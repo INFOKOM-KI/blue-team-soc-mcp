@@ -305,14 +305,27 @@ async def _wazuh_get_token() -> Optional[str]:
             )
             resp.raise_for_status()
             return resp.text.strip().strip('"')
-    except Exception:
+    except httpx.HTTPStatusError as e:
+        logger.warning("Wazuh auth failed: HTTP %s — %s", e.response.status_code, e.response.text[:200])
+        return None
+    except Exception as e:
+        logger.warning("Wazuh auth failed: %s", e)
         return None
 
 async def _wazuh_api_get(path: str, params: Dict[str, str] = None) -> Dict:
     """Call Wazuh API GET endpoint. path should start with / (e.g. /agents)."""
+    if not WAZUH_API_URL or not WAZUH_API_PASSWORD:
+        return {"error": "WAZUH_API_URL and WAZUH_API_PASSWORD must be set. See README for Wazuh setup."}
     token = await _wazuh_get_token()
     if not token:
-        return {"error": "WAZUH_API_URL and WAZUH_API_PASSWORD must be set. See README for Wazuh setup."}
+        return {
+            "error": "Wazuh API authentication failed",
+            "detail": (
+                f"Could not authenticate to {WAZUH_API_URL} as '{WAZUH_API_USER}'. "
+                "Check credentials and that the Wazuh Manager API is running on port 55000. "
+                "If using Wazuh 4.7+, the user may need the 'administrator' role assigned via the Wazuh dashboard."
+            ),
+        }
     url = f"{WAZUH_API_URL}{path}"
     try:
         async with httpx.AsyncClient(verify=WAZUH_API_VERIFY_SSL, timeout=30) as client:
@@ -1215,20 +1228,26 @@ _AGENT_NAME_SAFE_RE = re.compile(r"^[a-zA-Z0-9_\-\.]+$")
 
 class WazuhIndexerSearchInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    agent_name: str = Field(..., max_length=64, description="Agent name to filter (e.g. HYDRA-DC)")
+    agent_name: Optional[str] = Field(
+        default=None,
+        max_length=64,
+        description="Agent name to filter (e.g. 'HYDRA-DC'). Leave empty to search all agents.",
+    )
     index_type: str = Field(default="alerts", description="Index: alerts, events, or vulnerabilities")
     limit: int = Field(default=100, description="Max docs to return", ge=1, le=500)
 
     @field_validator("agent_name")
     @classmethod
-    def validate_agent_name(cls, v: str) -> str:
-        if not v or not v.strip():
-            raise ValueError("agent_name is required")
-        v = v.strip()
-        if len(v) > 64:
-            raise ValueError("agent_name too long")
-        if not _AGENT_NAME_SAFE_RE.match(v):
-            raise ValueError("agent_name: use only letters, numbers, hyphen, underscore, dot")
+    def validate_agent_name(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v = v.strip()
+            if not v:
+                return None
+            if len(v) > 64:
+                raise ValueError("agent_name too long (max 64)")
+            if not _AGENT_NAME_SAFE_RE.match(v):
+                raise ValueError("agent_name: use only letters, numbers, hyphen, underscore, dot")
+        return v
         return v
 
 @mcp.tool(
