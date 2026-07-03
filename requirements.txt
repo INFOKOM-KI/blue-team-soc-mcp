@@ -1,0 +1,4 @@
+# Pinned for supply chain security (MAESTRO Layer 3). Update with: pip-audit, pip list --outdated
+mcp>=1.0.0,<2.0.0
+httpx>=0.27.0,<0.28.0
+pydantic>=2.0.0,<3.0.0
