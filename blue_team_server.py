@@ -1995,6 +1995,27 @@ def main() -> None:
     mcp.settings.host = args.host
     mcp.settings.port = args.port
 
+    # Update transport security to allow the actual host the client connects to.
+    # FastMCP auto-enables DNS rebinding protection for localhost only - if we're
+    # binding to a different IP (e.g. 172.16.9.125 or 0.0.0.0), we must add it
+    # to the allowed_hosts so the Host header validation passes (MCP spec security).
+    if args.host not in ("127.0.0.1", "localhost", "::1"):
+        transport_security = mcp.settings.transport_security
+        if transport_security is None:
+            from mcp.server.transport_security import TransportSecuritySettings
+            transport_security = TransportSecuritySettings(
+                enable_dns_rebinding_protection=True,
+            )
+            mcp.settings.transport_security = transport_security
+        transport_security.allowed_hosts.extend([
+            f"{args.host}:{args.port}",
+            f"{args.host}:*",
+        ])
+        transport_security.allowed_origins.extend([
+            f"http://{args.host}:{args.port}",
+            f"http://{args.host}:*",
+        ])
+
     if args.transport == "sse":
         logger.info(
             "Starting blue_team_mcp via SSE transport on %s:%s", args.host, args.port

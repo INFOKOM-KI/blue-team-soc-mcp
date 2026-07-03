@@ -402,6 +402,24 @@ def main() -> None:
     mcp.settings.host = args.host
     mcp.settings.port = args.port
 
+    # Update transport security to allow the actual host the client connects.
+    if args.host not in ("127.0.0.1", "localhost", "::1"):
+        transport_security = mcp.settings.transport_security
+        if transport_security is None:
+            from mcp.server.transport_security import TransportSecuritySettings
+            transport_security = TransportSecuritySettings(
+                enable_dns_rebinding_protection=True,
+            )
+            mcp.settings.transport_security = transport_security
+        transport_security.allowed_hosts.extend([
+            f"{args.host}:{args.port}",
+            f"{args.host}:*",
+        ])
+        transport_security.allowed_origins.extend([
+            f"http://{args.host}:{args.port}",
+            f"http://{args.host}:*",
+        ])
+
     if args.transport == "sse":
         logger.info("Menjalankan blue_team_mcp via SSE transport di %s:%s", args.host, args.port)
         mcp.run(transport="sse")
