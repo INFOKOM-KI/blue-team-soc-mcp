@@ -98,13 +98,13 @@ The suite has been refactored for **bulk data processing and concurrent workload
 
 #### Cursor-Based Pagination (Bulk Data Without Hard Caps)
 
-All five Wazuh tools support iterative cursor pagination. Each page returns a `next_cursor` token; pass it back as the `cursor` parameter to fetch the next page. When `next_cursor` is `null`, all results have been exhausted.
+All five Wazuh tools support iterative cursor pagination via base64-encoded JSON tokens. Each page returns a `next_cursor`; pass it back as the `cursor` parameter to fetch the next page. `next_cursor` is `null` when the dataset is exhausted.
 
-| Tool | Pagination Mechanism | Max per Page | Cursor Encoding |
+| Tool | Pagination Mechanism | Max per Page | Cursor Shape |
 |---|---|---|---|
-| `blueteam_wazuh_indexer_search` | OpenSearch `from`/`size` | 10,000 | `{"from": N}` |
+| `blueteam_wazuh_indexer_search` | OpenSearch `search_after` (sort-key traversal) | 10,000 | `{"search_after": [<sort_values>]}` |
 | `blueteam_wazuh_agents` | Wazuh API `offset`/`limit` | 10,000 | `{"offset": N}` |
-| `blueteam_wazuh_manager_logs` | Wazuh API `offset`/`limit` | 1,000 | `{"offset": N}` |
+| `blueteam_wazuh_manager_logs` | Wazuh API `offset`/`limit` | **500** (auto-capped) | `{"offset": N}` |
 | `blueteam_wazuh_alerts` | Line-offset in local `alerts.json` | 2,000 | `{"scanned": N}` |
 
 **Agent workflow:**
@@ -114,57 +114,85 @@ All five Wazuh tools support iterative cursor pagination. Each page returns a `n
 3. Repeat until next_cursor is null — all results retrieved
 ```
 
-Cursors are base64-encoded JSON, transparent to the caller. All input schemas are **backward-compatible** — `cursor` is optional and defaults are unchanged.
+All input schemas are **backward-compatible** — `cursor` is optional and defaults are unchanged.
+
+#### Deep-Paging via `search_after` (`blueteam_wazuh_indexer_search`)
+
+The Wazuh Indexer search tool was migrated from offset-based pagination (`from`/`size`) to OpenSearch's `search_after` cursor, eliminating the 10,000-document `max_result_window` ceiling:
+
+- **Sort anchor**: Results are ordered by `@timestamp` (ascending) with `_id` as a deterministic tie-breaker. This guarantees every document has a unique, stable sort key.
+- **Cursor traversal**: `next_cursor` encodes the raw sort values of the last document in the current page. On the next call, those values are sent as the `search_after` array — OpenSearch resumes the scan from exactly where the previous page ended.
+- **Truncation metadata**: The response exposes `total` as an object `{"value": <int>, "relation": <"eq"|"gte">}`. When `relation` is `"gte"` (greater-than-or-equal), the LLM client knows the true document count exceeds the reported ceiling and continues paginating.
+- **Natural exhaustion**: `next_cursor` becomes `null` when the number of returned documents is strictly less than the requested `limit` — no arithmetic against a capped `total.value`.
+
+#### Auto-Cap Limit Guard (Self-Healing Defense)
+
+The Wazuh Manager API (`/manager/logs`) rejects `limit > 500` with HTTP 400. The Pydantic input model allows up to 1,000, creating a gap where LLM clients can inadvertently construct failing requests. The `blueteam_wazuh_manager_logs` tool now applies an inline safety clamp before the HTTP call:
+
+```python
+wazuh_safe_limit = min(params.limit, 500)
+```
+
+This silently caps the value to 500 at the application layer. The client still receives the full pagination metadata (`next_cursor`, `total`) and can iterate through all results without ever triggering a validation error.
+
+In addition, the global `_handle_api_error` helper returns a specific, actionable message for HTTP 400 (Bad Request) advising the caller to reduce limit size or switch filter parameters. This guard is deployed across all three server files.
+
+#### Remote Architecture Fallback (`blueteam_wazuh_alerts`)
+
+When the Wazuh Manager runs on a remote host, the local `alerts.json` file is absent. Instead of a generic OS error, the tool returns a strict metadata instruction:
+
+```
+[CRITICAL METADATA] This tool is disabled because the Wazuh Manager
+is running on a remote host. DO NOT RETRY this local tool. You MUST
+immediately switch to 'blueteam_wazuh_indexer_search' or
+'blueteam_wazuh_manager_logs' to query security events.
+```
+
+This prevents the LLM client from wasting context loops retrying a fundamentally unavailable data path and directs it toward the correct remote-capable alternatives.
 
 #### Shared HTTP Client with Connection Pooling
 
-A single module-level `httpx.AsyncClient` is lazily initialized and reused across all six HTTP-based helper functions (`_http_get`, `_wazuh_get_token`, `_wazuh_api_get`, `_wazuh_indexer_search`, `_crowdsec_request`, `_greynoise_community_request`). Configuration:
+Three dedicated `httpx.AsyncClient` instances, one per SSL trust domain:
 
-- **Keepalive connections**: 20
-- **Max total connections**: 100
-- **Timeout**: `HTTP_TIMEOUT` (configurable, default 30 s)
+| Client | `verify` | Endpoints |
+|---|---|---|
+| `_get_http_client()` | `True` (public CA) | AbuseIPDB, VirusTotal, CrowdSec CTI, GreyNoise |
+| `_get_wazuh_client()` | `WAZUH_API_VERIFY_SSL` (default `false`) | Wazuh Manager API (port 55000) |
+| `_get_indexer_client()` | `WAZUH_INDEXER_VERIFY_SSL` (default `false`) | OpenSearch (port 9200) |
 
-Every external API call previously created a fresh TCP connection per request. Connection pooling eliminates that overhead — repeated calls to the same service (e.g., Wazuh API, OpenSearch) reuse existing connections.
+Each client pools connections independently (20 keepalive / 100 max for public APIs; 10 / 50 for Wazuh and Indexer). SSL verification is set at client creation — no per-request `verify=` keyword arguments.
 
 #### Wazuh JWT Token Caching
 
-The Wazuh Manager API JWT is cached for **300 seconds (5 minutes)** after first authentication. Previously every `_wazuh_api_get()` call performed a full re-authentication round-trip. Now:
-
-- First call: POST to `/security/user/authenticate` → cache token + expiry
-- Subsequent calls within TTL: use cached token (no auth round-trip)
-- Auth failure: cache is cleared so the next call retries fresh
-
-This cuts Wazuh API latency in half for multi-tool agent workflows.
+Cached for **300 seconds (5 minutes)** with automatic cache clearance on authentication failure.
 
 #### Non-Blocking Subprocess Execution
 
-30 of 37 tools invoke system commands (`ss`, `tcpdump`, `lynis`, `rkhunter`, `tail`, etc.). The new `_run_async()` wrapper offloads these to a thread pool via `asyncio.to_thread()`, preventing long-running commands (Lynis at 180 s, rkhunter at 120 s, tcpdump at 60 s) from blocking the event loop. Under HTTP transport with concurrent clients, the server remains responsive to new requests while subprocesses run.
+`_run_async()` wraps synchronous subprocess calls in `asyncio.to_thread()`, preventing 30 tools from blocking the event loop under concurrent load.
 
-### CrowdSec Server (`blue_team_server_crowdsec.py`)
+### CrowdSec Server (`blue_team_server_crowdsec.py`) — Point-Lookup API
+
+This server operates exclusively as a **stateless point-lookup API**. It queries the CrowdSec CTI Smoke endpoint (`GET /v2/smoke/{ip}`) for single-IP reputation data. It does **not** implement cursor pagination, `search_after`, or any offset mechanism — by design, not oversight. There is no search index, no result window, and no deep-paging concern.
 
 #### Connection Pooling
 
-Shared `httpx.AsyncClient` with **10 keepalive**, **50 max connections**. The `_crowdsec_request()` helper reuses connections across all tool invocations.
+Shared `httpx.AsyncClient` with **10 keepalive**, **50 max connections**, SSL verification controlled by `BLUETEAM_VERIFY_SSL`.
 
 #### Parallel Bulk IP Lookups
 
-`crowdsec_ip_reputation_bulk` now executes all IP lookups **concurrently** via `asyncio.gather()` with an `asyncio.Semaphore` for rate-limit safety:
+`crowdsec_ip_reputation_bulk` executes up to 10 IP lookups concurrently via `asyncio.gather()` bounded by an `asyncio.Semaphore`:
 
-- **Default concurrency**: 5 parallel requests (configurable via `BLUETEAM_BULK_CONCURRENCY`)
-- **Error isolation**: one failed IP lookup does not affect others
-- **Latency**: 10 IPs complete in ~2 sequential batches instead of 10 — roughly a 5× speedup
+- **Default concurrency**: 5 (configurable via `BLUETEAM_BULK_CONCURRENCY`)
+- **Error isolation**: per-IP failure does not affect sibling lookups
+- **Latency**: ~5× speedup vs serial iteration
 
-```
-Serial (before):   IP₁ → IP₂ → IP₃ → ... → IP₁₀
-Parallel (now):    IP₁..IP₅  concurrently
-                   IP₆..IP₁₀  concurrently
-```
+### GreyNoise Server (`blue_team_server_greynoise.py`) — Point-Lookup API
 
-### GreyNoise Server (`blue_team_server_greynoise.py`)
+This server also operates as a **stateless point-lookup API**. It queries GreyNoise Community (`GET /v3/community/{ip}`) for single-IP scanner/RIOT classification. No pagination, no cursors, no offset logic.
 
 #### Connection Pooling
 
-Shared `httpx.AsyncClient` with **10 keepalive**, **50 max connections**. The `_greynoise_community_request()` helper reuses connections. Though GreyNoise Community is a single-IP lookup tool, connection reuse benefits repeated calls from the same agent session.
+Shared `httpx.AsyncClient` with **10 keepalive**, **50 max connections**, SSL verification controlled by `BLUETEAM_VERIFY_SSL`.
 
 ---
 
@@ -178,6 +206,7 @@ All environment variables accepted by the suite. Variables marked **[unified]** 
 |---|---|---|
 | `BLUETEAM_CHARACTER_LIMIT` | `25000` | Maximum characters per tool response before truncation |
 | `BLUETEAM_HTTP_TIMEOUT` | `30.0` | HTTP request timeout in seconds (applies to `_get_http_client()`) |
+| `BLUETEAM_VERIFY_SSL` | `true` | SSL certificate verification for the shared HTTP client (set `false` for proxies or mirror endpoints with self-signed certs) |
 
 ### CrowdSec Bulk Lookups
 
