@@ -332,13 +332,16 @@ After=network.target
 
 [Service]
 Type=simple
-User=blue-team
+User=root
 WorkingDirectory=/opt/blue-team-mcp
-EnvironmentFile=/opt/blue-team-mcp/config.env
+# Memanggil wrapper secara langsung karena wrapper sudah menangani pembacaan config.env,
+# ekspor variabel, serta eksekusi venv Python dengan benar.
+Environment="MCP_TRANSPORT=streamable_http"
 Environment="MCP_HOST=0.0.0.0"
 Environment="MCP_PORT=8000"
-ExecStart=/opt/blue-team-mcp/venv/bin/python3 blue_team_server.py --transport streamable_http
+ExecStart=/usr/local/bin/mcp-server-blueteam
 Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
@@ -462,7 +465,7 @@ All tools below are registered on `blue_team_server.py`. Tools not requiring a s
 Once connected via Claude Desktop, you can ask:
 
 ```
-"Check the last 2 hours of auth.log and tell me if there are any brute force 
+"Check the last 2 hours of auth.log and tell me if there are any brute force
  attempts. Group by source IP."
 
 "Show me all listening ports. Are any unexpected services running?"
