@@ -334,8 +334,6 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/opt/blue-team-mcp
-# Memanggil wrapper secara langsung karena wrapper sudah menangani pembacaan config.env,
-# ekspor variabel, serta eksekusi venv Python dengan benar.
 Environment="MCP_TRANSPORT=streamable_http"
 Environment="MCP_HOST=0.0.0.0"
 Environment="MCP_PORT=8000"
