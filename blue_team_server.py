@@ -752,7 +752,7 @@ def _format_greynoise_markdown(ip: str, raw: dict[str, Any]) -> str:
 
     message = raw.get("message", "")
     if message and message != "Success":
-        lines.append(f"> ⚠️ {message}")
+        lines.append(f"> {message}")
         lines.append("")
 
     lines.append(f"- **IP**: {raw.get('ip', ip)}")
@@ -760,18 +760,18 @@ def _format_greynoise_markdown(ip: str, raw: dict[str, Any]) -> str:
     # Noise
     noise = raw.get("noise")
     if noise is True:
-        lines.append("- **Noise**: ✅ Yes — this IP has been observed scanning the internet")
+        lines.append("- **Noise**: Yes — this IP has been observed scanning the internet")
     elif noise is False:
-        lines.append("- **Noise**: ❌ No — this IP has not been observed scanning")
+        lines.append("- **Noise**: No — this IP has not been observed scanning")
     else:
         lines.append("- **Noise**: unknown")
 
     # RIOT (business service)
     riot = raw.get("riot")
     if riot is True:
-        lines.append("- **RIOT**: ✅ Yes — this IP is a known business service (trusted)")
+        lines.append("- **RIOT**: Yes — this IP is a known business service (trusted)")
     elif riot is False:
-        lines.append("- **RIOT**: ❌ No — not a known business service")
+        lines.append("- **RIOT**: No — not a known business service")
     else:
         lines.append("- **RIOT**: unknown")
 
