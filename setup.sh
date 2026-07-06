@@ -2,6 +2,7 @@
 # Blue Team MCP Server - Setup Script
 # Run this on your DEFENDER HOST (Ubuntu/Debian recommended)
 # Usage: sudo bash setup.sh
+# Programmer : NAuliajati (csirt[at]tangerangkota[.]go[.]id)
 set -e
 
 INSTALL_DIR="/opt/blue-team-mcp"
@@ -84,6 +85,12 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 # export WAZUH_INDEXER_PASSWORD="your_indexer_password"
 # export WAZUH_INDEXER_VERIFY_SSL="false"
 
+# Performance & Tuning Limits
+# export BLUETEAM_CHARACTER_LIMIT="25000"       # max chars per tool response before truncation
+# export BLUETEAM_HTTP_TIMEOUT="30.0"           # HTTP request timeout in seconds
+# export BLUETEAM_BULK_CONCURRENCY="5"          # max parallel IP lookups (CrowdSec bulk)
+# export WAZUH_INDEXER_MAX_SIZE="10000"         # max documents per page in Wazuh Indexer search
+
 # Audit and limits (optional)
 # export BLUETEAM_AUDIT_LOG="/var/log/blue-team-mcp-audit.jsonl"
 # export BLUETEAM_RATE_LIMIT="60"
@@ -98,8 +105,10 @@ else
   echo "[4/7] Config file exists at $CONFIG_FILE (not overwritten)"
 fi
 
-# Wrapper script
-echo "[5/7] Creating mcp-server wrapper script..."
+# Wrapper scripts
+echo "[5/7] Creating MCP server wrapper scripts..."
+
+# Main wrapper: mcp-server-blueteam (all 37 tools)
 cat > /usr/local/bin/mcp-server-blueteam << 'EOF'
 #!/usr/bin/env bash
 # Wrapper - Claude Desktop calls this via SSH (MAESTRO-compliant)
@@ -112,6 +121,9 @@ export BLUETEAM_AUDIT_LOG="${BLUETEAM_AUDIT_LOG:-}"
 export BLUETEAM_RATE_LIMIT="${BLUETEAM_RATE_LIMIT:-0}"
 export BLUETEAM_ALLOWED_PATHS="${BLUETEAM_ALLOWED_PATHS:-/var:/etc:/home:/opt:/usr}"
 export BLUETEAM_CAPTURE_DIR="${BLUETEAM_CAPTURE_DIR:-/tmp}"
+export BLUETEAM_HTTP_TIMEOUT="${BLUETEAM_HTTP_TIMEOUT:-30.0}"
+export BLUETEAM_CHARACTER_LIMIT="${BLUETEAM_CHARACTER_LIMIT:-25000}"
+export WAZUH_INDEXER_MAX_SIZE="${WAZUH_INDEXER_MAX_SIZE:-10000}"
 export WAZUH_API_URL="${WAZUH_API_URL:-}"
 export WAZUH_API_USER="${WAZUH_API_USER:-wazuh-wui}"
 export WAZUH_API_PASSWORD="${WAZUH_API_PASSWORD:-}"
@@ -126,6 +138,36 @@ export MCP_PORT="${MCP_PORT:-8000}"
 exec /opt/blue-team-mcp/venv/bin/python3 /opt/blue-team-mcp/blue_team_server.py "$@"
 EOF
 chmod +x /usr/local/bin/mcp-server-blueteam
+
+# Standalone wrapper: mcp-server-crowdsec (2 CrowdSec CTI tools)
+cat > /usr/local/bin/mcp-server-crowdsec << 'EOF'
+#!/usr/bin/env bash
+# Wrapper - CrowdSec-only MCP server with parallel bulk lookups
+[[ -f /opt/blue-team-mcp/config.env ]] && source /opt/blue-team-mcp/config.env
+export CROWDSEC_API_KEY="${CROWDSEC_API_KEY:-}"
+export BLUETEAM_HTTP_TIMEOUT="${BLUETEAM_HTTP_TIMEOUT:-30.0}"
+export BLUETEAM_CHARACTER_LIMIT="${BLUETEAM_CHARACTER_LIMIT:-25000}"
+export BLUETEAM_BULK_CONCURRENCY="${BLUETEAM_BULK_CONCURRENCY:-5}"
+export MCP_TRANSPORT="${MCP_TRANSPORT:-stdio}"
+export MCP_HOST="${MCP_HOST:-127.0.0.1}"
+export MCP_PORT="${MCP_PORT:-8000}"
+exec /opt/blue-team-mcp/venv/bin/python3 /opt/blue-team-mcp/blue_team_server_crowdsec.py "$@"
+EOF
+chmod +x /usr/local/bin/mcp-server-crowdsec
+
+# Standalone wrapper: mcp-server-greynoise (1 GreyNoise Community tool)
+cat > /usr/local/bin/mcp-server-greynoise << 'EOF'
+#!/usr/bin/env bash
+# Wrapper - GreyNoise-only MCP server (free, no API key required)
+[[ -f /opt/blue-team-mcp/config.env ]] && source /opt/blue-team-mcp/config.env
+export BLUETEAM_HTTP_TIMEOUT="${BLUETEAM_HTTP_TIMEOUT:-30.0}"
+export BLUETEAM_CHARACTER_LIMIT="${BLUETEAM_CHARACTER_LIMIT:-25000}"
+export MCP_TRANSPORT="${MCP_TRANSPORT:-stdio}"
+export MCP_HOST="${MCP_HOST:-127.0.0.1}"
+export MCP_PORT="${MCP_PORT:-8000}"
+exec /opt/blue-team-mcp/venv/bin/python3 /opt/blue-team-mcp/blue_team_server_greynoise.py "$@"
+EOF
+chmod +x /usr/local/bin/mcp-server-greynoise
 
 # SSH hardening reminder
 echo "[6/7] Ensuring SSH is running..."
@@ -150,7 +192,20 @@ echo "  Uncomment and set: ABUSEIPDB_API_KEY, VIRUSTOTAL_API_KEY,"
 echo "  CROWDSEC_API_KEY (free tier at crowdsec.net),"
 echo "  WAZUH_API_URL, WAZUH_API_USER, WAZUH_API_PASSWORD,"
 echo "  WAZUH_INDEXER_URL, WAZUH_INDEXER_PASSWORD."
+echo ""
+echo "  Performance tuning (all optional, defaults shown):"
+echo "    BLUETEAM_CHARACTER_LIMIT=25000"
+echo "    BLUETEAM_HTTP_TIMEOUT=30.0"
+echo "    BLUETEAM_BULK_CONCURRENCY=5       (CrowdSec parallel lookups)"
+echo "    WAZUH_INDEXER_MAX_SIZE=10000      (docs per page in indexer search)"
+echo ""
 echo "  GreyNoise Community needs no key — greynoise_ip_context works immediately."
+echo ""
+echo "Wrapper entry points installed:"
+echo ""
+echo "  mcp-server-blueteam    — All 37 tools (Wazuh, threat intel, host forensics)"
+echo "  mcp-server-crowdsec    — CrowdSec CTI only (2 tools, parallel bulk lookups)"
+echo "  mcp-server-greynoise   — GreyNoise Community only (1 tool, no API key needed)"
 echo ""
 echo "Run as a remote HTTP service (no SSH needed):"
 echo ""

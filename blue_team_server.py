@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 Blue Team MCP Server
-====================
 A defensive security MCP server for Claude Desktop, mirroring the Kali mcp-kali-server setup but for blue team / defenders.
 
 MAESTRO Framework: Aligned with CSA MAESTRO (Layer 3 Agent Frameworks, Layer 5 Observability, Layer 6 Security & Compliance).
@@ -35,6 +34,7 @@ Claude Desktop config (claude_desktop_config.json):
 from __future__ import annotations
 import argparse
 import asyncio
+import base64
 import hashlib
 import ipaddress
 import json
@@ -44,6 +44,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -52,7 +53,7 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-# Logging — MUST go to stderr. stdout is used by the MCP stdio protocol.
+# Logging - Must go to stderr. stdout is used by the MCP stdio protocol.
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -102,7 +103,9 @@ GREYNOISE_COMMUNITY_BASE_URL = "https://api.greynoise.io/v3/community"
 
 # Shared HTTP / response config
 HTTP_TIMEOUT = 30.0
-CHARACTER_LIMIT = 25000
+CHARACTER_LIMIT = int(os.environ.get("BLUETEAM_CHARACTER_LIMIT", "25000"))
+_WAZUH_INDEXER_MAX_SIZE = int(os.environ.get("WAZUH_INDEXER_MAX_SIZE", "10000"))
+_WAZUH_TOKEN_TTL = 300  # seconds — cache Wazuh JWT for 5 min
 
 # Private / reserved IP ranges — threat-intel tools are for public IPs only
 _PRIVATE_NETWORKS = [
@@ -118,6 +121,40 @@ _PRIVATE_NETWORKS = [
         "fe80::/10",
     )
 ]
+
+# Shared HTTP client with connection pooling
+_shared_http_client: Optional[httpx.AsyncClient] = None
+
+async def _get_http_client() -> httpx.AsyncClient:
+    """Return a shared httpx.AsyncClient with connection pooling.
+    Lazily initialized; reuse across all tool invocations to avoid
+    connection-establishment overhead on every call."""
+    global _shared_http_client
+    if _shared_http_client is None or _shared_http_client.is_closed:
+        _shared_http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(HTTP_TIMEOUT),
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
+        )
+    return _shared_http_client
+
+
+# Cursor utilities for pagination
+def _encode_cursor(data: dict) -> str:
+    """Encode pagination state as a base64 JSON cursor string."""
+    return base64.b64encode(json.dumps(data).encode()).decode()
+
+
+def _decode_cursor(cursor: str) -> Optional[dict]:
+    """Decode a pagination cursor; returns None on invalid/malformed input."""
+    try:
+        return json.loads(base64.b64decode(cursor).decode())
+    except Exception:
+        return None
+
+
+# Wazuh JWT token cache
+_wazuh_token: Optional[str] = None
+_wazuh_token_expiry: float = 0.0
 
 # Shared enums & formatting utilities
 class ResponseFormat(str, Enum):
@@ -166,8 +203,7 @@ def _truncate_if_needed(text: str) -> str:
         "use a more specific filter]"
     )
 
-# MAESTRO: Input validation and sanitization helpers
-
+# Input validation and sanitization helpers
 def _sanitize_regex(pattern: str) -> str:
     """Sanitize grep pattern to mitigate ReDoS. Use simple substring when regex metacharacters present."""
     if not pattern:
@@ -214,7 +250,7 @@ def _validate_bpf_filter(expr: str) -> tuple[bool, str]:
         return False, "BPF filter contains invalid characters (use alphanumeric, spaces, port, host, and, or)"
     return True, ""
 
-# MAESTRO: Audit logging (optional, Layer 6)
+# Audit logging (optional, Layer 6)
 def _audit_log(tool_name: str, params: dict, result_preview: str = "") -> None:
     """Append audit entry to BLUETEAM_AUDIT_LOG if configured."""
     if not BLUETEAM_AUDIT_LOG:
@@ -231,7 +267,7 @@ def _audit_log(tool_name: str, params: dict, result_preview: str = "") -> None:
     except Exception:
         pass
 
-# MAESTRO: Rate limiting (optional, Layer 3 DoS)
+# Rate limiting (optional, Layer 3 DoS)
 _rate_limit_count = 0
 _rate_limit_reset_time = 0.0
 
@@ -239,7 +275,6 @@ def _check_rate_limit() -> bool:
     """Return True if allowed, False if rate limited."""
     if BLUETEAM_RATE_LIMIT <= 0:
         return True
-    import time
     global _rate_limit_count, _rate_limit_reset_time
     now = time.time()
     if now > _rate_limit_reset_time:
@@ -270,6 +305,12 @@ def _run(cmd: List[str], timeout: int = TIMEOUT) -> Dict[str, Any]:
     except Exception as e:
         return {"stdout": "", "stderr": str(e), "returncode": -1}
 
+
+async def _run_async(cmd: List[str], timeout: int = TIMEOUT) -> Dict[str, Any]:
+    """Non-blocking wrapper around _run() — offloads subprocess to a thread pool.
+    Use in async tool handlers to avoid blocking the event loop."""
+    return await asyncio.to_thread(_run, cmd, timeout)
+
 def _tool_not_found(tool: str) -> str:
     return json.dumps({
         "error": f"'{tool}' is not installed or not in PATH.",
@@ -286,30 +327,40 @@ def _tail_file(path: str, lines: int) -> str:
 
 
 async def _http_get(url: str, headers: Dict[str, str], params: Dict[str, str] = None) -> Dict:
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(url, headers=headers, params=params or {})
-        resp.raise_for_status()
-        return resp.json()
+    client = await _get_http_client()
+    resp = await client.get(url, headers=headers, params=params or {})
+    resp.raise_for_status()
+    return resp.json()
 
 # Wazuh API helper (openWorld - external API calls)
 async def _wazuh_get_token() -> Optional[str]:
-    """Obtain JWT token from Wazuh API. Returns None if not configured or auth fails."""
+    """Obtain JWT token from Wazuh API with 300 s TTL cache. Returns None if not configured or auth fails."""
+    global _wazuh_token, _wazuh_token_expiry
     if not WAZUH_API_URL or not WAZUH_API_PASSWORD:
         return None
+    now = time.monotonic()
+    if _wazuh_token and now < _wazuh_token_expiry:
+        return _wazuh_token
     try:
         url = f"{WAZUH_API_URL}/security/user/authenticate?raw=true"
-        async with httpx.AsyncClient(verify=WAZUH_API_VERIFY_SSL, timeout=15) as client:
-            resp = await client.post(
-                url,
-                auth=(WAZUH_API_USER, WAZUH_API_PASSWORD),
-            )
-            resp.raise_for_status()
-            return resp.text.strip().strip('"')
+        client = await _get_http_client()
+        resp = await client.post(
+            url,
+            auth=(WAZUH_API_USER, WAZUH_API_PASSWORD),
+        )
+        resp.raise_for_status()
+        _wazuh_token = resp.text.strip().strip('"')
+        _wazuh_token_expiry = now + _WAZUH_TOKEN_TTL
+        return _wazuh_token
     except httpx.HTTPStatusError as e:
         logger.warning("Wazuh auth failed: HTTP %s — %s", e.response.status_code, e.response.text[:200])
+        _wazuh_token = None
+        _wazuh_token_expiry = 0.0
         return None
     except Exception as e:
         logger.warning("Wazuh auth failed: %s", e)
+        _wazuh_token = None
+        _wazuh_token_expiry = 0.0
         return None
 
 async def _wazuh_api_get(path: str, params: Dict[str, str] = None) -> Dict:
@@ -328,14 +379,14 @@ async def _wazuh_api_get(path: str, params: Dict[str, str] = None) -> Dict:
         }
     url = f"{WAZUH_API_URL}{path}"
     try:
-        async with httpx.AsyncClient(verify=WAZUH_API_VERIFY_SSL, timeout=30) as client:
-            resp = await client.get(
-                url,
-                headers={"Authorization": f"Bearer {token}"},
-                params=params or {},
-            )
-            resp.raise_for_status()
-            return resp.json()
+        client = await _get_http_client()
+        resp = await client.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            params=params or {},
+        )
+        resp.raise_for_status()
+        return resp.json()
     except httpx.HTTPStatusError as e:
         return {"error": f"Wazuh API error: {e.response.status_code}", "detail": e.response.text[:500]}
     except Exception as e:
@@ -345,8 +396,10 @@ async def _wazuh_indexer_search(
     index_pattern: str,
     agent_name: Optional[str],
     size: int,
+    from_: int = 0,
 ) -> Dict:
-    """Query Wazuh Indexer (OpenSearch) for alerts/events. Read-only _search only."""
+    """Query Wazuh Indexer (OpenSearch) for alerts/events. Read-only _search only.
+    Supports from_/size pagination for iterative bulk retrieval."""
     if not WAZUH_INDEXER_URL or not WAZUH_INDEXER_PASSWORD:
         return {"error": "WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD must be set. See README for Indexer setup."}
     url = f"{WAZUH_INDEXER_URL}/{index_pattern}/_search"
@@ -356,20 +409,21 @@ async def _wazuh_indexer_search(
     else:
         query = {"match_all": {}}
     body = {
-        "size": min(size, 500),
+        "from": from_,
+        "size": min(size, _WAZUH_INDEXER_MAX_SIZE),
         "sort": [{"@timestamp": {"order": "desc"}}],
         "query": query,
     }
     try:
-        async with httpx.AsyncClient(verify=WAZUH_INDEXER_VERIFY_SSL, timeout=30) as client:
-            resp = await client.post(
-                url,
-                auth=(WAZUH_INDEXER_USER, WAZUH_INDEXER_PASSWORD),
-                json=body,
-                headers={"Content-Type": "application/json"},
-            )
-            resp.raise_for_status()
-            return resp.json()
+        client = await _get_http_client()
+        resp = await client.post(
+            url,
+            auth=(WAZUH_INDEXER_USER, WAZUH_INDEXER_PASSWORD),
+            json=body,
+            headers={"Content-Type": "application/json"},
+        )
+        resp.raise_for_status()
+        return resp.json()
     except httpx.HTTPStatusError as e:
         return {"error": f"Indexer API error: {e.response.status_code}", "detail": e.response.text[:500]}
     except Exception as e:
@@ -395,10 +449,10 @@ async def _crowdsec_request(path: str) -> dict[str, Any]:
         "User-Agent": "blue-team-mcp/1.0.0 (TangerangKota-CSIRT)",
     }
     url = f"{CROWDSEC_BASE_URL}{path}"
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        response = await client.get(url, headers=headers)
-        response.raise_for_status()
-        return response.json()
+    client = await _get_http_client()
+    response = await client.get(url, headers=headers)
+    response.raise_for_status()
+    return response.json()
 
 def _format_crowdsec_markdown(ip: str, raw: dict[str, Any]) -> str:
     """Render CrowdSec CTI API response as a human-readable markdown report."""
@@ -508,7 +562,7 @@ class CrowdsecIpReputationBulkInput(BaseModel):
             raise ValueError(f"Invalid IP(s): {', '.join(invalid)}")
         return [ip.strip() for ip in v]
 
-# CROWDSEC CTI TOOLS 
+# CROWDSEC CTI TOOLS
 @mcp.tool(
     name="crowdsec_ip_reputation",
     annotations={
@@ -650,10 +704,10 @@ async def _greynoise_community_request(ip: str) -> dict[str, Any]:
         "User-Agent": "blue-team-mcp/1.0.0 (TangerangKota-CSIRT)",
     }
     url = f"{GREYNOISE_COMMUNITY_BASE_URL}/{ip}"
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        response = await client.get(url, headers=headers)
-        response.raise_for_status()
-        return response.json()
+    client = await _get_http_client()
+    response = await client.get(url, headers=headers)
+    response.raise_for_status()
+    return response.json()
 
 def _format_greynoise_markdown(ip: str, raw: dict[str, Any]) -> str:
     """Render GreyNoise Community API response as a human-readable markdown report."""
@@ -754,7 +808,7 @@ class GreynoiseIpContextInput(BaseModel):
             raise ValueError(f"'{v}' is not a valid IP address (IPv4/IPv6).") from exc
         return v
 
-# GREYNOISE COMMUNITY TOOL 
+# GREYNOISE COMMUNITY TOOL
 @mcp.tool(
     name="greynoise_ip_context",
     annotations={
@@ -1062,21 +1116,45 @@ async def blueteam_capture_traffic(params: CaptureInput) -> str:
     return result
 
 # WAZUH SIEM
+class WazuhAgentsInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    limit: int = Field(default=100, description="Agents per page", ge=1, le=10000)
+    cursor: Optional[str] = Field(
+        default=None,
+        description="Pagination cursor from previous response (next_cursor). Omit for first page.",
+    )
+
 @mcp.tool(
     name="blueteam_wazuh_agents",
     annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True}
 )
-async def blueteam_wazuh_agents() -> str:
-    """List all Wazuh agents (including domain controller agents) with status, IP, OS.
-    Requires WAZUH_API_URL and WAZUH_API_PASSWORD. Reads from Wazuh SIEM.
+async def blueteam_wazuh_agents(params: WazuhAgentsInput) -> str:
+    """List Wazuh agents with cursor pagination — one page per call.
+    Pass the returned next_cursor back as the cursor parameter for the next page.
+    Requires WAZUH_API_URL and WAZUH_API_PASSWORD.
+
+    Args:
+        params.limit: Agents per page (default 100, max 10000)
+        params.cursor: next_cursor from previous response (omit for first page)
 
     Returns:
-        str: JSON with agent list (id, name, ip, status, os, version) or error
+        str: JSON with agents, total, offset, limit, and next_cursor
     """
-    data = await _wazuh_api_get("/agents", {"pretty": "true", "limit": "1000"})
+    offset = 0
+    if params.cursor:
+        decoded = _decode_cursor(params.cursor)
+        if decoded:
+            offset = decoded.get("offset", 0)
+
+    data = await _wazuh_api_get("/agents", {
+        "offset": str(offset),
+        "limit": str(params.limit),
+        "pretty": "true",
+    })
     if isinstance(data.get("error"), str):
         return json.dumps(data, indent=2)
     items = data.get("data", {}).get("affected_items", [])
+    total = data.get("data", {}).get("total_affected_items", len(items))
     summary = [{
         "id": a.get("id"),
         "name": a.get("name"),
@@ -1085,7 +1163,17 @@ async def blueteam_wazuh_agents() -> str:
         "os": a.get("os", {}).get("name") if isinstance(a.get("os"), dict) else a.get("os"),
         "version": a.get("version"),
     } for a in items]
-    return json.dumps({"agents": summary, "total": len(summary)}, indent=2)
+
+    next_offset = offset + len(items)
+    next_cursor = _encode_cursor({"offset": next_offset}) if next_offset < total else None
+
+    return json.dumps({
+        "agents": summary,
+        "total": total,
+        "offset": offset,
+        "limit": params.limit,
+        "next_cursor": next_cursor,
+    }, indent=2)
 
 @mcp.tool(
     name="blueteam_wazuh_agents_summary",
@@ -1115,7 +1203,11 @@ _WAZUH_LOG_TAG = {
 class WazuhLogsInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     log_type: str = Field(default="alerts", description="Log type: alerts, api, cluster, integrations")
-    limit: int = Field(default=50, description="Max log entries to return", ge=1, le=500)
+    limit: int = Field(default=50, description="Max log entries per page", ge=1, le=1000)
+    cursor: Optional[str] = Field(
+        default=None,
+        description="Pagination cursor from previous response (next_cursor). Omit for first page.",
+    )
 
 
 @mcp.tool(
@@ -1123,21 +1215,29 @@ class WazuhLogsInput(BaseModel):
     annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True}
 )
 async def blueteam_wazuh_manager_logs(params: WazuhLogsInput) -> str:
-    """Fetch Wazuh manager logs (alerts, api, cluster, integrations).
-    Use log_type='alerts' for security alert processing logs from the manager.
+    """Fetch Wazuh manager logs with cursor pagination — one page per call.
+    Pass the returned next_cursor back as cursor for the next page.
     Compatible with Wazuh 4.x API (uses 'tag' parameter).
 
     Args:
         params.log_type: alerts, api, cluster, or integrations
-        params.limit: Max entries (default 50, max 500)
+        params.limit: Max entries per page (default 50, max 1000)
+        params.cursor: next_cursor from previous response (omit for first page)
 
     Returns:
-        str: Log entries as JSON
+        str: JSON with logs, total, offset, limit, and next_cursor
     """
     valid = ("alerts", "api", "cluster", "integrations")
     if params.log_type not in valid:
         return json.dumps({"error": f"log_type must be one of: {valid}"})
-    api_params = {"limit": str(params.limit), "pretty": "true"}
+
+    offset = 0
+    if params.cursor:
+        decoded = _decode_cursor(params.cursor)
+        if decoded:
+            offset = decoded.get("offset", 0)
+
+    api_params = {"offset": str(offset), "limit": str(params.limit), "pretty": "true"}
     tag = _WAZUH_LOG_TAG.get(params.log_type)
     if tag:
         api_params["tag"] = tag
@@ -1146,7 +1246,22 @@ async def blueteam_wazuh_manager_logs(params: WazuhLogsInput) -> str:
     data = await _wazuh_api_get("/manager/logs", api_params)
     if isinstance(data.get("error"), str):
         return json.dumps(data, indent=2)
-    return json.dumps(data.get("data", data), indent=2)
+
+    items = data.get("data", {}).get("affected_items", data.get("data", []))
+    if isinstance(items, dict):
+        items = [items]
+    total = data.get("data", {}).get("total_affected_items", len(items))
+
+    next_offset = offset + len(items)
+    next_cursor = _encode_cursor({"offset": next_offset}) if next_offset < total else None
+
+    return json.dumps({
+        "logs": items,
+        "total": total,
+        "offset": offset,
+        "limit": params.limit,
+        "next_cursor": next_cursor,
+    }, indent=2)
 
 
 # Path to Wazuh alerts file (on the host where MCP runs; must be Wazuh manager or have mounts)
@@ -1157,7 +1272,11 @@ _WAZUH_ALERTS_MAX_LINES = 2000  # safety cap
 class WazuhAlertsInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     agent_name: Optional[str] = Field(default=None, max_length=64, description="Filter by agent name (e.g. HYDRA-DC)")
-    limit: int = Field(default=100, description="Max alerts to return", ge=1, le=500)
+    limit: int = Field(default=100, description="Max alerts per page", ge=1, le=2000)
+    cursor: Optional[str] = Field(
+        default=None,
+        description="Pagination cursor from previous response (next_cursor). Omit for first page.",
+    )
 
 
 @mcp.tool(
@@ -1165,16 +1284,17 @@ class WazuhAlertsInput(BaseModel):
     annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}
 )
 async def blueteam_wazuh_alerts(params: WazuhAlertsInput) -> str:
-    """Read security alerts from Wazuh alerts.json.
+    """Read security alerts from Wazuh alerts.json with cursor pagination.
     Use when the MCP runs on the Wazuh manager host (or has /var/ossec/logs/alerts mounted).
-    For agent-specific alerts (e.g. HYDRA-DC), pass agent_name.
+    Returns one page per call. Pass next_cursor back as cursor for the next page.
 
     Args:
         params.agent_name: Optional filter by agent name (e.g. HYDRA-DC)
-        params.limit: Max alerts to return (default 100, max 500)
+        params.limit: Max alerts per page (default 100, max 2000)
+        params.cursor: next_cursor from previous response (omit for first page)
 
     Returns:
-        str: JSON array of alert objects
+        str: JSON with alerts, count, scanned, next_cursor
     """
     ok, err = _validate_path(_WAZUH_ALERTS_PATH, ALLOWED_PATH_PREFIXES)
     if not ok:
@@ -1187,14 +1307,28 @@ async def blueteam_wazuh_alerts(params: WazuhAlertsInput) -> str:
             "hint": "This tool runs on the MCP host. Alerts live on the Wazuh manager. "
                     "If Wazuh is on another host, use the indexer/OpenSearch API or run the command there directly."
         }, indent=2)
-    # Read last N lines (file can be large)
-    tail_lines = min(params.limit * 3, _WAZUH_ALERTS_MAX_LINES)  # read extra for filtering
-    r = _run(["tail", "-n", str(tail_lines), _WAZUH_ALERTS_PATH])
+
+    # Decode cursor to find how many lines were already scanned
+    skip_lines = 0
+    if params.cursor:
+        decoded = _decode_cursor(params.cursor)
+        if decoded:
+            skip_lines = decoded.get("scanned", 0)
+
+    # Read from tail — fetch enough lines to cover skip + limit with filtering overhead
+    page_size = min((skip_lines + params.limit) * 3, _WAZUH_ALERTS_MAX_LINES)
+    r = await _run_async(["tail", "-n", str(page_size), _WAZUH_ALERTS_PATH])
     if r.get("returncode", 0) != 0:
         return json.dumps({"error": "Failed to read alerts", "stderr": r.get("stderr", "")})
+
     alerts = []
     agent_filter = (params.agent_name or "").strip()
+    scanned = 0
     for line in (r.get("stdout") or "").strip().splitlines():
+        scanned += 1
+        # Skip already-returned lines
+        if scanned <= skip_lines:
+            continue
         if len(alerts) >= params.limit:
             break
         line = line.strip()
@@ -1213,7 +1347,14 @@ async def blueteam_wazuh_alerts(params: WazuhAlertsInput) -> str:
             alerts.append(a)
         except json.JSONDecodeError:
             continue
-    return json.dumps({"alerts": alerts, "count": len(alerts)}, indent=2)
+
+    next_cursor = _encode_cursor({"scanned": scanned}) if len(alerts) >= params.limit else None
+
+    return json.dumps({
+        "alerts": alerts,
+        "count": len(alerts),
+        "next_cursor": next_cursor,
+    }, indent=2)
 
 
 # Wazuh Indexer index patterns (OpenSearch)
@@ -1234,7 +1375,11 @@ class WazuhIndexerSearchInput(BaseModel):
         description="Agent name to filter (e.g. 'HYDRA-DC'). Leave empty to search all agents.",
     )
     index_type: str = Field(default="alerts", description="Index: alerts, events, or vulnerabilities")
-    limit: int = Field(default=100, description="Max docs to return", ge=1, le=500)
+    limit: int = Field(default=100, description="Max docs to return per page", ge=1, le=10000)
+    cursor: Optional[str] = Field(
+        default=None,
+        description="Pagination cursor from previous response (next_cursor). Omit for first page.",
+    )
 
     @field_validator("agent_name")
     @classmethod
@@ -1248,32 +1393,44 @@ class WazuhIndexerSearchInput(BaseModel):
             if not _AGENT_NAME_SAFE_RE.match(v):
                 raise ValueError("agent_name: use only letters, numbers, hyphen, underscore, dot")
         return v
-        return v
 
 @mcp.tool(
     name="blueteam_wazuh_indexer_search",
     annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True}
 )
 async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
-    """Query Wazuh Indexer (OpenSearch) for alerts/events by agent.
+    """Query Wazuh Indexer (OpenSearch) for alerts/events by agent with cursor pagination.
     Use for HYDRA-DC Windows events and security alerts stored in OpenSearch.
     Requires WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD (port 9200).
+
+    Returns one page per call. Pass the returned next_cursor back as the cursor
+    parameter to fetch the next page. next_cursor is null when all results are exhausted.
 
     Args:
         params.agent_name: Agent name (e.g. HYDRA-DC)
         params.index_type: alerts (default), events, or vulnerabilities
-        params.limit: Max documents (default 100, max 500)
+        params.limit: Max documents per page (default 100, max 10000)
+        params.cursor: next_cursor from previous response (omit for first page)
 
     Returns:
-        str: JSON with hits (total and documents)
+        str: JSON with documents, total, from, size, count, and next_cursor
     """
     if params.index_type not in _WAZUH_INDEX_PATTERNS:
         return json.dumps({"error": f"index_type must be one of: {list(_WAZUH_INDEX_PATTERNS)}"})
     index_pattern = _WAZUH_INDEX_PATTERNS[params.index_type]
+
+    # Decode pagination cursor
+    from_ = 0
+    if params.cursor:
+        decoded = _decode_cursor(params.cursor)
+        if decoded:
+            from_ = decoded.get("from", 0)
+
     data = await _wazuh_indexer_search(
         index_pattern=index_pattern,
         agent_name=params.agent_name,
         size=params.limit,
+        from_=from_,
     )
     if isinstance(data.get("error"), str):
         return json.dumps(data, indent=2)
@@ -1281,9 +1438,17 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
     total = hits.get("total", {})
     total_val = total.get("value", 0) if isinstance(total, dict) else total
     docs = [h.get("_source", h) for h in hits.get("hits", [])]
+
+    # Build next cursor
+    next_offset = from_ + len(docs)
+    next_cursor = _encode_cursor({"from": next_offset}) if next_offset < total_val else None
+
     return json.dumps({
         "total": total_val,
         "count": len(docs),
+        "from": from_,
+        "size": params.limit,
+        "next_cursor": next_cursor,
         "documents": docs,
     }, indent=2)
 

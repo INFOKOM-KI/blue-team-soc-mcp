@@ -80,13 +80,155 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
 
 ### Standalone files (optional backward-compat)
 
-The CrowdSec and GreyNoise tools also ship as separate files for users who prefer modular deployment:
+The CrowdSec and GreyNoise tools also ship as separate files for users who prefer modular deployment. **All standalone servers share the same performance architecture** as the main server (shared `httpx.AsyncClient` with connection pooling, configurable timeouts and character limits).
 
 | File | Tools | When to use |
 |---|---|---|
-| `blue_team_server.py` | **All 37 tools** | **Recommended** — single process, single endpoint |
-| `blue_team_server_crowdsec.py` | 2 CrowdSec CTI tools | Only if you want an isolated CrowdSec-only server |
-| `blue_team_server_greynoise.py` | 1 GreyNoise Community tool | Only if you want an isolated GreyNoise-only server |
+| `blue_team_server.py` | **All 37 tools** | **Recommended** — full capabilities, cursor pagination, token caching |
+| `blue_team_server_crowdsec.py` | 2 CrowdSec CTI tools | Isolated CrowdSec-only server with parallel bulk lookups |
+| `blue_team_server_greynoise.py` | 1 GreyNoise Community tool | Isolated GreyNoise-only server |
+
+---
+
+## Performance Architecture
+
+The suite has been refactored for **bulk data processing and concurrent workloads** beyond single-analyst interactive triage. Every server in the suite now shares the same performance patterns.
+
+### Wazuh Server (`blue_team_server.py`)
+
+#### Cursor-Based Pagination (Bulk Data Without Hard Caps)
+
+All five Wazuh tools support iterative cursor pagination. Each page returns a `next_cursor` token; pass it back as the `cursor` parameter to fetch the next page. When `next_cursor` is `null`, all results have been exhausted.
+
+| Tool | Pagination Mechanism | Max per Page | Cursor Encoding |
+|---|---|---|---|
+| `blueteam_wazuh_indexer_search` | OpenSearch `from`/`size` | 10,000 | `{"from": N}` |
+| `blueteam_wazuh_agents` | Wazuh API `offset`/`limit` | 10,000 | `{"offset": N}` |
+| `blueteam_wazuh_manager_logs` | Wazuh API `offset`/`limit` | 1,000 | `{"offset": N}` |
+| `blueteam_wazuh_alerts` | Line-offset in local `alerts.json` | 2,000 | `{"scanned": N}` |
+
+**Agent workflow:**
+```
+1. Call tool (no cursor) → page 1 + next_cursor
+2. Call tool(cursor=next_cursor) → page 2 + next_cursor
+3. Repeat until next_cursor is null — all results retrieved
+```
+
+Cursors are base64-encoded JSON, transparent to the caller. All input schemas are **backward-compatible** — `cursor` is optional and defaults are unchanged.
+
+#### Shared HTTP Client with Connection Pooling
+
+A single module-level `httpx.AsyncClient` is lazily initialized and reused across all six HTTP-based helper functions (`_http_get`, `_wazuh_get_token`, `_wazuh_api_get`, `_wazuh_indexer_search`, `_crowdsec_request`, `_greynoise_community_request`). Configuration:
+
+- **Keepalive connections**: 20
+- **Max total connections**: 100
+- **Timeout**: `HTTP_TIMEOUT` (configurable, default 30 s)
+
+Every external API call previously created a fresh TCP connection per request. Connection pooling eliminates that overhead — repeated calls to the same service (e.g., Wazuh API, OpenSearch) reuse existing connections.
+
+#### Wazuh JWT Token Caching
+
+The Wazuh Manager API JWT is cached for **300 seconds (5 minutes)** after first authentication. Previously every `_wazuh_api_get()` call performed a full re-authentication round-trip. Now:
+
+- First call: POST to `/security/user/authenticate` → cache token + expiry
+- Subsequent calls within TTL: use cached token (no auth round-trip)
+- Auth failure: cache is cleared so the next call retries fresh
+
+This cuts Wazuh API latency in half for multi-tool agent workflows.
+
+#### Non-Blocking Subprocess Execution
+
+30 of 37 tools invoke system commands (`ss`, `tcpdump`, `lynis`, `rkhunter`, `tail`, etc.). The new `_run_async()` wrapper offloads these to a thread pool via `asyncio.to_thread()`, preventing long-running commands (Lynis at 180 s, rkhunter at 120 s, tcpdump at 60 s) from blocking the event loop. Under HTTP transport with concurrent clients, the server remains responsive to new requests while subprocesses run.
+
+### CrowdSec Server (`blue_team_server_crowdsec.py`)
+
+#### Connection Pooling
+
+Shared `httpx.AsyncClient` with **10 keepalive**, **50 max connections**. The `_crowdsec_request()` helper reuses connections across all tool invocations.
+
+#### Parallel Bulk IP Lookups
+
+`crowdsec_ip_reputation_bulk` now executes all IP lookups **concurrently** via `asyncio.gather()` with an `asyncio.Semaphore` for rate-limit safety:
+
+- **Default concurrency**: 5 parallel requests (configurable via `BLUETEAM_BULK_CONCURRENCY`)
+- **Error isolation**: one failed IP lookup does not affect others
+- **Latency**: 10 IPs complete in ~2 sequential batches instead of 10 — roughly a 5× speedup
+
+```
+Serial (before):   IP₁ → IP₂ → IP₃ → ... → IP₁₀
+Parallel (now):    IP₁..IP₅  concurrently
+                   IP₆..IP₁₀  concurrently
+```
+
+### GreyNoise Server (`blue_team_server_greynoise.py`)
+
+#### Connection Pooling
+
+Shared `httpx.AsyncClient` with **10 keepalive**, **50 max connections**. The `_greynoise_community_request()` helper reuses connections. Though GreyNoise Community is a single-IP lookup tool, connection reuse benefits repeated calls from the same agent session.
+
+---
+
+## Configuration Reference
+
+All environment variables accepted by the suite. Variables marked **[unified]** apply to all three servers; others are server-specific.
+
+### Performance & Limits [unified]
+
+| Variable | Default | Description |
+|---|---|---|
+| `BLUETEAM_CHARACTER_LIMIT` | `25000` | Maximum characters per tool response before truncation |
+| `BLUETEAM_HTTP_TIMEOUT` | `30.0` | HTTP request timeout in seconds (applies to `_get_http_client()`) |
+
+### CrowdSec Bulk Lookups
+
+| Variable | Default | Description |
+|---|---|---|
+| `BLUETEAM_BULK_CONCURRENCY` | `5` | Max parallel IP lookups in `crowdsec_ip_reputation_bulk` |
+
+### Wazuh API
+
+| Variable | Default | Description |
+|---|---|---|
+| `WAZUH_API_URL` | (empty) | Wazuh Manager API base URL (`https://<host>:55000`) |
+| `WAZUH_API_USER` | `wazuh-wui` | Wazuh API username |
+| `WAZUH_API_PASSWORD` | (empty) | Wazuh API password |
+| `WAZUH_API_VERIFY_SSL` | `false` | TLS certificate verification for Wazuh API |
+
+### Wazuh Indexer (OpenSearch)
+
+| Variable | Default | Description |
+|---|---|---|
+| `WAZUH_INDEXER_URL` | (empty) | OpenSearch base URL (`https://<host>:9200`) |
+| `WAZUH_INDEXER_USER` | `admin` | OpenSearch username |
+| `WAZUH_INDEXER_PASSWORD` | (empty) | OpenSearch password |
+| `WAZUH_INDEXER_VERIFY_SSL` | `false` | TLS certificate verification for indexer |
+| `WAZUH_INDEXER_MAX_SIZE` | `10000` | Max documents per page in `_wazuh_indexer_search` |
+
+### Threat Intelligence APIs
+
+| Variable | Default | Description |
+|---|---|---|
+| `CROWDSEC_API_KEY` | (empty) | CrowdSec CTI API key (required for CrowdSec tools) |
+| `ABUSEIPDB_API_KEY` | (empty) | AbuseIPDB API key |
+| `VIRUSTOTAL_API_KEY` | (empty) | VirusTotal API key |
+
+### Transport & Deployment
+
+| Variable | Default | Description |
+|---|---|---|
+| `MCP_TRANSPORT` | `stdio` | Transport mode: `stdio`, `sse`, or `streamable_http` |
+| `MCP_HOST` | `127.0.0.1` | Bind address for SSE/HTTP transports |
+| `MCP_PORT` | `8000` | Bind port for SSE/HTTP transports |
+| `LOG_LEVEL` | `INFO` | Python logging level |
+
+### Security & Auditing
+
+| Variable | Default | Description |
+|---|---|---|
+| `BLUETEAM_AUDIT_LOG` | (empty) | Path to JSONL audit log file |
+| `BLUETEAM_RATE_LIMIT` | `0` (disabled) | Max tool calls per minute |
+| `BLUETEAM_ALLOWED_PATHS` | `/var:/etc:/home:/opt:/usr` | Colon-separated path allowlist for file tools |
+| `BLUETEAM_CAPTURE_DIR` | `/tmp` | Output directory for `blueteam_capture_traffic` pcap files |
 
 ---
 
@@ -238,13 +380,15 @@ All tools below are registered on `blue_team_server.py`. Tools not requiring a s
 | `blueteam_capture_traffic` | Live packet capture via tcpdump |
 
 ### Wazuh SIEM
+*All five tools support cursor-based pagination — see [Cursor-Based Pagination](#cursor-based-pagination-bulk-data-without-hard-caps).*
+
 | Tool | Description |
 |------|-------------|
-| `blueteam_wazuh_agents` | List all Wazuh agents (status, IP, OS) |
+| `blueteam_wazuh_agents` | List all Wazuh agents — paginated via `cursor`/`limit` (up to 10,000/page) |
 | `blueteam_wazuh_agents_summary` | Agent count by status (active/disconnected) |
-| `blueteam_wazuh_manager_logs` | Manager daemon logs (api, cluster, integrations) |
-| `blueteam_wazuh_alerts` | Security alerts from alerts.json (when MCP runs on manager host) |
-| `blueteam_wazuh_indexer_search` | Query OpenSearch for agent alerts/events (HYDRA-DC Windows events) |
+| `blueteam_wazuh_manager_logs` | Manager daemon logs — paginated via `cursor`/`limit` (up to 1,000/page) |
+| `blueteam_wazuh_alerts` | Security alerts from alerts.json — paginated via `cursor`/`limit` (up to 2,000/page) |
+| `blueteam_wazuh_indexer_search` | Query OpenSearch for agent alerts/events — paginated via `cursor`/`limit` (up to 10,000/page) |
 
 ### Threat Intelligence
 | Tool | Description |
@@ -259,7 +403,7 @@ All tools below are registered on `blue_team_server.py`. Tools not requiring a s
 | Tool | Description |
 |------|-------------|
 | `crowdsec_ip_reputation` | Single IP reputation via CrowdSec CTI Smoke API (behaviors, MITRE ATT&CK, CVEs) |
-| `crowdsec_ip_reputation_bulk` | Batch reputation lookup for up to 10 IPs |
+| `crowdsec_ip_reputation_bulk` | Batch reputation lookup for up to 10 IPs — **parallel execution** via `asyncio.gather()` + semaphore (configurable concurrency) |
 
 ### GreyNoise Community
 *Free — no API key required*
@@ -345,6 +489,12 @@ Once connected via Claude Desktop, you can ask:
 "Triage these 5 IPs from my firewall logs against both GreyNoise and CrowdSec.
  Filter out known scanners and business services, then prioritize the rest
  by reputation."
+
+"Search the Wazuh indexer for all alerts from agent HYDRA-DC in the last 24 hours.
+ Use cursor pagination to iterate through all results — don't stop at the first page."
+
+"List every Wazuh agent across the fleet. We have over 1,500 endpoints, so use
+ cursor pagination to enumerate them all — then group by OS and status."
 ```
 
 ---

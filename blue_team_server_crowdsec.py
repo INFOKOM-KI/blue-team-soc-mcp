@@ -7,13 +7,13 @@ Mendukung tiga transport:
   - stdio            (default, lokal, subprocess)
   - sse               (remote, legacy Server-Sent Events)
   - streamable_http   (remote, modern, stateless)
-
-Lihat PRD.md, CLAUDE.md, AGENTS.md, SKILLS.md di root repo untuk konteks desain lengkap.
 """
 
 from __future__ import annotations
 import argparse
+import asyncio
 import ipaddress
+import json
 import logging
 import os
 import sys
@@ -23,7 +23,7 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-# Logging — WAJIB ke stderr. stdout dipakai protokol MCP untuk transport stdio.
+# Logging - ke stderr. stdout dipakai protokol MCP untuk transport stdio.
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -34,10 +34,11 @@ logger = logging.getLogger("blue_team_mcp")
 # Constants
 CROWDSEC_BASE_URL = "https://cti.api.crowdsec.net"
 CROWDSEC_API_KEY_ENV = "CROWDSEC_API_KEY"
-HTTP_TIMEOUT_SECONDS = 30.0
-CHARACTER_LIMIT = 25000
+HTTP_TIMEOUT_SECONDS = float(os.environ.get("BLUETEAM_HTTP_TIMEOUT", "30.0"))
+CHARACTER_LIMIT = int(os.environ.get("BLUETEAM_CHARACTER_LIMIT", "25000"))
+_BULK_CONCURRENCY = int(os.environ.get("BLUETEAM_BULK_CONCURRENCY", "5"))  # max parallel bulk lookups
 
-# Rentang IP privat/reserved — tool ini untuk threat intel IP publik, bukan internal network.
+# Rentang IP privat/reserved - tool ini untuk threat intel IP publik, bukan internal network.
 _PRIVATE_NETWORKS = [
     ipaddress.ip_network(net)
     for net in (
@@ -51,6 +52,20 @@ _PRIVATE_NETWORKS = [
         "fe80::/10",
     )
 ]
+
+# Shared HTTP client with connection pooling
+_shared_http_client: Optional[httpx.AsyncClient] = None
+
+async def _get_http_client() -> httpx.AsyncClient:
+    """Return a shared httpx.AsyncClient with connection pooling.
+    Lazily initialized; reuse across all tool invocations."""
+    global _shared_http_client
+    if _shared_http_client is None or _shared_http_client.is_closed:
+        _shared_http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS),
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=50),
+        )
+    return _shared_http_client
 
 mcp = FastMCP("blue_team_mcp")
 
@@ -85,10 +100,10 @@ async def _crowdsec_request(path: str) -> dict[str, Any]:
         "User-Agent": "blue-team-mcp/1.0.0 (TangerangKota-CSIRT)",
     }
     url = f"{CROWDSEC_BASE_URL}{path}"
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
-        response = await client.get(url, headers=headers)
-        response.raise_for_status()
-        return response.json()
+    client = await _get_http_client()
+    response = await client.get(url, headers=headers)
+    response.raise_for_status()
+    return response.json()
 
 def _handle_api_error(e: Exception, context: str = "") -> str:
     """Consistent, actionable error formatting across all tools."""
@@ -283,8 +298,6 @@ async def crowdsec_ip_reputation(params: CrowdsecIpReputationInput) -> str:
         return _handle_api_error(e, context="crowdsec_ip_reputation")
 
     if params.response_format == ResponseFormat.JSON:
-        import json
-
         output = {
             "ip": params.ip,
             "reputation": raw.get("reputation", "unknown"),
@@ -338,21 +351,24 @@ async def crowdsec_ip_reputation_bulk(params: CrowdsecIpReputationBulkInput) -> 
         - Kegagalan pada satu IP tidak menggagalkan keseluruhan batch — error per-IP dilaporkan
           di dalam hasil, bukan menghentikan proses.
     """
-    import json
-    results: list[dict[str, Any]] = []
-    for ip in params.ips:
-        try:
-            raw = await _crowdsec_request(f"/v2/smoke/{ip}")
-            results.append(
-                {
+    async def _lookup_one(ip: str, sem: asyncio.Semaphore) -> dict[str, Any]:
+        """Look up a single IP under semaphore concurrency control."""
+        async with sem:
+            try:
+                raw = await _crowdsec_request(f"/v2/smoke/{ip}")
+                return {
                     "ip": ip,
                     "reputation": raw.get("reputation", "unknown"),
                     "behaviors": raw.get("behaviors", []),
                     "cves": raw.get("cves", []),
                 }
-            )
-        except Exception as e:  # noqa: BLE001
-            results.append({"ip": ip, "error": _handle_api_error(e, context=ip)})
+            except Exception as e:  # noqa: BLE001
+                return {"ip": ip, "error": _handle_api_error(e, context=ip)}
+
+    sem = asyncio.Semaphore(_BULK_CONCURRENCY)
+    results = await asyncio.gather(
+        *(_lookup_one(ip, sem) for ip in params.ips)
+    )
 
     if params.response_format == ResponseFormat.JSON:
         result = json.dumps(results, indent=2, ensure_ascii=False)

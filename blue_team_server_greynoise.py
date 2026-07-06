@@ -10,18 +10,18 @@ Supports three transports:
 
 The GreyNoise Community API is free and unauthenticated — no API key required.
 Rate limits apply per GreyNoise's fair-use policy.
-
-See PRD.md, CLAUDE.md, AGENTS.md, SKILLS.md in the repo root for full design context.
 """
 
 from __future__ import annotations
 import argparse
+import asyncio
 import ipaddress
+import json
 import logging
 import os
 import sys
 from enum import Enum
-from typing import Any
+from typing import Any, Optional
 import httpx
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -37,8 +37,8 @@ logger = logging.getLogger("blue_team_mcp")
 
 # Constants
 GREYNOISE_COMMUNITY_BASE_URL = "https://api.greynoise.io/v3/community"
-HTTP_TIMEOUT_SECONDS = 30.0
-CHARACTER_LIMIT = 25000
+HTTP_TIMEOUT_SECONDS = float(os.environ.get("BLUETEAM_HTTP_TIMEOUT", "30.0"))
+CHARACTER_LIMIT = int(os.environ.get("BLUETEAM_CHARACTER_LIMIT", "25000"))
 
 # Private / reserved IP ranges — this tool is for public-IP threat intel only.
 _PRIVATE_NETWORKS = [
@@ -54,6 +54,22 @@ _PRIVATE_NETWORKS = [
         "fe80::/10",
     )
 ]
+
+# --- Shared HTTP client with connection pooling ---
+_shared_http_client: Optional[httpx.AsyncClient] = None
+
+
+async def _get_http_client() -> httpx.AsyncClient:
+    """Return a shared httpx.AsyncClient with connection pooling.
+    Lazily initialized; reuse across all tool invocations."""
+    global _shared_http_client
+    if _shared_http_client is None or _shared_http_client.is_closed:
+        _shared_http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS),
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=50),
+        )
+    return _shared_http_client
+
 
 mcp = FastMCP("blue_team_mcp")
 
@@ -82,10 +98,10 @@ async def _greynoise_community_request(ip: str) -> dict[str, Any]:
         "User-Agent": "blue-team-mcp/1.0.0 (TangerangKota-CSIRT)",
     }
     url = f"{GREYNOISE_COMMUNITY_BASE_URL}/{ip}"
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
-        response = await client.get(url, headers=headers)
-        response.raise_for_status()
-        return response.json()
+    client = await _get_http_client()
+    response = await client.get(url, headers=headers)
+    response.raise_for_status()
+    return response.json()
 
 def _handle_api_error(e: Exception, context: str = "") -> str:
     """Consistent, actionable error formatting across all tools."""
@@ -159,18 +175,18 @@ def _format_greynoise_markdown(ip: str, raw: dict[str, Any]) -> str:
     # Noise
     noise = raw.get("noise")
     if noise is True:
-        lines.append("- **Noise**: ✅ Yes — this IP has been observed scanning the internet")
+        lines.append("- **Noise**: Yes — this IP has been observed scanning the internet")
     elif noise is False:
-        lines.append("- **Noise**: ❌ No — this IP has not been observed scanning")
+        lines.append("- **Noise**: No — this IP has not been observed scanning")
     else:
         lines.append("- **Noise**: unknown")
 
     # RIOT (business service)
     riot = raw.get("riot")
     if riot is True:
-        lines.append("- **RIOT**: ✅ Yes — this IP is a known business service (trusted)")
+        lines.append("- **RIOT**: Yes — this IP is a known business service (trusted)")
     elif riot is False:
-        lines.append("- **RIOT**: ❌ No — not a known business service")
+        lines.append("- **RIOT**: No — not a known business service")
     else:
         lines.append("- **RIOT**: unknown")
 
@@ -278,8 +294,6 @@ async def greynoise_ip_context(params: GreynoiseIpContextInput) -> str:
         return _handle_api_error(e, context="greynoise_ip_context")
 
     if params.response_format == ResponseFormat.JSON:
-        import json
-
         output = {
             "ip": raw.get("ip", params.ip),
             "noise": raw.get("noise"),
