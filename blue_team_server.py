@@ -122,13 +122,14 @@ _PRIVATE_NETWORKS = [
     )
 ]
 
-# Shared HTTP client with connection pooling
+# Shared HTTP clients with connection pooling — one per SSL trust domain
 _shared_http_client: Optional[httpx.AsyncClient] = None
+_shared_wazuh_client: Optional[httpx.AsyncClient] = None
+_shared_indexer_client: Optional[httpx.AsyncClient] = None
+
 
 async def _get_http_client() -> httpx.AsyncClient:
-    """Return a shared httpx.AsyncClient with connection pooling.
-    Lazily initialized; reuse across all tool invocations to avoid
-    connection-establishment overhead on every call."""
+    """Return a shared httpx.AsyncClient for public APIs (strict SSL verification)."""
     global _shared_http_client
     if _shared_http_client is None or _shared_http_client.is_closed:
         _shared_http_client = httpx.AsyncClient(
@@ -136,6 +137,30 @@ async def _get_http_client() -> httpx.AsyncClient:
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
         )
     return _shared_http_client
+
+
+async def _get_wazuh_client() -> httpx.AsyncClient:
+    """Return a shared httpx.AsyncClient for the Wazuh Manager API (often self-signed)."""
+    global _shared_wazuh_client
+    if _shared_wazuh_client is None or _shared_wazuh_client.is_closed:
+        _shared_wazuh_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(HTTP_TIMEOUT),
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=50),
+            verify=WAZUH_API_VERIFY_SSL,
+        )
+    return _shared_wazuh_client
+
+
+async def _get_indexer_client() -> httpx.AsyncClient:
+    """Return a shared httpx.AsyncClient for the Wazuh Indexer/OpenSearch (often self-signed)."""
+    global _shared_indexer_client
+    if _shared_indexer_client is None or _shared_indexer_client.is_closed:
+        _shared_indexer_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(HTTP_TIMEOUT),
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=50),
+            verify=WAZUH_INDEXER_VERIFY_SSL,
+        )
+    return _shared_indexer_client
 
 
 # Cursor utilities for pagination
@@ -343,11 +368,10 @@ async def _wazuh_get_token() -> Optional[str]:
         return _wazuh_token
     try:
         url = f"{WAZUH_API_URL}/security/user/authenticate?raw=true"
-        client = await _get_http_client()
+        client = await _get_wazuh_client()
         resp = await client.post(
             url,
             auth=(WAZUH_API_USER, WAZUH_API_PASSWORD),
-            verify=WAZUH_API_VERIFY_SSL,
         )
         resp.raise_for_status()
         _wazuh_token = resp.text.strip().strip('"')
@@ -380,12 +404,11 @@ async def _wazuh_api_get(path: str, params: Dict[str, str] = None) -> Dict:
         }
     url = f"{WAZUH_API_URL}{path}"
     try:
-        client = await _get_http_client()
+        client = await _get_wazuh_client()
         resp = await client.get(
             url,
             headers={"Authorization": f"Bearer {token}"},
             params=params or {},
-            verify=WAZUH_API_VERIFY_SSL,
         )
         resp.raise_for_status()
         return resp.json()
@@ -417,13 +440,12 @@ async def _wazuh_indexer_search(
         "query": query,
     }
     try:
-        client = await _get_http_client()
+        client = await _get_indexer_client()
         resp = await client.post(
             url,
             auth=(WAZUH_INDEXER_USER, WAZUH_INDEXER_PASSWORD),
             json=body,
             headers={"Content-Type": "application/json"},
-            verify=WAZUH_INDEXER_VERIFY_SSL,
         )
         resp.raise_for_status()
         return resp.json()
