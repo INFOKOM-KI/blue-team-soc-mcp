@@ -428,6 +428,8 @@ async def _wazuh_indexer_search(
     size: int,
     search_after: Optional[list] = None,
     srcip: Optional[str] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
 ) -> Dict:
     """Query Wazuh Indexer (OpenSearch) for alerts/events. Read-only _search only.
     Uses search_after cursor pagination — bypasses the 10000 doc max_result_window
@@ -435,15 +437,11 @@ async def _wazuh_indexer_search(
     if not WAZUH_INDEXER_URL or not WAZUH_INDEXER_PASSWORD:
         return {"error": "WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD must be set. See README for Indexer setup."}
     url = f"{WAZUH_INDEXER_URL}/{index_pattern}/_search"
-    # Build query: bool with must clauses for agent name and/or srcip
+    # Build query: bool with must clauses for agent name, srcip, and time range
     must_clauses = []
     if agent_name and agent_name.strip():
         must_clauses.append({"match": {"agent.name": agent_name.strip()}})
     if srcip and srcip.strip():
-        # Wazuh alerts store srcip in data.srcip (and data.srcip2 when
-        # nginx reverse-proxy logs capture both the real client and the
-        # upstream proxy address). Also search top-level srcip
-        # (active-response alerts) and full_log text for completeness.
         must_clauses.append({
             "bool": {
                 "should": [
@@ -453,6 +451,18 @@ async def _wazuh_indexer_search(
                     {"match_phrase": {"full_log": srcip.strip()}},
                 ],
                 "minimum_should_match": 1,
+            }
+        })
+    # Time-range filter on @timestamp (UTC). Accepts ISO 8601 strings.
+    # Both since and until must be non-empty to add the clause.
+    if since and since.strip() and until and until.strip():
+        must_clauses.append({
+            "range": {
+                "@timestamp": {
+                    "gte": since.strip(),
+                    "lt": until.strip(),
+                    "format": "strict_date_optional_time",
+                }
             }
         })
     query = {"bool": {"must": must_clauses}} if must_clauses else {"match_all": {}}
@@ -1330,6 +1340,8 @@ class WazuhAlertsInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     agent_name: Optional[str] = Field(default=None, max_length=64, description="Filter by agent name (e.g. HYDRA-DC)")
     srcip: Optional[str] = Field(default=None, max_length=45, description="Source IP filter (e.g. '180.254.78.145')")
+    since: Optional[str] = Field(default=None, max_length=30, description="ISO 8601 start time in UTC")
+    until: Optional[str] = Field(default=None, max_length=30, description="ISO 8601 end time in UTC")
     limit: int = Field(default=100, description="Max alerts per page", ge=1, le=2000)
     cursor: Optional[str] = Field(
         default=None,
@@ -1389,6 +1401,8 @@ async def blueteam_wazuh_alerts(params: WazuhAlertsInput) -> str:
             size=params.limit,
             search_after=search_after,
             srcip=params.srcip,
+            since=params.since,
+            until=params.until,
         )
         if isinstance(data.get("error"), str):
             return json.dumps(data, indent=2)
@@ -1502,6 +1516,18 @@ class WazuhIndexerSearchInput(BaseModel):
         description="Source IP address to filter alerts by (e.g. '180.254.78.145'). "
                     "Searches data.srcip, srcip, and full_log fields. Leave empty for all IPs.",
     )
+    since: Optional[str] = Field(
+        default=None,
+        max_length=30,
+        description="ISO 8601 start time in UTC (e.g. '2026-07-05T18:30:00Z'). "
+                    "Filters alerts with @timestamp >= this value.",
+    )
+    until: Optional[str] = Field(
+        default=None,
+        max_length=30,
+        description="ISO 8601 end time in UTC (e.g. '2026-07-05T19:00:00Z'). "
+                    "Filters alerts with @timestamp < this value.",
+    )
     cursor: Optional[str] = Field(
         default=None,
         description="Pagination cursor from previous response (next_cursor). Uses search_after "
@@ -1551,6 +1577,8 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
     Args:
         params.agent_name: Optional agent name filter (e.g. HYDRA-DC)
         params.srcip: Optional source IP filter (e.g. '180.254.78.145')
+        params.since: Optional ISO 8601 start time in UTC (e.g. '2026-07-05T18:30:00Z')
+        params.until: Optional ISO 8601 end time in UTC (e.g. '2026-07-05T19:00:00Z')
         params.index_type: alerts (default), events, or vulnerabilities
         params.limit: Max documents per page (default 100, max 10000)
         params.cursor: next_cursor from previous response (omit for first page)
@@ -1575,6 +1603,8 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
         size=params.limit,
         search_after=search_after,
         srcip=params.srcip,
+        since=params.since,
+        until=params.until,
     )
     if isinstance(data.get("error"), str):
         return json.dumps(data, indent=2)
