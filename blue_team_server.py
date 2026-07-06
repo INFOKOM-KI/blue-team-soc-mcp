@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Blue Team MCP Server
-A defensive security MCP server for Claude Desktop, mirroring the Kali mcp-kali-server setup but for blue team / defenders.
+A defensive security MCP server for Claude Desktop and Compatible with any MCP Host. 
+Mirroring the Kali mcp-kali-server setup but for blue team / defenders / SOC.
 
 MAESTRO Framework: Aligned with CSA MAESTRO (Layer 3 Agent Frameworks, Layer 5 Observability, Layer 6 Security & Compliance).
 
@@ -201,6 +202,9 @@ def _handle_api_error(e: Exception, context: str = "") -> str:
     prefix = f"[{context}] " if context else ""
     if isinstance(e, httpx.HTTPStatusError):
         status = e.response.status_code
+        if status == 400:
+            return f"{prefix}Error: Bad request (400) — the API rejected the parameters. "
+            "Try a smaller limit (e.g. limit=50) or a different filter."
         if status == 401:
             return f"{prefix}Error: Invalid or missing API key (401). Check your environment variables."
         if status == 404:
@@ -1263,7 +1267,10 @@ async def blueteam_wazuh_manager_logs(params: WazuhLogsInput) -> str:
         if decoded:
             offset = decoded.get("offset", 0)
 
-    api_params = {"offset": str(offset), "limit": str(params.limit), "pretty": "true"}
+    # Wazuh Manager API hard-caps limit at 500 — values > 500 return 400.
+    # Auto-cap here so LLM clients pass large values without triggering API errors.
+    wazuh_safe_limit = min(params.limit, 500)
+    api_params = {"offset": str(offset), "limit": str(wazuh_safe_limit), "pretty": "true"}
     tag = _WAZUH_LOG_TAG.get(params.log_type)
     if tag:
         api_params["tag"] = tag
@@ -1328,10 +1335,11 @@ async def blueteam_wazuh_alerts(params: WazuhAlertsInput) -> str:
     p = Path(_WAZUH_ALERTS_PATH)
     if not p.exists():
         return json.dumps({
-            "error": "alerts.json not found on this host",
+            "error": "[CRITICAL METADATA] This tool is disabled because the Wazuh Manager "
+                     "is running on a remote host. DO NOT RETRY this local tool. You MUST "
+                     "immediately switch to 'blueteam_wazuh_indexer_search' or "
+                     "'blueteam_wazuh_manager_logs' to query security events.",
             "path": _WAZUH_ALERTS_PATH,
-            "hint": "This tool runs on the MCP host. Alerts live on the Wazuh manager. "
-                    "If Wazuh is on another host, use the indexer/OpenSearch API or run the command there directly."
         }, indent=2)
 
     # Decode cursor to find how many lines were already scanned

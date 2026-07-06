@@ -112,6 +112,9 @@ def _handle_api_error(e: Exception, context: str = "") -> str:
     prefix = f"[{context}] " if context else ""
     if isinstance(e, httpx.HTTPStatusError):
         status = e.response.status_code
+        if status == 400:
+            return f"{prefix}Error: Bad request (400) — API menolak parameter. "
+            "Coba batasi jumlah IP atau kurangi ukuran batch."
         if status == 401:
             return f"{prefix}Error: API key tidak valid atau belum diset (401)."
         if status == 404:
@@ -134,8 +137,9 @@ def _truncate_if_needed(text: str) -> str:
     truncated = text[: CHARACTER_LIMIT]
     return (
         truncated
-        + f"\n\n... [truncated - response melebihi {CHARACTER_LIMIT} karakter, "
-        "gunakan filter lebih spesifik]"
+        + f"\n\n... [truncated - response melebihi {CHARACTER_LIMIT} karakter. "
+        "Batch lookup hasil besar? Kurangi max_length atau gunakan crowdsec_ip_reputation "
+        "satu per satu untuk memproses IP secara bertahap.]"
     )
 
 # Input models

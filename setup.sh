@@ -88,6 +88,7 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 # Performance & Tuning Limits
 # export BLUETEAM_CHARACTER_LIMIT="25000"       # max chars per tool response before truncation
 # export BLUETEAM_HTTP_TIMEOUT="30.0"           # HTTP request timeout in seconds
+# export BLUETEAM_VERIFY_SSL="true"             # SSL cert verification for external API calls
 # export BLUETEAM_BULK_CONCURRENCY="5"          # max parallel IP lookups (CrowdSec bulk)
 # export WAZUH_INDEXER_MAX_SIZE="10000"         # max documents per page in Wazuh Indexer search
 
@@ -123,6 +124,7 @@ export BLUETEAM_ALLOWED_PATHS="${BLUETEAM_ALLOWED_PATHS:-/var:/etc:/home:/opt:/u
 export BLUETEAM_CAPTURE_DIR="${BLUETEAM_CAPTURE_DIR:-/tmp}"
 export BLUETEAM_HTTP_TIMEOUT="${BLUETEAM_HTTP_TIMEOUT:-30.0}"
 export BLUETEAM_CHARACTER_LIMIT="${BLUETEAM_CHARACTER_LIMIT:-25000}"
+export BLUETEAM_VERIFY_SSL="${BLUETEAM_VERIFY_SSL:-true}"
 export WAZUH_INDEXER_MAX_SIZE="${WAZUH_INDEXER_MAX_SIZE:-10000}"
 export WAZUH_API_URL="${WAZUH_API_URL:-}"
 export WAZUH_API_USER="${WAZUH_API_USER:-wazuh-wui}"
@@ -147,6 +149,7 @@ cat > /usr/local/bin/mcp-server-crowdsec << 'EOF'
 export CROWDSEC_API_KEY="${CROWDSEC_API_KEY:-}"
 export BLUETEAM_HTTP_TIMEOUT="${BLUETEAM_HTTP_TIMEOUT:-30.0}"
 export BLUETEAM_CHARACTER_LIMIT="${BLUETEAM_CHARACTER_LIMIT:-25000}"
+export BLUETEAM_VERIFY_SSL="${BLUETEAM_VERIFY_SSL:-true}"
 export BLUETEAM_BULK_CONCURRENCY="${BLUETEAM_BULK_CONCURRENCY:-5}"
 export MCP_TRANSPORT="${MCP_TRANSPORT:-stdio}"
 export MCP_HOST="${MCP_HOST:-127.0.0.1}"
@@ -162,6 +165,7 @@ cat > /usr/local/bin/mcp-server-greynoise << 'EOF'
 [[ -f /opt/blue-team-mcp/config.env ]] && source /opt/blue-team-mcp/config.env
 export BLUETEAM_HTTP_TIMEOUT="${BLUETEAM_HTTP_TIMEOUT:-30.0}"
 export BLUETEAM_CHARACTER_LIMIT="${BLUETEAM_CHARACTER_LIMIT:-25000}"
+export BLUETEAM_VERIFY_SSL="${BLUETEAM_VERIFY_SSL:-true}"
 export MCP_TRANSPORT="${MCP_TRANSPORT:-stdio}"
 export MCP_HOST="${MCP_HOST:-127.0.0.1}"
 export MCP_PORT="${MCP_PORT:-8000}"

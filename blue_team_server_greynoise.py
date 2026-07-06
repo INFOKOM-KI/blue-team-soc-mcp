@@ -56,7 +56,7 @@ _PRIVATE_NETWORKS = [
     )
 ]
 
-# --- Shared HTTP client with connection pooling ---
+# Shared HTTP client with connection pooling
 _shared_http_client: Optional[httpx.AsyncClient] = None
 
 
@@ -110,6 +110,9 @@ def _handle_api_error(e: Exception, context: str = "") -> str:
     prefix = f"[{context}] " if context else ""
     if isinstance(e, httpx.HTTPStatusError):
         status = e.response.status_code
+        if status == 400:
+            return f"{prefix}Error: Bad request (400) — GreyNoise rejected the parameters. "
+            "Verify the IP format is valid and the field values are well-formed."
         if status == 404:
             return f"{prefix}Error: No GreyNoise data found for this IP (404). The IP may not have been observed scanning."
         if status == 429:
@@ -131,8 +134,9 @@ def _truncate_if_needed(text: str) -> str:
     truncated = text[:CHARACTER_LIMIT]
     return (
         truncated
-        + f"\n\n... [truncated — response exceeds {CHARACTER_LIMIT} characters, "
-        "use a more specific filter]"
+        + f"\n\n... [truncated — response exceeds {CHARACTER_LIMIT} characters. "
+        "Response may include verbose raw fields; switch to "
+        "response_format='json' for structured output with tighter field selection.]"
     )
 
 # Input models
