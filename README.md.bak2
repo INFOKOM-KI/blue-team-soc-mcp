@@ -1,6 +1,6 @@
 # Blue Team MCP Server
 
-A defensive security MCP server for Claude Desktop or any MCP Client - the defender's counterpart to [mcp-kali-server](https://www.kali.org/blog/kali-llm-claude-desktop/).
+A defensive security MCP server for Claude Desktop or any MCP Client — the defender's counterpart to [mcp-kali-server](https://www.kali.org/blog/kali-llm-claude-desktop/).
 
 Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this gives Claude **blue team / SOC analyst tools** to investigate, monitor, and harden your systems.
 
@@ -95,7 +95,7 @@ The CrowdSec and GreyNoise tools also ship as separate files for users who prefe
 ### 1. On your Defender Host (Ubuntu/Debian)
 
 ```bash
-git clone https://github.com/INFOKOM-KI/blue-team-soc-mcp.git
+git clone <this repo>
 cd blue-team-mcp
 sudo bash setup.sh
 ```
@@ -120,11 +120,11 @@ Uncomment and set the variables you need:
 - **CROWDSEC_API_KEY** — https://www.crowdsec.net/en/user/profile (free CTI tier; powers the `crowdsec_ip_reputation` tools)
 - **ABUSEIPDB_API_KEY** — https://www.abuseipdb.com/account/api
 - **VIRUSTOTAL_API_KEY** — https://www.virustotal.com/gui/my-apikey
-- **WAZUH_API_URL** — `https://<host>:55000` (if Wazuh is on same host) or `https://<host>:55000`
+- **WAZUH_API_URL** — `https://localhost:55000` (if Wazuh is on same host) or `https://<host>:55000`
 - **WAZUH_API_USER** — `wazuh-wui` (Wazuh Docker default)
 - **WAZUH_API_PASSWORD** — e.g. `MyS3cr37P450r.*-` (Wazuh Docker default)
 - **WAZUH_API_VERIFY_SSL** — `false` for self-signed certs
-- **WAZUH_INDEXER_URL** — `https://<host>:9200` (if on same host) or `https://<host>:9200`
+- **WAZUH_INDEXER_URL** — `https://localhost:9200` (if on same host) or `https://<host>:9200`
 - **WAZUH_INDEXER_USER** — `admin` (indexer default)
 - **WAZUH_INDEXER_PASSWORD** — indexer password (often different from Wazuh API)
 - **WAZUH_INDEXER_VERIFY_SSL** — `false` for self-signed certs
