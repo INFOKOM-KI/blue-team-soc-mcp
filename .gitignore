@@ -37,6 +37,9 @@ config.env
 .bak
 .bak.*
 .bak-*/
+*.bak
+*.bak.*
+*.bak-*
 
 # Logs
 *.log
