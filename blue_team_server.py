@@ -426,10 +426,11 @@ async def _wazuh_indexer_search(
     index_pattern: str,
     agent_name: Optional[str],
     size: int,
-    from_: int = 0,
+    search_after: Optional[list] = None,
 ) -> Dict:
     """Query Wazuh Indexer (OpenSearch) for alerts/events. Read-only _search only.
-    Supports from_/size pagination for iterative bulk retrieval."""
+    Uses search_after cursor pagination — bypasses the 10 000-doc max_result_window
+    by traversing sort keys instead of numeric offsets."""
     if not WAZUH_INDEXER_URL or not WAZUH_INDEXER_PASSWORD:
         return {"error": "WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD must be set. See README for Indexer setup."}
     url = f"{WAZUH_INDEXER_URL}/{index_pattern}/_search"
@@ -439,11 +440,17 @@ async def _wazuh_indexer_search(
     else:
         query = {"match_all": {}}
     body = {
-        "from": from_,
         "size": min(size, _WAZUH_INDEXER_MAX_SIZE),
-        "sort": [{"@timestamp": {"order": "desc"}}],
+        "sort": [
+            {"@timestamp": {"order": "asc"}},
+            {"_id": {"order": "asc"}},
+        ],
         "query": query,
     }
+    # search_after must ONLY be present when a non-empty cursor array is supplied.
+    # Omitting it on the first page avoids a malformed-query error.
+    if search_after:
+        body["search_after"] = search_after
     try:
         client = await _get_indexer_client()
         resp = await client.post(
@@ -1412,7 +1419,8 @@ class WazuhIndexerSearchInput(BaseModel):
     limit: int = Field(default=100, description="Max docs to return per page", ge=1, le=10000)
     cursor: Optional[str] = Field(
         default=None,
-        description="Pagination cursor from previous response (next_cursor). Omit for first page.",
+        description="Pagination cursor from previous response (next_cursor). Uses search_after "
+                    "sort-key traversal — no 10K-doc ceiling. Omit for first page.",
     )
 
     @field_validator("agent_name")
@@ -1453,34 +1461,38 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
         return json.dumps({"error": f"index_type must be one of: {list(_WAZUH_INDEX_PATTERNS)}"})
     index_pattern = _WAZUH_INDEX_PATTERNS[params.index_type]
 
-    # Decode pagination cursor
-    from_ = 0
+    # Decode pagination cursor — search_after uses sort-key values, not numeric offsets
+    search_after: Optional[list] = None
     if params.cursor:
         decoded = _decode_cursor(params.cursor)
         if decoded:
-            from_ = decoded.get("from", 0)
+            search_after = decoded.get("search_after")
 
     data = await _wazuh_indexer_search(
         index_pattern=index_pattern,
         agent_name=params.agent_name,
         size=params.limit,
-        from_=from_,
+        search_after=search_after,
     )
     if isinstance(data.get("error"), str):
         return json.dumps(data, indent=2)
     hits = data.get("hits", {})
     total = hits.get("total", {})
     total_val = total.get("value", 0) if isinstance(total, dict) else total
+    total_relation = total.get("relation", "eq") if isinstance(total, dict) else "eq"
     docs = [h.get("_source", h) for h in hits.get("hits", [])]
 
-    # Build next cursor
-    next_offset = from_ + len(docs)
-    next_cursor = _encode_cursor({"from": next_offset}) if next_offset < total_val else None
+    # Build next cursor from the last document's sort values
+    next_cursor = None
+    hit_list = hits.get("hits", [])
+    if hit_list and len(docs) >= params.limit:
+        last_sort = hit_list[-1].get("sort")
+        if last_sort:
+            next_cursor = _encode_cursor({"search_after": last_sort})
 
     return _truncate_if_needed(json.dumps({
-        "total": total_val,
+        "total": {"value": total_val, "relation": total_relation},
         "count": len(docs),
-        "from": from_,
         "size": params.limit,
         "next_cursor": next_cursor,
         "documents": docs,
