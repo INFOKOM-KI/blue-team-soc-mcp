@@ -73,7 +73,7 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
 ┌─────────────────────┐     HTTP (SSE or       ┌─────────────────────────┐
 │   Any MCP Client    │     Streamable HTTP)    │    Defender Host        │
 │   (Claude Desktop,  │ ────────────────────── │   systemd service:      │
-│    custom client)   │     http://host:8000    │   blue_team_server.py   │
+│    custom client)   │     http://<host>:8000    │   blue_team_server.py   │
 └─────────────────────┘                        │   --transport http      │
                                                └─────────────────────────┘
 ```
@@ -104,7 +104,7 @@ All five Wazuh tools support iterative cursor pagination via base64-encoded JSON
 |---|---|---|---|
 | `blueteam_wazuh_indexer_search` | OpenSearch `search_after` (sort-key traversal) | 10,000 | `{"search_after": [<sort_values>]}` |
 | `blueteam_wazuh_agents` | Wazuh API `offset`/`limit` | 10,000 | `{"offset": N}` |
-| `blueteam_wazuh_manager_logs` | Wazuh API `offset`/`limit` | **500** (auto-capped) | `{"offset": N}` |
+| `blueteam_wazuh_manager_logs` | Wazuh API `offset`/`limit` | **500** (auto capped) | `{"offset": N}` |
 | `blueteam_wazuh_alerts` | Line-offset in local `alerts.json` | 2,000 | `{"scanned": N}` |
 
 **Agent workflow:**
@@ -116,7 +116,7 @@ All five Wazuh tools support iterative cursor pagination via base64-encoded JSON
 
 All input schemas are **backward-compatible** — `cursor` is optional and defaults are unchanged.
 
-#### Deep-Paging via `search_after` (`blueteam_wazuh_indexer_search`)
+#### Paging via `search_after` (`blueteam_wazuh_indexer_search`)
 
 The Wazuh Indexer search tool was migrated from offset-based pagination (`from`/`size`) to OpenSearch's `search_after` cursor, eliminating the 10,000-document `max_result_window` ceiling:
 
@@ -125,7 +125,7 @@ The Wazuh Indexer search tool was migrated from offset-based pagination (`from`/
 - **Truncation metadata**: The response exposes `total` as an object `{"value": <int>, "relation": <"eq"|"gte">}`. When `relation` is `"gte"` (greater-than-or-equal), the LLM client knows the true document count exceeds the reported ceiling and continues paginating.
 - **Natural exhaustion**: `next_cursor` becomes `null` when the number of returned documents is strictly less than the requested `limit` — no arithmetic against a capped `total.value`.
 
-#### Auto-Cap Limit Guard (Self-Healing Defense)
+#### Auto Cap Limit Guard (Self Healing Defense)
 
 The Wazuh Manager API (`/manager/logs`) rejects `limit > 500` with HTTP 400. The Pydantic input model allows up to 1,000, creating a gap where LLM clients can inadvertently construct failing requests. The `blueteam_wazuh_manager_logs` tool now applies an inline safety clamp before the HTTP call:
 
@@ -316,7 +316,7 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS).
     "blue-team-mcp": {
       "command": "ssh",
       "args": [
-        "-i", "/Users/you/.ssh/ubuntu-soc",
+        "-i", "/Users/defence/.ssh/ubuntu-soc",
         "soc-admin@192.168.153.5",
         "mcp-server-blueteam"
       ],
