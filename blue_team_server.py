@@ -427,6 +427,7 @@ async def _wazuh_indexer_search(
     agent_name: Optional[str],
     size: int,
     search_after: Optional[list] = None,
+    srcip: Optional[str] = None,
 ) -> Dict:
     """Query Wazuh Indexer (OpenSearch) for alerts/events. Read-only _search only.
     Uses search_after cursor pagination — bypasses the 10000 doc max_result_window
@@ -434,11 +435,27 @@ async def _wazuh_indexer_search(
     if not WAZUH_INDEXER_URL or not WAZUH_INDEXER_PASSWORD:
         return {"error": "WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD must be set. See README for Indexer setup."}
     url = f"{WAZUH_INDEXER_URL}/{index_pattern}/_search"
-    # Build query: filter by agent.name if provided, else match_all
+    # Build query: bool with must clauses for agent name and/or srcip
+    must_clauses = []
     if agent_name and agent_name.strip():
-        query = {"match": {"agent.name": agent_name.strip()}}
-    else:
-        query = {"match_all": {}}
+        must_clauses.append({"match": {"agent.name": agent_name.strip()}})
+    if srcip and srcip.strip():
+        # Wazuh alerts store srcip in data.srcip (and data.srcip2 when
+        # nginx reverse-proxy logs capture both the real client and the
+        # upstream proxy address). Also search top-level srcip
+        # (active-response alerts) and full_log text for completeness.
+        must_clauses.append({
+            "bool": {
+                "should": [
+                    {"match": {"data.srcip": srcip.strip()}},
+                    {"match": {"data.srcip2": srcip.strip()}},
+                    {"match": {"srcip": srcip.strip()}},
+                    {"match_phrase": {"full_log": srcip.strip()}},
+                ],
+                "minimum_should_match": 1,
+            }
+        })
+    query = {"bool": {"must": must_clauses}} if must_clauses else {"match_all": {}}
     body = {
         "size": min(size, _WAZUH_INDEXER_MAX_SIZE),
         "sort": [
@@ -1312,6 +1329,7 @@ _WAZUH_ALERTS_MAX_LINES = 2000  # safety cap
 class WazuhAlertsInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     agent_name: Optional[str] = Field(default=None, max_length=64, description="Filter by agent name (e.g. HYDRA-DC)")
+    srcip: Optional[str] = Field(default=None, max_length=45, description="Source IP filter (e.g. '180.254.78.145')")
     limit: int = Field(default=100, description="Max alerts per page", ge=1, le=2000)
     cursor: Optional[str] = Field(
         default=None,
@@ -1370,6 +1388,7 @@ async def blueteam_wazuh_alerts(params: WazuhAlertsInput) -> str:
             agent_name=params.agent_name,
             size=params.limit,
             search_after=search_after,
+            srcip=params.srcip,
         )
         if isinstance(data.get("error"), str):
             return json.dumps(data, indent=2)
@@ -1412,6 +1431,7 @@ async def blueteam_wazuh_alerts(params: WazuhAlertsInput) -> str:
 
     alerts = []
     agent_filter = (params.agent_name or "").strip()
+    ip_filter = (params.srcip or "").strip()
     scanned = 0
     for line in (r.get("stdout") or "").strip().splitlines():
         scanned += 1
@@ -1432,6 +1452,16 @@ async def blueteam_wazuh_alerts(params: WazuhAlertsInput) -> str:
                 else:
                     name = str(agent)
                 if agent_filter.lower() not in (name or "").lower():
+                    continue
+            # Filter by source IP — checks data.srcip, data.srcip2, top-level
+            # srcip (active-response), and full_log for the IP string
+            if ip_filter:
+                data_srcip = str(a.get("data", {}).get("srcip", ""))
+                data_srcip2 = str(a.get("data", {}).get("srcip2", ""))
+                top_srcip = str(a.get("srcip", ""))
+                full_log = str(a.get("full_log", ""))
+                if (ip_filter not in (data_srcip, data_srcip2, top_srcip)
+                        and ip_filter not in full_log):
                     continue
             alerts.append(a)
         except json.JSONDecodeError:
@@ -1466,6 +1496,12 @@ class WazuhIndexerSearchInput(BaseModel):
     )
     index_type: str = Field(default="alerts", description="Index: alerts, events, or vulnerabilities")
     limit: int = Field(default=100, description="Max docs to return per page", ge=1, le=10000)
+    srcip: Optional[str] = Field(
+        default=None,
+        max_length=45,
+        description="Source IP address to filter alerts by (e.g. '180.254.78.145'). "
+                    "Searches data.srcip, srcip, and full_log fields. Leave empty for all IPs.",
+    )
     cursor: Optional[str] = Field(
         default=None,
         description="Pagination cursor from previous response (next_cursor). Uses search_after "
@@ -1485,20 +1521,36 @@ class WazuhIndexerSearchInput(BaseModel):
                 raise ValueError("agent_name: use only letters, numbers, hyphen, underscore, dot")
         return v
 
+    @field_validator("srcip")
+    @classmethod
+    def validate_srcip(cls, v: Optional[str]) -> Optional[str]:
+        """Sanitize srcip: validate looks like an IP address to prevent injection."""
+        if v is not None:
+            v = v.strip()
+            if not v:
+                return None
+            if len(v) > 45:
+                raise ValueError("srcip too long (max 45)")
+            # Allow IPv4, IPv6, and CIDR notation — reject obvious non-IP strings
+            if not re.match(r"^[0-9a-fA-F.:/]+$", v):
+                raise ValueError("srcip must be a valid IP address or CIDR range")
+        return v
+
 @mcp.tool(
     name="blueteam_wazuh_indexer_search",
     annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True}
 )
 async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
-    """Query Wazuh Indexer (OpenSearch) for alerts/events by agent with cursor pagination.
-    Use for HYDRA-DC Windows events and security alerts stored in OpenSearch.
+    """Query Wazuh Indexer (OpenSearch) for alerts/events with cursor pagination.
+    Supports filtering by agent_name, srcip (source IP), or both simultaneously.
     Requires WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD (port 9200).
 
     Returns one page per call. Pass the returned next_cursor back as the cursor
     parameter to fetch the next page. next_cursor is null when all results are exhausted.
 
     Args:
-        params.agent_name: Agent name (e.g. HYDRA-DC)
+        params.agent_name: Optional agent name filter (e.g. HYDRA-DC)
+        params.srcip: Optional source IP filter (e.g. '180.254.78.145')
         params.index_type: alerts (default), events, or vulnerabilities
         params.limit: Max documents per page (default 100, max 10000)
         params.cursor: next_cursor from previous response (omit for first page)
@@ -1522,6 +1574,7 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
         agent_name=params.agent_name,
         size=params.limit,
         search_after=search_after,
+        srcip=params.srcip,
     )
     if isinstance(data.get("error"), str):
         return json.dumps(data, indent=2)
