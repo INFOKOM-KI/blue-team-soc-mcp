@@ -347,6 +347,7 @@ async def _wazuh_get_token() -> Optional[str]:
         resp = await client.post(
             url,
             auth=(WAZUH_API_USER, WAZUH_API_PASSWORD),
+            verify=WAZUH_API_VERIFY_SSL,
         )
         resp.raise_for_status()
         _wazuh_token = resp.text.strip().strip('"')
@@ -384,6 +385,7 @@ async def _wazuh_api_get(path: str, params: Dict[str, str] = None) -> Dict:
             url,
             headers={"Authorization": f"Bearer {token}"},
             params=params or {},
+            verify=WAZUH_API_VERIFY_SSL,
         )
         resp.raise_for_status()
         return resp.json()
@@ -421,6 +423,7 @@ async def _wazuh_indexer_search(
             auth=(WAZUH_INDEXER_USER, WAZUH_INDEXER_PASSWORD),
             json=body,
             headers={"Content-Type": "application/json"},
+            verify=WAZUH_INDEXER_VERIFY_SSL,
         )
         resp.raise_for_status()
         return resp.json()

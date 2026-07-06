@@ -37,6 +37,7 @@ CROWDSEC_API_KEY_ENV = "CROWDSEC_API_KEY"
 HTTP_TIMEOUT_SECONDS = float(os.environ.get("BLUETEAM_HTTP_TIMEOUT", "30.0"))
 CHARACTER_LIMIT = int(os.environ.get("BLUETEAM_CHARACTER_LIMIT", "25000"))
 _BULK_CONCURRENCY = int(os.environ.get("BLUETEAM_BULK_CONCURRENCY", "5"))  # max parallel bulk lookups
+BLUETEAM_VERIFY_SSL = os.environ.get("BLUETEAM_VERIFY_SSL", "true").lower() in ("1", "true", "yes")
 
 # Rentang IP privat/reserved - tool ini untuk threat intel IP publik, bukan internal network.
 _PRIVATE_NETWORKS = [
@@ -64,6 +65,7 @@ async def _get_http_client() -> httpx.AsyncClient:
         _shared_http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS),
             limits=httpx.Limits(max_keepalive_connections=10, max_connections=50),
+            verify=BLUETEAM_VERIFY_SSL,
         )
     return _shared_http_client
 
