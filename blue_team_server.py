@@ -429,7 +429,7 @@ async def _wazuh_indexer_search(
     search_after: Optional[list] = None,
 ) -> Dict:
     """Query Wazuh Indexer (OpenSearch) for alerts/events. Read-only _search only.
-    Uses search_after cursor pagination — bypasses the 10 000-doc max_result_window
+    Uses search_after cursor pagination — bypasses the 10000 doc max_result_window
     by traversing sort keys instead of numeric offsets."""
     if not WAZUH_INDEXER_URL or not WAZUH_INDEXER_PASSWORD:
         return {"error": "WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD must be set. See README for Indexer setup."}
@@ -1324,9 +1324,10 @@ class WazuhAlertsInput(BaseModel):
     annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}
 )
 async def blueteam_wazuh_alerts(params: WazuhAlertsInput) -> str:
-    """Read security alerts from Wazuh alerts.json with cursor pagination.
-    Use when the MCP runs on the Wazuh manager host (or has /var/ossec/logs/alerts mounted).
-    Returns one page per call. Pass next_cursor back as cursor for the next page.
+    """Read Wazuh security alerts — local alerts.json first, auto-fallback to Indexer.
+    When /var/ossec/logs/alerts/alerts.json is available (MCP on Wazuh Manager host),
+    reads directly from the file. When the file is absent (remote Wazuh Manager),
+    automatically delegates to the Wazuh Indexer (OpenSearch) — no tool switch needed.
 
     Args:
         params.agent_name: Optional filter by agent name (e.g. HYDRA-DC)
@@ -1334,20 +1335,67 @@ async def blueteam_wazuh_alerts(params: WazuhAlertsInput) -> str:
         params.cursor: next_cursor from previous response (omit for first page)
 
     Returns:
-        str: JSON with alerts, count, scanned, next_cursor
+        str: JSON with alerts, count, next_cursor, and source field ("local" or "wazuh-indexer")
     """
     ok, err = _validate_path(_WAZUH_ALERTS_PATH, ALLOWED_PATH_PREFIXES)
     if not ok:
         return json.dumps({"error": err})
     p = Path(_WAZUH_ALERTS_PATH)
     if not p.exists():
-        return json.dumps({
-            "error": "[CRITICAL METADATA] This tool is disabled because the Wazuh Manager "
-                     "is running on a remote host. DO NOT RETRY this local tool. You MUST "
-                     "immediately switch to 'blueteam_wazuh_indexer_search' or "
-                     "'blueteam_wazuh_manager_logs' to query security events.",
-            "path": _WAZUH_ALERTS_PATH,
-        }, indent=2)
+        # Self-healing fallback: when alerts.json is absent (remote Wazuh Manager),
+        # transparently delegate to the Wazuh Indexer instead of returning an error.
+        # This avoids forcing the LLM to manually switch tools.
+        if not WAZUH_INDEXER_URL or not WAZUH_INDEXER_PASSWORD:
+            return json.dumps({
+                "error": "[CRITICAL METADATA] This tool is disabled because the Wazuh Manager "
+                         "is running on a remote host and the Wazuh Indexer is not configured. "
+                         "DO NOT RETRY this local tool. Set WAZUH_INDEXER_URL and "
+                         "WAZUH_INDEXER_PASSWORD to enable automatic indexer fallback, "
+                         "or use 'blueteam_wazuh_manager_logs' to query security events.",
+                "path": _WAZUH_ALERTS_PATH,
+            }, indent=2)
+
+        # Decode cursor — handle both indexer search_after and legacy scanned formats
+        search_after: Optional[list] = None
+        if params.cursor:
+            decoded = _decode_cursor(params.cursor)
+            if decoded:
+                search_after = decoded.get("search_after") or decoded.get("scanned")
+                # "scanned" is a legacy integer — discard it; search_after needs an array
+                if isinstance(search_after, int):
+                    search_after = None
+
+        data = await _wazuh_indexer_search(
+            index_pattern="wazuh-alerts-*",
+            agent_name=params.agent_name,
+            size=params.limit,
+            search_after=search_after,
+        )
+        if isinstance(data.get("error"), str):
+            return json.dumps(data, indent=2)
+
+        hits = data.get("hits", {})
+        total = hits.get("total", {})
+        total_val = total.get("value", 0) if isinstance(total, dict) else total
+        total_relation = total.get("relation", "eq") if isinstance(total, dict) else "eq"
+        docs = [h.get("_source", h) for h in hits.get("hits", [])]
+
+        # Build next_cursor from last document's sort values
+        next_cursor = None
+        hit_list = hits.get("hits", [])
+        if hit_list and len(docs) >= params.limit:
+            last_sort = hit_list[-1].get("sort")
+            if last_sort:
+                next_cursor = _encode_cursor({"search_after": last_sort})
+
+        return _truncate_if_needed(json.dumps({
+            "source": "wazuh-indexer",  # signals auto-fallback to the LLM
+            "total": {"value": total_val, "relation": total_relation},
+            "count": len(docs),
+            "limit": params.limit,
+            "next_cursor": next_cursor,
+            "alerts": docs,
+        }, indent=2))
 
     # Decode cursor to find how many lines were already scanned
     skip_lines = 0
@@ -1392,6 +1440,7 @@ async def blueteam_wazuh_alerts(params: WazuhAlertsInput) -> str:
     next_cursor = _encode_cursor({"scanned": scanned}) if len(alerts) >= params.limit else None
 
     return _truncate_if_needed(json.dumps({
+        "source": "local",
         "alerts": alerts,
         "count": len(alerts),
         "next_cursor": next_cursor,
