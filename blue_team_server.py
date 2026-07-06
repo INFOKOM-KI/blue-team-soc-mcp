@@ -1340,7 +1340,7 @@ class WazuhAlertsInput(BaseModel):
     srcip: Optional[str] = Field(default=None, max_length=45, description="Source IP filter (e.g. '180.254.78.145')")
     since: Optional[str] = Field(default=None, max_length=30, description="ISO 8601 start time in UTC")
     until: Optional[str] = Field(default=None, max_length=30, description="ISO 8601 end time in UTC")
-    limit: int = Field(default=100, description="Max alerts per page", ge=1, le=2000)
+    limit: int = Field(default=500, description="Max alerts per page", ge=1, le=2000)
     cursor: Optional[str] = Field(
         default=None,
         description="Pagination cursor from previous response (next_cursor). Omit for first page.",
@@ -1507,7 +1507,7 @@ class WazuhIndexerSearchInput(BaseModel):
         description="Agent name to filter (e.g. 'HYDRA-DC'). Leave empty to search all agents.",
     )
     index_type: str = Field(default="alerts", description="Index: alerts, events, or vulnerabilities")
-    limit: int = Field(default=100, description="Max docs to return per page", ge=1, le=10000)
+    limit: int = Field(default=500, description="Max docs to return per page", ge=1, le=10000)
     srcip: Optional[str] = Field(
         default=None,
         max_length=45,
