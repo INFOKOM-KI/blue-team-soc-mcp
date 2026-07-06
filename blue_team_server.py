@@ -224,8 +224,9 @@ def _truncate_if_needed(text: str) -> str:
     truncated = text[:CHARACTER_LIMIT]
     return (
         truncated
-        + f"\n\n... [truncated — response exceeds {CHARACTER_LIMIT} characters, "
-        "use a more specific filter]"
+        + f"\n\n... [truncated — response exceeds {CHARACTER_LIMIT} characters. "
+        "Use a smaller limit per page (e.g. limit=50) or iterate with the next_cursor "
+        "to process results incrementally.]"
     )
 
 # Input validation and sanitization helpers
@@ -1192,13 +1193,13 @@ async def blueteam_wazuh_agents(params: WazuhAgentsInput) -> str:
     next_offset = offset + len(items)
     next_cursor = _encode_cursor({"offset": next_offset}) if next_offset < total else None
 
-    return json.dumps({
+    return _truncate_if_needed(json.dumps({
         "agents": summary,
         "total": total,
         "offset": offset,
         "limit": params.limit,
         "next_cursor": next_cursor,
-    }, indent=2)
+    }, indent=2))
 
 @mcp.tool(
     name="blueteam_wazuh_agents_summary",
@@ -1280,13 +1281,13 @@ async def blueteam_wazuh_manager_logs(params: WazuhLogsInput) -> str:
     next_offset = offset + len(items)
     next_cursor = _encode_cursor({"offset": next_offset}) if next_offset < total else None
 
-    return json.dumps({
+    return _truncate_if_needed(json.dumps({
         "logs": items,
         "total": total,
         "offset": offset,
         "limit": params.limit,
         "next_cursor": next_cursor,
-    }, indent=2)
+    }, indent=2))
 
 
 # Path to Wazuh alerts file (on the host where MCP runs; must be Wazuh manager or have mounts)
@@ -1375,11 +1376,11 @@ async def blueteam_wazuh_alerts(params: WazuhAlertsInput) -> str:
 
     next_cursor = _encode_cursor({"scanned": scanned}) if len(alerts) >= params.limit else None
 
-    return json.dumps({
+    return _truncate_if_needed(json.dumps({
         "alerts": alerts,
         "count": len(alerts),
         "next_cursor": next_cursor,
-    }, indent=2)
+    }, indent=2))
 
 
 # Wazuh Indexer index patterns (OpenSearch)
@@ -1468,14 +1469,14 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
     next_offset = from_ + len(docs)
     next_cursor = _encode_cursor({"from": next_offset}) if next_offset < total_val else None
 
-    return json.dumps({
+    return _truncate_if_needed(json.dumps({
         "total": total_val,
         "count": len(docs),
         "from": from_,
         "size": params.limit,
         "next_cursor": next_cursor,
         "documents": docs,
-    }, indent=2)
+    }, indent=2))
 
 # THREAT INTELLIGENCE
 _IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
