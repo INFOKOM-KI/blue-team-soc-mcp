@@ -454,17 +454,15 @@ async def _wazuh_indexer_search(
             }
         })
     # Time-range filter on @timestamp (UTC). Accepts ISO 8601 strings.
-    # Both since and until must be non-empty to add the clause.
-    if since and since.strip() and until and until.strip():
-        must_clauses.append({
-            "range": {
-                "@timestamp": {
-                    "gte": since.strip(),
-                    "lt": until.strip(),
-                    "format": "strict_date_optional_time",
-                }
-            }
-        })
+    # Supports since-only, until-only, or both together.
+    time_range: dict[str, str] = {}
+    if since and since.strip():
+        time_range["gte"] = since.strip()
+    if until and until.strip():
+        time_range["lt"] = until.strip()
+    if time_range:
+        time_range["format"] = "strict_date_optional_time"
+        must_clauses.append({"range": {"@timestamp": time_range}})
     query = {"bool": {"must": must_clauses}} if must_clauses else {"match_all": {}}
     body = {
         "size": min(size, _WAZUH_INDEXER_MAX_SIZE),
@@ -1520,13 +1518,15 @@ class WazuhIndexerSearchInput(BaseModel):
         default=None,
         max_length=30,
         description="ISO 8601 start time in UTC (e.g. '2026-07-05T18:30:00Z'). "
-                    "Filters alerts with @timestamp >= this value.",
+                    "Wazuh alerts use the '@timestamp' field in UTC. "
+                    "To convert WIB (GMT+7): subtract 7 hours. "
+                    "Can be used alone (no until required).",
     )
     until: Optional[str] = Field(
         default=None,
         max_length=30,
         description="ISO 8601 end time in UTC (e.g. '2026-07-05T19:00:00Z'). "
-                    "Filters alerts with @timestamp < this value.",
+                    "Filters @timestamp < this value. Can be used alone (no since required).",
     )
     cursor: Optional[str] = Field(
         default=None,
@@ -1622,13 +1622,19 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
         if last_sort:
             next_cursor = _encode_cursor({"search_after": last_sort})
 
-    return _truncate_if_needed(json.dumps({
+    meta: dict = {
         "total": {"value": total_val, "relation": total_relation},
         "count": len(docs),
         "size": params.limit,
         "next_cursor": next_cursor,
+        "timezone": "UTC",
         "documents": docs,
-    }, indent=2))
+    }
+    if params.since:
+        meta["since"] = params.since
+    if params.until:
+        meta["until"] = params.until
+    return _truncate_if_needed(json.dumps(meta, indent=2))
 
 # THREAT INTELLIGENCE
 _IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
