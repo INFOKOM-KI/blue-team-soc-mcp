@@ -11,7 +11,7 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
 
 ## Architecture
 
-`blue_team_server.py` is a **single, unified MCP server** with 37 tools spanning host forensics, Wazuh SIEM, and multi-source threat intelligence. It supports three transports:
+`blue_team_server.py` is a **single, unified MCP server** with 38 tools spanning host forensics, Wazuh SIEM, and multi-source threat intelligence. It supports three transports:
 
 | Transport | Use case | MCP client connection |
 |---|---|---|
@@ -22,7 +22,7 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
 ```
                           ┌──────────────────────────────────┐
                           │     blue_team_server.py          │
-                          │     37 tools · 1 file · 3 transports  │
+                          │     38 tools · 1 file · 3 transports  │
                           │                                  │
                           │  ┌────────────────────────────┐  │
                           │  │ Host Forensics (26 tools)  │  │
@@ -43,11 +43,12 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
                           │  │ • OpenSearch indexer query │  │
                           │  └────────────────────────────┘  │
                           │  ┌────────────────────────────┐  │
-                          │  │ Threat Intel (6 tools)     │  │
+                          │  │ Threat Intel (7 tools)     │  │
                           │  │ • AbuseIPDB IP reputation  │  │
                           │  │ • VirusTotal hash & domain │  │
                           │  │ • CrowdSec CTI (2 tools)   │  │
-                          │  │ • GreyNoise Community      │  │
+                          │  │ • GreyNoise Community      │
+                          │  │ • Netra multi-source        │  │
                           │  └────────────────────────────┘  │
                           └──────────────────────────────────┘
                             │          │           │
@@ -84,7 +85,7 @@ The CrowdSec and GreyNoise tools also ship as separate files for users who prefe
 
 | File | Tools | When to use |
 |---|---|---|
-| `blue_team_server.py` | **All 37 tools** | **Recommended** — full capabilities, cursor pagination, token caching |
+| `blue_team_server.py` | **All 38 tools** | **Recommended** — full capabilities, cursor pagination, token caching |
 | `blue_team_server_crowdsec.py` | 2 CrowdSec CTI tools | Isolated CrowdSec-only server with parallel bulk lookups |
 | `blue_team_server_greynoise.py` | 1 GreyNoise Community tool | Isolated GreyNoise-only server |
 
@@ -152,15 +153,16 @@ This prevents the LLM client from wasting context loops retrying a fundamentally
 
 #### Shared HTTP Client with Connection Pooling
 
-Three dedicated `httpx.AsyncClient` instances, one per SSL trust domain:
+Four dedicated `httpx.AsyncClient` instances, one per SSL trust domain:
 
 | Client | `verify` | Endpoints |
 |---|---|---|
 | `_get_http_client()` | `True` (public CA) | AbuseIPDB, VirusTotal, CrowdSec CTI, GreyNoise |
+| `_get_netra_http_client()` | `NETRA_VERIFY_SSL` (default `false`) | Netra Threat Intelligence (staging-gitlab:8013) |
 | `_get_wazuh_client()` | `WAZUH_API_VERIFY_SSL` (default `false`) | Wazuh Manager API (port 55000) |
 | `_get_indexer_client()` | `WAZUH_INDEXER_VERIFY_SSL` (default `false`) | OpenSearch (port 9200) |
 
-Each client pools connections independently (20 keepalive / 100 max for public APIs; 10 / 50 for Wazuh and Indexer). SSL verification is set at client creation — no per-request `verify=` keyword arguments.
+Each client pools connections independently (20 keepalive / 100 max for public APIs; 5 / 20 for Netra staging; 10 / 50 for Wazuh and Indexer). SSL verification is set at client creation — no per-request `verify=` keyword arguments.
 
 #### Wazuh JWT Token Caching
 
@@ -240,6 +242,8 @@ All environment variables accepted by the suite. Variables marked **[unified]** 
 | `CROWDSEC_API_KEY` | (empty) | CrowdSec CTI API key (required for CrowdSec tools) |
 | `ABUSEIPDB_API_KEY` | (empty) | AbuseIPDB API key |
 | `VIRUSTOTAL_API_KEY` | (empty) | VirusTotal API key |
+| `NETRA_API_KEY` | (empty) | Netra Threat Intelligence API key |
+| `NETRA_VERIFY_SSL` | `false` | TLS certificate verification for Netra API (set `true` for production) |
 
 ### Transport & Deployment
 
@@ -347,7 +351,7 @@ Then point Claude Desktop at it:
 
 Replace `192.168.153.5` with the IP reachable from your workstation (`192.168.153.5` for NAT, `172.16.101.5` for LAB).
 
-Restart Claude Desktop. You should see all 37 blue-team-mcp tools available.
+Restart Claude Desktop. You should see all 38 blue-team-mcp tools available.
 
 ### 4. Remote Service Deployment (systemd)
 
@@ -426,6 +430,13 @@ All tools below are registered on `blue_team_server.py`. Tools not requiring a s
 | `blueteam_lookup_ip_abuseipdb` | IP reputation via AbuseIPDB |
 | `blueteam_lookup_hash_virustotal` | File hash lookup via VirusTotal |
 | `blueteam_lookup_domain_virustotal` | Domain reputation via VirusTotal |
+
+### Netra Threat Intelligence
+*Requires `NETRA_API_KEY`*
+
+| Tool | Description |
+|------|-------------|
+| `netra_ip_analysis` | Multi-source IP analysis aggregating VirusTotal, AbuseIPDB, CrowdSec, IPAPI, and Argus with composite threat score and AI-generated insight |
 
 ### CrowdSec CTI
 *Requires `CROWDSEC_API_KEY`*
@@ -587,6 +598,6 @@ export BLUETEAM_RATE_LIMIT=60
 
 | File | Role |
 |---|---|
-| `blue_team_server.py` | **Primary** — all 37 tools, all three transports (stdio / SSE / Streamable HTTP) |
+| `blue_team_server.py` | **Primary** — all 38 tools, all three transports (stdio / SSE / Streamable HTTP) |
 | `blue_team_server_crowdsec.py` | Standalone CrowdSec-only server (backward compat) |
 | `blue_team_server_greynoise.py` | Standalone GreyNoise-only server (backward compat) |

@@ -64,6 +64,8 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 # export ABUSEIPDB_API_KEY="your_key"
 # export VIRUSTOTAL_API_KEY="your_key"
 # export CROWDSEC_API_KEY="your_key" # free tier: https://www.crowdsec.net/en/user/profile
+# export NETRA_API_KEY="your_key"
+# export NETRA_VERIFY_SSL="false"   # set to "true" for production / trusted CA
 
 # GreyNoise Community — no API key needed; greynoise_ip_context works out of the box.
 
@@ -109,7 +111,7 @@ fi
 # Wrapper scripts
 echo "[5/7] Creating MCP server wrapper scripts..."
 
-# Main wrapper: mcp-server-blueteam (all 37 tools)
+# Main wrapper: mcp-server-blueteam (all 38 tools)
 cat > /usr/local/bin/mcp-server-blueteam << 'EOF'
 #!/usr/bin/env bash
 # Wrapper - Claude Desktop calls this via SSH (MAESTRO-compliant)
@@ -118,6 +120,8 @@ cat > /usr/local/bin/mcp-server-blueteam << 'EOF'
 export ABUSEIPDB_API_KEY="${ABUSEIPDB_API_KEY:-}"
 export VIRUSTOTAL_API_KEY="${VIRUSTOTAL_API_KEY:-}"
 export CROWDSEC_API_KEY="${CROWDSEC_API_KEY:-}"
+export NETRA_API_KEY="${NETRA_API_KEY:-}"
+export NETRA_VERIFY_SSL="${NETRA_VERIFY_SSL:-false}"
 export BLUETEAM_AUDIT_LOG="${BLUETEAM_AUDIT_LOG:-}"
 export BLUETEAM_RATE_LIMIT="${BLUETEAM_RATE_LIMIT:-0}"
 export BLUETEAM_ALLOWED_PATHS="${BLUETEAM_ALLOWED_PATHS:-/var:/etc:/home:/opt:/usr}"
@@ -192,7 +196,7 @@ echo "OPTIONAL: Edit $CONFIG_FILE to add API keys and credentials:"
 echo ""
 echo "  sudo nano $CONFIG_FILE"
 echo ""
-echo "  Uncomment and set: ABUSEIPDB_API_KEY, VIRUSTOTAL_API_KEY,"
+echo "  Uncomment and set: ABUSEIPDB_API_KEY, VIRUSTOTAL_API_KEY, NETRA_API_KEY,"
 echo "  CROWDSEC_API_KEY (free tier at crowdsec.net),"
 echo "  WAZUH_API_URL, WAZUH_API_USER, WAZUH_API_PASSWORD,"
 echo "  WAZUH_INDEXER_URL, WAZUH_INDEXER_PASSWORD."
@@ -207,7 +211,7 @@ echo "  GreyNoise Community needs no key — greynoise_ip_context works immediat
 echo ""
 echo "Wrapper entry points installed:"
 echo ""
-echo "  mcp-server-blueteam    — All 37 tools (Wazuh, threat intel, host forensics)"
+echo "  mcp-server-blueteam    — All 38 tools (Wazuh, threat intel, host forensics)"
 echo "  mcp-server-crowdsec    — CrowdSec CTI only (2 tools, parallel bulk lookups)"
 echo "  mcp-server-greynoise   — GreyNoise Community only (1 tool, no API key needed)"
 echo ""
