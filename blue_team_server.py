@@ -49,6 +49,7 @@ import time
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
+from collections import Counter
 from typing import Any, Dict, List, Optional
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -182,6 +183,85 @@ def _decode_cursor(cursor: str) -> Optional[dict]:
         return json.loads(base64.b64decode(cursor).decode())
     except Exception:
         return None
+
+
+# Time-window utilities
+# Pattern for relative time expressions: "5m", "1h", "24h", "7d", "4w", "15s"
+_RELATIVE_TIME_RE = re.compile(r"^(\d+)([smhdw])$")
+# Pattern for ISO 8601: Ex: "2026-07-07T17:00:00Z" or "2026-07-07"
+_ISO_TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+
+def _parse_time_window(
+    since: Optional[str],
+    until: Optional[str],
+    default_back: timedelta = timedelta(days=365),
+) -> tuple[str, str]:
+    """Parse since/until parameters accepting ISO 8601 or relative expressions.
+
+    Relative expressions: "N" followed by one of {s, m, h, d, w}:
+      - ``5m`` / ``30m`` → 5 / 30 minutes ago
+      - ``1h`` / ``24h`` / ``6h`` → N hours ago
+      - ``1d`` / ``7d`` / ``30d`` → N days ago
+      - ``1w`` / ``4w`` → N weeks ago
+      - ``15s`` → 15 seconds ago
+
+    ISO 8601 strings (must start with ``YYYY-MM-DD``) pass through unchanged.
+    Returns ``(since_iso, until_iso)`` — absolute ISO 8601 strings in UTC.
+    ``until`` defaults to ``now``; ``since`` defaults to ``default_back`` ago.
+    """
+    now = datetime.utcnow()
+    until_dt = now
+
+    # Parse until
+    if until and until.strip():
+        until_str = until.strip()
+        if _ISO_TIME_RE.match(until_str):
+            until_dt = datetime.fromisoformat(
+                until_str.replace("Z", "+00:00").rstrip("Z")
+            )
+        else:
+            m = _RELATIVE_TIME_RE.match(until_str)
+            if m:
+                n, unit = int(m.group(1)), m.group(2)
+                delta = _relative_delta(n, unit)
+                until_dt = now - delta
+            # else: pass through as-is (trust the caller for bare strings)
+
+    # Parse since
+    if since and since.strip():
+        since_str = since.strip()
+        if _ISO_TIME_RE.match(since_str):
+            since_dt = datetime.fromisoformat(
+                since_str.replace("Z", "+00:00").rstrip("Z")
+            )
+        else:
+            m = _RELATIVE_TIME_RE.match(since_str)
+            if m:
+                n, unit = int(m.group(1)), m.group(2)
+                delta = _relative_delta(n, unit)
+                since_dt = now - delta
+            else:
+                since_dt = now - default_back
+    else:
+        since_dt = now - default_back
+
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    return since_dt.strftime(fmt), until_dt.strftime(fmt)
+
+
+def _relative_delta(n: int, unit: str) -> timedelta:
+    """Convert a relative time token to a timedelta."""
+    if unit == "s":
+        return timedelta(seconds=n)
+    elif unit == "m":
+        return timedelta(minutes=n)
+    elif unit == "h":
+        return timedelta(hours=n)
+    elif unit == "d":
+        return timedelta(days=n)
+    elif unit == "w":
+        return timedelta(weeks=n)
+    return timedelta(days=365)  # fallback — shouldn't happen with validated regex
 
 
 # Wazuh JWT token cache
@@ -496,6 +576,380 @@ async def _wazuh_indexer_search(
         return {"error": f"Indexer API error: {e.response.status_code}", "detail": e.response.text[:500]}
     except Exception as e:
         return {"error": str(e)}
+
+
+# Wazuh Indexer search helpers
+async def _wazuh_indexer_email_search(
+    agent_name: Optional[str],
+    size: int,
+    search_after: Optional[list] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    rule_groups: Optional[list[str]] = None,
+) -> Dict:
+    """Query Wazuh Indexer for alerts containing email-address-like strings.
+    Searches ``full_log`` (query_string wildcard ``*@*.*``) and the structured
+    ``data.account`` field (wildcard ``*@*``).  Both clauses are combined with
+    ``minimum_should_match: 1`` so a document only needs to match one of them.
+    Optional filters: agent_name, time range, and a list of rule groups
+    (matched against the ``rule.groups`` keyword field).
+    """
+    if not WAZUH_INDEXER_URL or not WAZUH_INDEXER_PASSWORD:
+        return {"error": "WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD must be set."}
+
+    index_pattern = _WAZUH_INDEX_PATTERNS["alerts"]
+    url = f"{WAZUH_INDEXER_URL}/{index_pattern}/_search"
+
+    # Build bool query — should clauses for the two email sources
+    should_clauses: list[dict] = [
+        {"query_string": {"query": r"full_log: *@*.*", "default_operator": "AND"}},
+        {"wildcard": {"data.account": {"value": "*@*"}}},
+    ]
+
+    must_clauses: list[dict] = []
+    if agent_name and agent_name.strip():
+        must_clauses.append({"match": {"agent.name": agent_name.strip()}})
+
+    if rule_groups:
+        must_clauses.append({"terms": {"rule.groups": list(rule_groups)}})
+
+    time_range: dict[str, str] = {}
+    if since and since.strip():
+        time_range["gte"] = since.strip()
+    if until and until.strip():
+        time_range["lt"] = until.strip()
+    if time_range:
+        time_range["format"] = "strict_date_optional_time"
+        must_clauses.append({"range": {"@timestamp": time_range}})
+
+    query = {
+        "bool": {
+            "must": must_clauses,
+            "should": should_clauses,
+            "minimum_should_match": 1,
+        }
+    }
+
+    body: dict = {
+        "size": min(size, _WAZUH_INDEXER_MAX_SIZE),
+        "sort": [{"@timestamp": {"order": "asc"}}, {"_id": {"order": "asc"}}],
+        "query": query,
+        # Only fetch fields we actually need — raw full_log can be huge
+        "_source": [
+            "full_log",
+            "data.account",
+            "data.srcip",
+            "rule.id",
+            "rule.description",
+            "rule.groups",
+            "rule.level",
+            "@timestamp",
+            "agent.name",
+        ],
+    }
+    if search_after:
+        body["search_after"] = search_after
+
+    try:
+        client = await _get_indexer_client()
+        resp = await client.post(
+            url,
+            auth=(WAZUH_INDEXER_USER, WAZUH_INDEXER_PASSWORD),
+            json=body,
+            headers={"Content-Type": "application/json"},
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.HTTPStatusError as e:
+        return {"error": f"Indexer API error: {e.response.status_code}", "detail": e.response.text[:500]}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def _wazuh_indexer_domain_search(
+    domain: str,
+    agent_name: Optional[str],
+    size: int,
+    search_after: Optional[list] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    include_full_log: bool = False,
+) -> Dict:
+    """Query Wazuh Indexer for alerts matching a domain name.
+
+    Searches the structured ``data.domain`` field with a match query (boosted
+    so structured matches sort higher) and falls back to a ``query_string``
+    phrase match on ``full_log``.
+    """
+    if not WAZUH_INDEXER_URL or not WAZUH_INDEXER_PASSWORD:
+        return {"error": "WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD must be set."}
+
+    index_pattern = _WAZUH_INDEX_PATTERNS["alerts"]
+    url = f"{WAZUH_INDEXER_URL}/{index_pattern}/_search"
+
+    should_clauses: list[dict] = [
+        {"match": {"data.domain": {"query": domain, "boost": 2.0}}},
+        {"query_string": {"query": f'full_log: "{domain}"', "default_operator": "AND"}},
+    ]
+
+    must_clauses: list[dict] = []
+    if agent_name and agent_name.strip():
+        must_clauses.append({"match": {"agent.name": agent_name.strip()}})
+
+    time_range: dict[str, str] = {}
+    if since and since.strip():
+        time_range["gte"] = since.strip()
+    if until and until.strip():
+        time_range["lt"] = until.strip()
+    if time_range:
+        time_range["format"] = "strict_date_optional_time"
+        must_clauses.append({"range": {"@timestamp": time_range}})
+
+    query = {
+        "bool": {
+            "must": must_clauses,
+            "should": should_clauses,
+            "minimum_should_match": 1,
+        }
+    }
+
+    _source_fields: list[str] = [
+        "data.srcip",
+        "data.account",
+        "data.domain",
+        "rule.id",
+        "rule.description",
+        "rule.groups",
+        "rule.level",
+        "@timestamp",
+        "agent.name",
+    ]
+    if include_full_log:
+        _source_fields.append("full_log")
+
+    body: dict = {
+        "size": min(size, _WAZUH_INDEXER_MAX_SIZE),
+        "sort": [{"@timestamp": {"order": "asc"}}, {"_id": {"order": "asc"}}],
+        "query": query,
+        "_source": _source_fields,
+    }
+    if search_after:
+        body["search_after"] = search_after
+
+    try:
+        client = await _get_indexer_client()
+        resp = await client.post(
+            url,
+            auth=(WAZUH_INDEXER_USER, WAZUH_INDEXER_PASSWORD),
+            json=body,
+            headers={"Content-Type": "application/json"},
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.HTTPStatusError as e:
+        return {"error": f"Indexer API error: {e.response.status_code}", "detail": e.response.text[:500]}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def _wazuh_indexer_multi_email_search(
+    emails: list[str],
+    agent_name: Optional[str],
+    size: int,
+    search_after: Optional[list] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+) -> Dict:
+    """Query Wazuh Indexer for alerts mentioning any of the given email addresses.
+
+    Uses a ``query_string`` OR-of-phrases on ``full_log`` plus a ``terms``
+    query on ``data.account``.  Limited to 25 emails per sub-query to stay
+    within OpenSearch clause-count limits; callers with larger lists should
+    fan out across multiple calls and merge the results client-side.
+    """
+    if not WAZUH_INDEXER_URL or not WAZUH_INDEXER_PASSWORD:
+        return {"error": "WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD must be set."}
+
+    if len(emails) > 25:
+        emails = emails[:25]
+
+    index_pattern = _WAZUH_INDEX_PATTERNS["alerts"]
+    url = f"{WAZUH_INDEXER_URL}/{index_pattern}/_search"
+
+    # Build query_string: full_log: ("e1@x.com" OR "e2@y.com" ...)
+    quoted = [f'"{e}"' for e in emails]
+    email_query = " OR ".join(quoted)
+    should_clauses: list[dict] = [
+        {"query_string": {"query": f"full_log: ({email_query})", "default_operator": "AND"}},
+        {"terms": {"data.account": list(emails)}},
+    ]
+
+    must_clauses: list[dict] = []
+    if agent_name and agent_name.strip():
+        must_clauses.append({"match": {"agent.name": agent_name.strip()}})
+
+    time_range: dict[str, str] = {}
+    if since and since.strip():
+        time_range["gte"] = since.strip()
+    if until and until.strip():
+        time_range["lt"] = until.strip()
+    if time_range:
+        time_range["format"] = "strict_date_optional_time"
+        must_clauses.append({"range": {"@timestamp": time_range}})
+
+    query = {
+        "bool": {
+            "must": must_clauses,
+            "should": should_clauses,
+            "minimum_should_match": 1,
+        }
+    }
+
+    body: dict = {
+        "size": min(size, _WAZUH_INDEXER_MAX_SIZE),
+        "sort": [{"@timestamp": {"order": "asc"}}, {"_id": {"order": "asc"}}],
+        "query": query,
+        "_source": [
+            "data.srcip",
+            "data.account",
+            "full_log",
+            "rule.id",
+            "rule.description",
+            "rule.groups",
+            "@timestamp",
+            "agent.name",
+        ],
+    }
+    if search_after:
+        body["search_after"] = search_after
+
+    try:
+        client = await _get_indexer_client()
+        resp = await client.post(
+            url,
+            auth=(WAZUH_INDEXER_USER, WAZUH_INDEXER_PASSWORD),
+            json=body,
+            headers={"Content-Type": "application/json"},
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.HTTPStatusError as e:
+        return {"error": f"Indexer API error: {e.response.status_code}", "detail": e.response.text[:500]}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def _wazuh_indexer_aggregate(
+    bucket_interval: str,
+    since: str,
+    until: str,
+    agent_name: Optional[str] = None,
+    rule_groups: Optional[list[str]] = None,
+    rule_level_min: Optional[int] = None,
+    top_n_rules: int = 3,
+    top_n_srcips: int = 5,
+    top_n_agents: int = 3,
+) -> Dict:
+    """Query Wazuh Indexer with a date_histogram aggregation — no document hits.
+
+    Returns only the aggregation buckets (``size: 0``), which means the query
+    covers ALL matching documents regardless of ``max_result_window``.
+
+    Sub-aggregations nested under each time bucket:
+    - ``by_level`` — range aggregation on ``rule.level`` (low ≤4, medium 5-9, high ≥10)
+    - ``top_rules`` — terms aggregation on ``rule.id.keyword`` or ``rule.id``
+    - ``top_srcips`` — terms aggregation on ``data.srcip``
+    - ``top_agents`` — terms aggregation on ``agent.name``
+    """
+    if not WAZUH_INDEXER_URL or not WAZUH_INDEXER_PASSWORD:
+        return {"error": "WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD must be set."}
+
+    index_pattern = _WAZUH_INDEX_PATTERNS["alerts"]
+    url = f"{WAZUH_INDEXER_URL}/{index_pattern}/_search"
+
+    # Filter context (no scoring needed — filter is faster than query)
+    filter_clauses: list[dict] = [
+        {"range": {
+            "@timestamp": {
+                "gte": since,
+                "lt": until,
+                "format": "strict_date_optional_time",
+            }
+        }},
+    ]
+    if agent_name and agent_name.strip():
+        filter_clauses.append({"match": {"agent.name": agent_name.strip()}})
+    if rule_groups:
+        filter_clauses.append({"terms": {"rule.groups": list(rule_groups)}})
+    if rule_level_min is not None:
+        filter_clauses.append({"range": {"rule.level": {"gte": rule_level_min}}})
+
+    # Sub-aggregations nested under each date bucket
+    sub_aggs: dict = {
+        "by_level": {
+            "range": {
+                "field": "rule.level",
+                "ranges": [
+                    {"key": "low", "to": 5},
+                    {"key": "medium", "from": 5, "to": 10},
+                    {"key": "high", "from": 10},
+                ],
+            }
+        },
+        "top_rules": {
+            "terms": {
+                "field": "rule.id.keyword",
+                "size": top_n_rules,
+                "missing": "unknown",
+            }
+        },
+        "top_srcips": {
+            "terms": {
+                "field": "data.srcip",
+                "size": top_n_srcips,
+                "missing": "0.0.0.0",
+            }
+        },
+        "top_agents": {
+            "terms": {
+                "field": "agent.name",
+                "size": top_n_agents,
+                "missing": "unknown",
+            }
+        },
+    }
+
+    body: dict = {
+        "size": 0,
+        "query": {"bool": {"filter": filter_clauses}},
+        "aggs": {
+            "alerts_over_time": {
+                "date_histogram": {
+                    "field": "@timestamp",
+                    "fixed_interval": bucket_interval,
+                    "min_doc_count": 0,
+                    "extended_bounds": {"min": since, "max": until},
+                },
+                "aggs": sub_aggs,
+            }
+        },
+    }
+
+    try:
+        client = await _get_indexer_client()
+        resp = await client.post(
+            url,
+            auth=(WAZUH_INDEXER_USER, WAZUH_INDEXER_PASSWORD),
+            json=body,
+            headers={"Content-Type": "application/json"},
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.HTTPStatusError as e:
+        return {"error": f"Indexer API error: {e.response.status_code}", "detail": e.response.text[:500]}
+    except Exception as e:
+        return {"error": str(e)}
+
 
 # CrowdSec CTI helpers
 def _get_crowdsec_api_key() -> str:
@@ -952,8 +1406,6 @@ async def greynoise_ip_context(params: GreynoiseIpContextInput) -> str:
 # Optional: set NETRA_API_KEY to enable the netra_ip_analysis tool.
 # The staging server may use a self-signed certificate — configure
 # NETRA_VERIFY_SSL=true if your deployment uses a trusted CA.
-
-
 async def _get_netra_http_client() -> httpx.AsyncClient:
     """Return a shared httpx.AsyncClient for the Netra Threat Intelligence API (staging, often self-signed)."""
     global _shared_netra_client
@@ -1894,6 +2346,13 @@ _WAZUH_INDEX_PATTERNS = {
 # Agent name: alphanumeric, hyphen, underscore, dot only (prevents injection)
 _AGENT_NAME_SAFE_RE = re.compile(r"^[a-zA-Z0-9_\-\.]+$")
 
+# Practical email regex for extraction from log fields — covers >99% of real addresses
+# Handles dots-in-local-part, plus-sign aliases, and multi-level TLDs
+_EMAIL_RE = re.compile(
+    r'[a-zA-Z0-9.!#$%&\'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?'
+    r'(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}'
+)
+
 class WazuhIndexerSearchInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     agent_name: Optional[str] = Field(
@@ -2030,6 +2489,1460 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
     if params.until:
         meta["until"] = params.until
     return _truncate_if_needed(json.dumps(meta, indent=2))
+
+
+# Wazuh Email & Domain Lookup
+def _extract_emails_from_doc(doc: dict) -> set[str]:
+    """Extract email addresses from a single Wazuh alert document.
+    Checks ``data.account`` first (structured, most reliable), then scans
+    ``full_log`` with the compiled ``_EMAIL_RE`` regex.  Returns a set of
+    lowercased email addresses.
+    """
+    found: set[str] = set()
+    # Structured account field (Zimbra alerts)
+    account = (doc.get("data") or {}).get("account")
+    if account and isinstance(account, str) and "@" in account:
+        for m in _EMAIL_RE.finditer(account):
+            found.add(m.group(0).lower())
+    # Full log line
+    full_log = doc.get("full_log")
+    if full_log and isinstance(full_log, str):
+        for m in _EMAIL_RE.finditer(full_log):
+            found.add(m.group(0).lower())
+    return found
+
+
+class WazuhEmailLookupInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    agent_name: Optional[str] = Field(
+        default=None,
+        max_length=64,
+        description="Optional agent name filter (e.g. 'mailbox-new'). Omit to search all agents.",
+    )
+    since: Optional[str] = Field(
+        default=None,
+        max_length=30,
+        description="Start of time window — ISO 8601 ('2026-07-07T00:00:00Z') or relative "
+                    "('5m', '1h', '24h', '7d', '30d'). Defaults to 365 days ago if omitted.",
+    )
+    until: Optional[str] = Field(
+        default=None,
+        max_length=30,
+        description="End of time window — ISO 8601 or relative expression. Defaults to now if omitted.",
+    )
+    top_n: int = Field(
+        default=100,
+        description="Number of top email addresses to return, ranked by frequency.",
+        ge=1,
+        le=500,
+    )
+    rule_groups: Optional[str] = Field(
+        default=None,
+        max_length=256,
+        description="Comma-separated rule groups to filter by "
+                    "(e.g. 'authentication_failed,brute_force'). "
+                    "Omit to search all rule groups.",
+    )
+    max_scanned: int = Field(
+        default=50000,
+        description="Maximum number of alert documents to scan internally. "
+                    "Higher values give more accurate counts but take longer.",
+        ge=1000,
+        le=200000,
+    )
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN,
+        description="'markdown' for human-readable report, 'json' for structured data.",
+    )
+
+    @field_validator("agent_name")
+    @classmethod
+    def validate_agent_name(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v = v.strip()
+            if not v:
+                return None
+            if len(v) > 64:
+                raise ValueError("agent_name too long (max 64)")
+            if not _AGENT_NAME_SAFE_RE.match(v):
+                raise ValueError("agent_name: use only letters, numbers, hyphen, underscore, dot")
+        return v
+
+    @field_validator("rule_groups")
+    @classmethod
+    def validate_rule_groups(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v = v.strip()
+            if not v:
+                return None
+            for g in v.split(","):
+                g = g.strip()
+                if not g:
+                    raise ValueError("Empty rule group name in comma-separated list")
+                if not _AGENT_NAME_SAFE_RE.match(g):
+                    raise ValueError(
+                        f"Invalid rule group name: '{g}'. "
+                        "Use only letters, numbers, hyphen, underscore, dot."
+                    )
+        return v
+
+
+@mcp.tool(
+    name="wazuh_email_lookup",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def wazuh_email_lookup(params: WazuhEmailLookupInput) -> str:
+    """Search Wazuh alerts for email addresses and rank top-N most frequently seen.
+
+    Scans the ``full_log`` field (raw log line) and the structured ``data.account``
+    field (Zimbra alerts) for email-address-like strings.  Aggregates every unique
+    address with its occurrence count, associated source IPs, and the rule groups
+    it appears in.  Results are sorted by frequency descending.
+
+    Querying the full year requires scanning many documents.  The internal scanner
+    pages through alerts using ``search_after`` cursors until either the Indexer
+    is exhausted or ``max_scanned`` documents have been processed.
+
+    Args:
+        params.agent_name: Optional agent to filter (e.g. 'mailbox-new')
+        params.since: ISO 8601 start (default: 365 days ago)
+        params.until: ISO 8601 end (default: now)
+        params.top_n: How many top emails to return (1-500, default 100)
+        params.rule_groups: Comma-separated groups filter
+        params.max_scanned: Hard cap on documents scanned (1000-200000, default 50000)
+        params.response_format: 'markdown' or 'json'
+
+    Returns:
+        str: Ranked table of email addresses with counts, unique IPs,
+        and associated rule categories.  Summary statistics are included.
+
+    Example usage:
+        - "Find the top 100 most compromised email addresses in the last year"
+        - "Show me the most targeted mailboxes on agent mailbox-new"
+    """
+    since_str, until_str = _parse_time_window(params.since, params.until)
+
+    rule_group_list: Optional[list[str]] = None
+    if params.rule_groups:
+        rule_group_list = [g.strip() for g in params.rule_groups.split(",") if g.strip()]
+
+    email_counter: Counter[str] = Counter()
+    email_srcips: dict[str, set[str]] = {}    # email -> set of srcip
+    email_rules: dict[str, set[str]] = {}     # email -> set of "rule_id: description"
+    email_groups: dict[str, set[str]] = {}    # email -> set of rule groups
+    email_first_seen: dict[str, str] = {}     # email -> earliest timestamp
+    email_last_seen: dict[str, str] = {}      # email -> latest timestamp
+
+    total_scanned = 0
+    search_after: Optional[list] = None
+    page_size = 1000
+    try:
+        while total_scanned < params.max_scanned:
+            data = await _wazuh_indexer_email_search(
+                agent_name=params.agent_name,
+                size=page_size,
+                search_after=search_after,
+                since=since_str,
+                until=until_str,
+                rule_groups=rule_group_list,
+            )
+            if "error" in data:
+                error_msg = data["error"]
+                # If we've already collected some data, return partial results
+                if total_scanned > 0:
+                    break
+                return json.dumps(data, indent=2)
+
+            hits = data.get("hits", {})
+            hit_list = hits.get("hits", [])
+            docs = [h.get("_source", h) for h in hit_list]
+            if not docs:
+                break
+
+            for doc in docs:
+                emails = _extract_emails_from_doc(doc)
+                ts = doc.get("@timestamp", "")
+                srcip = (doc.get("data") or {}).get("srcip", "")
+                rule = doc.get("rule") or {}
+                rule_id = rule.get("id", "")
+                rule_desc = rule.get("description", "")
+                groups = tuple(rule.get("groups", []))
+
+                for email in emails:
+                    email_counter[email] += 1
+                    if srcip:
+                        email_srcips.setdefault(email, set()).add(srcip)
+                    if rule_id:
+                        email_rules.setdefault(email, set()).add(f"{rule_id}: {rule_desc}")
+                    for g in groups:
+                        email_groups.setdefault(email, set()).add(g)
+                    if email not in email_first_seen or (ts and ts < email_first_seen[email]):
+                        email_first_seen[email] = ts
+                    if email not in email_last_seen or (ts and ts > email_last_seen[email]):
+                        email_last_seen[email] = ts
+
+            total_scanned += len(docs)
+
+            # Advance cursor or stop if exhausted
+            if len(docs) < page_size:
+                break
+            last_sort = hit_list[-1].get("sort") if hit_list else None
+            if last_sort:
+                search_after = last_sort
+            else:
+                break
+
+    except Exception as e:
+        if total_scanned == 0:
+            return _handle_api_error(e, context="wazuh_email_lookup")
+        # Partial results on transient error during pagination
+        logging.getLogger(__name__).warning(
+            "wazuh_email_lookup: error after %d docs scanned: %s", total_scanned, e
+        )
+
+    # Rank by frequency
+    top_emails = email_counter.most_common(params.top_n)
+
+    # Stats
+    total_unique = len(email_counter)
+    total_with_auth_fail = sum(
+        1 for e in email_counter
+        if any("authentication_fail" in g.lower() for g in email_groups.get(e, set()))
+    )
+    total_with_brute_force = sum(
+        1 for e in email_counter
+        if any("brute" in g.lower() for g in email_groups.get(e, set()))
+    )
+    high_freq = sum(1 for _, c in email_counter.items() if c >= 10)
+
+    if params.response_format == ResponseFormat.JSON:
+        results = []
+        for email, count in top_emails:
+            results.append({
+                "email": email,
+                "count": count,
+                "unique_srcips": len(email_srcips.get(email, set())),
+                "top_srcips": sorted(email_srcips.get(email, set()))[:20],
+                "rule_groups": sorted(email_groups.get(email, set())),
+                "top_rules": sorted(email_rules.get(email, set()))[:10],
+                "first_seen": email_first_seen.get(email),
+                "last_seen": email_last_seen.get(email),
+            })
+        output = {
+            "results": results,
+            "summary": {
+                "total_emails_found": total_unique,
+                "documents_scanned": total_scanned,
+                "time_window": {"since": since_str, "until": until_str},
+                "auth_failure_emails": total_with_auth_fail,
+                "brute_force_emails": total_with_brute_force,
+                "emails_with_10plus_appearances": high_freq,
+            },
+            "query": {
+                "agent_name": params.agent_name,
+                "rule_groups": params.rule_groups,
+                "since": since_str,
+                "until": until_str,
+                "max_scanned": params.max_scanned,
+            },
+        }
+        return _truncate_if_needed(json.dumps(output, indent=2, ensure_ascii=False))
+
+    # Markdown output
+    lines: list[str] = [
+        f"# Wazuh Email Lookup — Top {len(top_emails)} Emails",
+        "",
+        f"**Time window**: {since_str} to {until_str}",
+        f"**Documents scanned**: {total_scanned:,}",
+        f"**Unique emails found**: {total_unique:,}",
+        f"**Agent**: {params.agent_name or 'all agents'}",
+        f"**Rule groups**: {params.rule_groups or 'all'}",
+        "",
+        "## Top Email Addresses",
+        "",
+        "| # | Email | Count | Unique IPs | Top Rule Groups |",
+        "|---|-------|-------|------------|-----------------|",
+    ]
+    for i, (email, count) in enumerate(top_emails, 1):
+        ips = len(email_srcips.get(email, set()))
+        top_groups = ", ".join(sorted(email_groups.get(email, set()))[:4])
+        lines.append(f"| {i} | {email} | {count:,} | {ips} | {top_groups} |")
+
+    lines.extend([
+        "",
+        "## Summary Statistics",
+        f"- Total unique emails: {total_unique:,}",
+        f"- Emails appearing in auth-failure rules: {total_with_auth_fail:,}",
+        f"- Emails appearing in brute-force rules: {total_with_brute_force:,}",
+        f"- Emails with ≥10 appearances: {high_freq:,}",
+        "",
+        "## Search Parameters",
+        f"- Query: `full_log` contains email pattern (`*@*.*`) OR `data.account` contains `@`",
+        f"- Max documents scanned: {params.max_scanned:,}",
+        f"- Page size: {page_size}",
+    ])
+    return _truncate_if_needed("\n".join(lines))
+
+
+class WazuhDomainLookupInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    domain: str = Field(
+        ...,
+        max_length=253,
+        description="Domain name to search for in Wazuh alerts "
+                    "(e.g. 'tangerangkota.go.id', 'gmail.com').",
+    )
+    agent_name: Optional[str] = Field(
+        default=None,
+        max_length=64,
+        description="Optional agent name filter.",
+    )
+    since: Optional[str] = Field(
+        default=None,
+        max_length=30,
+        description="ISO 8601 start time in UTC. Defaults to 365 days ago.",
+    )
+    until: Optional[str] = Field(
+        default=None,
+        max_length=30,
+        description="ISO 8601 end time in UTC. Defaults to now.",
+    )
+    limit: int = Field(
+        default=500,
+        description="Max alerts per page.",
+        ge=1,
+        le=10000,
+    )
+    include_full_log: bool = Field(
+        default=False,
+        description="Include the full_log field in results. "
+                    "The full_log field can be very large (100KB+ per alert). "
+                    "Set to true only when you need the raw log line context.",
+    )
+    cursor: Optional[str] = Field(
+        default=None,
+        description="Pagination cursor from previous response (next_cursor).",
+    )
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN,
+        description="'markdown' for human-readable summary, 'json' for structured data.",
+    )
+
+    @field_validator("domain")
+    @classmethod
+    def validate_domain(cls, v: str) -> str:
+        if not v or len(v) > 253:
+            raise ValueError("Invalid domain length (max 253)")
+        if ".." in v:
+            raise ValueError("Invalid domain format")
+        v = v.strip().lower()
+        if not re.match(
+            r'^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?'
+            r'(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$',
+            v,
+        ):
+            raise ValueError(
+                "Invalid domain format — must be a valid domain name (e.g. example.com)"
+            )
+        return v
+
+    @field_validator("agent_name")
+    @classmethod
+    def validate_agent_name(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v = v.strip()
+            if not v:
+                return None
+            if len(v) > 64:
+                raise ValueError("agent_name too long (max 64)")
+            if not _AGENT_NAME_SAFE_RE.match(v):
+                raise ValueError("agent_name: use only letters, numbers, hyphen, underscore, dot")
+        return v
+
+
+@mcp.tool(
+    name="wazuh_domain_lookup",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
+    """Search Wazuh alerts for a specific domain name.
+
+    Queries the structured ``data.domain`` field (boosted) and also searches
+    ``full_log`` for the domain as a phrase.  Results are paginated via cursor;
+    call repeatedly with the ``next_cursor`` from each response to fetch all pages.
+
+    Args:
+        params.domain: Domain to search for (e.g. 'tangerangkota.go.id')
+        params.agent_name: Optional agent filter
+        params.since: ISO 8601 start in UTC (default: 365 days ago)
+        params.until: ISO 8601 end in UTC (default: now)
+        params.limit: Max alerts per page (1-10000, default 500)
+        params.include_full_log: Include raw log lines (default false — they can be huge)
+        params.cursor: Pagination cursor from previous response
+        params.response_format: 'markdown' or 'json'
+
+    Returns:
+        str: Paged alert results with aggregations (top source IPs, top rule groups).
+
+    Example usage:
+        - "Search for all alerts involving tangerangkota.go.id"
+        - "Show me who's hitting the mail server domain"
+    """
+    since_str, until_str = _parse_time_window(params.since, params.until)
+
+    search_after: Optional[list] = None
+    if params.cursor:
+        decoded = _decode_cursor(params.cursor)
+        if decoded:
+            search_after = decoded.get("search_after")
+
+    try:
+        data = await _wazuh_indexer_domain_search(
+            domain=params.domain,
+            agent_name=params.agent_name,
+            size=params.limit,
+            search_after=search_after,
+            since=since_str,
+            until=until_str,
+            include_full_log=params.include_full_log,
+        )
+    except Exception as e:
+        return _handle_api_error(e, context="wazuh_domain_lookup")
+
+    if isinstance(data.get("error"), str):
+        return json.dumps(data, indent=2)
+
+    hits = data.get("hits", {})
+    total = hits.get("total", {})
+    total_val = total.get("value", 0) if isinstance(total, dict) else total
+    total_relation = total.get("relation", "eq") if isinstance(total, dict) else "eq"
+    hit_list = hits.get("hits", [])
+    docs = [h.get("_source", h) for h in hit_list]
+
+    # Build next cursor
+    next_cursor = None
+    if hit_list and len(docs) >= params.limit:
+        last_sort = hit_list[-1].get("sort")
+        if last_sort:
+            next_cursor = _encode_cursor({"search_after": last_sort})
+
+    # Aggregations (client-side from the returned page)
+    srcip_counter: Counter[str] = Counter()
+    rule_group_counter: Counter[str] = Counter()
+    rule_counter: Counter[str] = Counter()
+    for doc in docs:
+        ip = (doc.get("data") or {}).get("srcip", "")
+        if ip:
+            srcip_counter[ip] += 1
+        rule = doc.get("rule") or {}
+        for g in rule.get("groups", []):
+            rule_group_counter[g] += 1
+        rule_id = rule.get("id", "")
+        rule_desc = rule.get("description", "")
+        if rule_id:
+            rule_counter[f"{rule_id}: {rule_desc}"] += 1
+
+    if params.response_format == ResponseFormat.JSON:
+        output = {
+            "domain": params.domain,
+            "total": {"value": total_val, "relation": total_relation},
+            "count": len(docs),
+            "size": params.limit,
+            "next_cursor": next_cursor,
+            "timezone": "UTC",
+            "since": since_str,
+            "until": until_str,
+            "alerts": docs,
+            "aggregations": {
+                "top_srcips": [
+                    {"ip": ip, "count": c} for ip, c in srcip_counter.most_common(20)
+                ],
+                "top_rule_groups": [
+                    {"group": g, "count": c} for g, c in rule_group_counter.most_common(20)
+                ],
+                "top_rules": [
+                    {"rule": r, "count": c} for r, c in rule_counter.most_common(10)
+                ],
+            },
+        }
+        return _truncate_if_needed(json.dumps(output, indent=2, ensure_ascii=False))
+
+    # Markdown output
+    total_display = f"{total_val:,}" + ("+" if total_relation == "gte" else "")
+    page_info = f"Page ({len(docs)} of {total_display})"
+    lines: list[str] = [
+        f"# Wazuh Domain Lookup — {params.domain}",
+        "",
+        f"**Total matches**: {total_display}",
+        f"**{page_info}**",
+        f"**Time window**: {since_str} to {until_str}",
+        f"**Agent**: {params.agent_name or 'all agents'}",
+        "",
+        "## Alerts",
+        "",
+        "| Time (UTC) | Agent | Rule | Level | Src IP | Account |",
+        "|------------|-------|------|-------|--------|---------|",
+    ]
+    for doc in docs:
+        ts = (doc.get("@timestamp") or "")[:19]
+        agent = (doc.get("agent") or {}).get("name", "-")
+        rule = doc.get("rule") or {}
+        rule_str = f"{rule.get('id', '-')}: {rule.get('description', '-')}"
+        level = rule.get("level", "-")
+        ip = (doc.get("data") or {}).get("srcip", "-")
+        account = (doc.get("data") or {}).get("account", "-")
+        lines.append(f"| {ts} | {agent} | {rule_str} | {level} | {ip} | {account} |")
+
+    lines.append("")
+    if srcip_counter:
+        lines.append("## Top Source IPs (this page)")
+        lines.append("| IP | Alert Count |")
+        lines.append("|----|-------------|")
+        for ip, c in srcip_counter.most_common(20):
+            lines.append(f"| {ip} | {c:,} |")
+        lines.append("")
+
+    if rule_group_counter:
+        lines.append("## Top Rule Groups (this page)")
+        lines.append("| Group | Count |")
+        lines.append("|-------|-------|")
+        for g, c in rule_group_counter.most_common(10):
+            lines.append(f"| {g} | {c:,} |")
+        lines.append("")
+
+    if next_cursor:
+        lines.append(f"---\n**Next cursor**: `{next_cursor}`")
+    else:
+        lines.append("---\n**No more pages** — all results returned.")
+
+    return _truncate_if_needed("\n".join(lines))
+
+
+class WazuhCompromisedEmailsAnalysisInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    emails: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=50,
+        description="List of email addresses to analyze "
+                    "(e.g. from wazuh_email_lookup results). Max 50.",
+    )
+    agent_name: Optional[str] = Field(
+        default=None,
+        max_length=64,
+        description="Optional agent name filter.",
+    )
+    since: Optional[str] = Field(
+        default=None,
+        max_length=30,
+        description="ISO 8601 start time in UTC. Defaults to 365 days ago.",
+    )
+    until: Optional[str] = Field(
+        default=None,
+        max_length=30,
+        description="ISO 8601 end time in UTC. Defaults to now.",
+    )
+    top_ips: int = Field(
+        default=20,
+        description="Number of top attacker IPs to return, ranked by alert count.",
+        ge=1,
+        le=100,
+    )
+    enrich_with_netra: bool = Field(
+        default=False,
+        description="If true, query Netra for each attacker IP (adds latency). "
+                    "Rate limiting applies. Only top 10 IPs are enriched.",
+    )
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN,
+        description="'markdown' for human-readable, 'json' for structured.",
+    )
+
+    @field_validator("emails")
+    @classmethod
+    def validate_emails(cls, v: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for email in v:
+            email = email.strip()
+            if not email:
+                continue
+            if len(email) > 254:
+                raise ValueError(f"Email too long: {email[:50]}...")
+            if "@" not in email or ".." in email:
+                raise ValueError(f"Invalid email format: {email}")
+            cleaned.append(email.lower())
+        if not cleaned:
+            raise ValueError("At least one valid email address is required")
+        return cleaned
+
+    @field_validator("agent_name")
+    @classmethod
+    def validate_agent_name(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v = v.strip()
+            if not v:
+                return None
+            if len(v) > 64:
+                raise ValueError("agent_name too long (max 64)")
+            if not _AGENT_NAME_SAFE_RE.match(v):
+                raise ValueError("agent_name: use only letters, numbers, hyphen, underscore, dot")
+        return v
+
+
+@mcp.tool(
+    name="wazuh_compromised_emails_analysis",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalysisInput) -> str:
+    """Correlate compromised email addresses with attacker IPs from Wazuh alerts.
+
+    Given a list of email addresses (typically sourced from ``wazuh_email_lookup``),
+    queries the Wazuh Indexer for alerts mentioning any of them, extracts and ranks
+    the source IPs involved, and optionally enriches the top attacker IPs through
+    Netra Threat Intelligence.
+
+    Netra enrichment is **disabled by default** because it adds latency and consumes
+    Netra API quota.  Set ``enrich_with_netra=true`` to enable it (max 10 IPs
+    enriched regardless of ``top_ips``).
+
+    Args:
+        params.emails: List of email addresses to analyze (1-50)
+        params.agent_name: Optional agent filter
+        params.since: ISO 8601 start (default: 365 days ago)
+        params.until: ISO 8601 end (default: now)
+        params.top_ips: Number of top attacker IPs to rank (1-100, default 20)
+        params.enrich_with_netra: Query Netra for top IPs (default false)
+        params.response_format: 'markdown' or 'json'
+
+    Returns:
+        str: Ranked attacker IP list with targeted email counts, plus per-email
+        breakdown.  If enrich_with_netra is true, Netra threat scores are included
+        for the top 10 IPs.
+
+    Example usage:
+        - "Take the top 5 emails from the lookup and find who's attacking them"
+        - "Enrich the attacker IPs for these compromised accounts through Netra"
+    """
+    since_str, until_str = _parse_time_window(params.since, params.until)
+
+    ip_counter: Counter[str] = Counter()
+    ip_to_emails: dict[str, set[str]] = {}  # IP -> set of targeted emails
+    email_to_ips: dict[str, Counter[str]] = {}  # email -> IP counter
+    email_alert_counts: Counter[str] = Counter()  # email -> total alert count
+    total_scanned = 0
+
+    # Fan out across email batches (max 25 per API call)
+    batch_size = 25
+    try:
+        for i in range(0, len(params.emails), batch_size):
+            batch = params.emails[i:i + batch_size]
+            search_after: Optional[list] = None
+            page_size = 1000
+            batch_scanned = 0
+            max_batch_scanned = 20000  # per-batch cap to prevent runaway
+
+            while batch_scanned < max_batch_scanned:
+                data = await _wazuh_indexer_multi_email_search(
+                    emails=batch,
+                    agent_name=params.agent_name,
+                    size=page_size,
+                    search_after=search_after,
+                    since=since_str,
+                    until=until_str,
+                )
+                if "error" in data:
+                    # Accumulate partial results
+                    break
+
+                hits = data.get("hits", {})
+                hit_list = hits.get("hits", [])
+                docs = [h.get("_source", h) for h in hit_list]
+                if not docs:
+                    break
+
+                for doc in docs:
+                    srcip = (doc.get("data") or {}).get("srcip", "")
+                    # Also extract emails from this doc for association
+                    doc_emails = _extract_emails_from_doc(doc)
+                    # Intersect with our target list
+                    matched = doc_emails & set(params.emails)
+                    if not matched:
+                        continue
+
+                    if srcip:
+                        ip_counter[srcip] += 1
+                        ip_to_emails.setdefault(srcip, set()).update(matched)
+                        for email in matched:
+                            email_to_ips.setdefault(email, Counter())[srcip] += 1
+                            email_alert_counts[email] += 1
+
+                batch_scanned += len(docs)
+                total_scanned += len(docs)
+
+                if len(docs) < page_size:
+                    break
+                last_sort = hit_list[-1].get("sort") if hit_list else None
+                if last_sort:
+                    search_after = last_sort
+                else:
+                    break
+
+    except Exception as e:
+        if total_scanned == 0:
+            return _handle_api_error(e, context="wazuh_compromised_emails_analysis")
+        logging.getLogger(__name__).warning(
+            "wazuh_compromised_emails_analysis: error after %d docs: %s", total_scanned, e
+        )
+
+    top_ips = ip_counter.most_common(params.top_ips)
+
+    # Optional Netra enrichment for top IPs (max 10)
+    netra_results: dict[str, dict] = {}
+    if params.enrich_with_netra:
+        enrich_count = min(len(top_ips), 10)
+        for ip, _ in top_ips[:enrich_count]:
+            try:
+                raw = await _netra_request(f"/analysis/{ip}")
+                data = raw.get("data", {})
+                results = data.get("results", {})
+                ts = results.get("threat_score", {})
+                ai = results.get("ai_insight", {})
+                vt = results.get("virustotal", {})
+                ab = results.get("abuseipdb", {})
+                geo = results.get("ipapi", {})
+                netra_results[ip] = {
+                    "threat_score": ts.get("score"),
+                    "threat_level": ts.get("level"),
+                    "breakdown": ts.get("breakdown"),
+                    "ai_assessment": ai.get("assessment"),
+                    "ai_confidence": ai.get("confidence"),
+                    "virustotal_malicious": vt.get("malicious"),
+                    "virustotal_total": vt.get("total"),
+                    "abuseipdb_confidence": ab.get("abuseConfidenceScore"),
+                    "abuseipdb_total_reports": ab.get("totalReports"),
+                    "country": (geo.get("location") or {}).get("country"),
+                    "country_name": geo.get("country_name"),
+                    "isp": geo.get("isp"),
+                }
+                # Rate-limit courtesy: 1s delay between Netra calls
+                await asyncio.sleep(1)
+            except Exception as e:
+                netra_results[ip] = {"error": str(e)}
+
+    if params.response_format == ResponseFormat.JSON:
+        attacker_ips = []
+        for ip, count in top_ips:
+            entry: dict = {
+                "ip": ip,
+                "alert_count": count,
+                "targeted_emails": sorted(ip_to_emails.get(ip, set())),
+                "targeted_email_count": len(ip_to_emails.get(ip, set())),
+            }
+            if ip in netra_results:
+                entry["netra"] = netra_results[ip]
+            attacker_ips.append(entry)
+
+        per_email: dict[str, dict] = {}
+        for email in params.emails:
+            ips_for_email = email_to_ips.get(email, Counter())
+            per_email[email] = {
+                "total_alerts": email_alert_counts.get(email, 0),
+                "attacker_ips": [
+                    {"ip": ip, "count": c}
+                    for ip, c in ips_for_email.most_common(20)
+                ],
+            }
+
+        output = {
+            "emails_analyzed": params.emails,
+            "total_alerts_scanned": total_scanned,
+            "top_attacker_ips": attacker_ips,
+            "per_email": per_email,
+            "enrichment_enabled": params.enrich_with_netra,
+            "time_window": {"since": since_str, "until": until_str},
+        }
+        return _truncate_if_needed(json.dumps(output, indent=2, ensure_ascii=False))
+
+    # Markdown output
+    lines: list[str] = [
+        "# Compromised Email Analysis",
+        "",
+        f"**Time window**: {since_str} to {until_str}",
+        f"**Emails analyzed**: {len(params.emails)}",
+        f"**Agent**: {params.agent_name or 'all agents'}",
+        f"**Alerts scanned**: {total_scanned:,}",
+        "",
+        "## Top Attacker IPs",
+        "",
+    ]
+    if params.enrich_with_netra:
+        lines.append(
+            "| # | IP | Alert Count | Targeted Emails | Netra Score | Netra Level | Country |"
+        )
+        lines.append(
+            "|---|----|------------|-----------------|-------------|-------------|---------|"
+        )
+        for i, (ip, count) in enumerate(top_ips, 1):
+            targeted = len(ip_to_emails.get(ip, set()))
+            nr = netra_results.get(ip, {})
+            score = nr.get("threat_score", "-")
+            level = nr.get("threat_level", "-")
+            country = nr.get("country_name") or nr.get("country") or "-"
+            lines.append(
+                f"| {i} | {ip} | {count:,} | {targeted} | {score} | {level} | {country} |"
+            )
+    else:
+        lines.append(
+            "| # | IP | Alert Count | Targeted Emails |"
+        )
+        lines.append(
+            "|---|----|------------|-----------------|"
+        )
+        for i, (ip, count) in enumerate(top_ips, 1):
+            targeted = len(ip_to_emails.get(ip, set()))
+            lines.append(f"| {i} | {ip} | {count:,} | {targeted} |")
+
+    lines.append("")
+    lines.append("## Per-Email Summary")
+    lines.append("")
+    for email in params.emails:
+        alert_count = email_alert_counts.get(email, 0)
+        lines.append(f"### {email} ({alert_count:,} alerts)")
+        ips_for_email = email_to_ips.get(email, Counter())
+        if ips_for_email:
+            lines.append("| IP | Count | Netra Level |")
+            lines.append("|----|-------|-------------|")
+            for ip, c in ips_for_email.most_common(10):
+                level = (netra_results.get(ip) or {}).get("threat_level", "-")
+                lines.append(f"| {ip} | {c:,} | {level} |")
+        else:
+            lines.append("_No attacker IPs found for this email._")
+        lines.append("")
+
+    if params.enrich_with_netra and netra_results:
+        lines.append("## Netra Enrichment (top attacker IPs)")
+        lines.append("")
+        for ip, nr in netra_results.items():
+            if "error" in nr:
+                lines.append(f"### {ip} — Error: {nr['error']}")
+                continue
+            score = nr.get("threat_score", "-")
+            level = nr.get("threat_level", "-")
+            ai = nr.get("ai_assessment") or "No AI assessment available"
+            vt = f"{nr.get('virustotal_malicious', '-')}/{nr.get('virustotal_total', '-')}"
+            ab = (
+                f"Confidence {nr.get('abuseipdb_confidence', '-')}%, "
+                f"{nr.get('abuseipdb_total_reports', '-')} reports"
+            )
+            country = nr.get("country_name") or nr.get("country") or "-"
+            isp = nr.get("isp") or "-"
+            lines.append(f"### {ip} — Threat Level: {level} (Score: {score}/100)")
+            lines.append(f"- **AI Assessment**: {ai}")
+            lines.append(f"- **VirusTotal**: {vt} malicious")
+            lines.append(f"- **AbuseIPDB**: {ab}")
+            lines.append(f"- **Country**: {country}   |   **ISP**: {isp}")
+            lines.append("")
+    elif params.enrich_with_netra and not netra_results:
+        lines.append("## Netra Enrichment")
+        lines.append("")
+        lines.append(
+            "_Netra enrichment was enabled but no results were obtained. "
+            "Check that NETRA_API_KEY is set._"
+        )
+    else:
+        lines.append(
+            "_Netra enrichment was disabled. Set `enrich_with_netra=true` to enable "
+            "threat intelligence enrichment for attacker IPs._"
+        )
+
+    return _truncate_if_needed("\n".join(lines))
+
+
+# Dynamic Time-Based Alert Analysis
+def _auto_bucket_interval(window_duration_minutes: float) -> str:
+    """Pick a reasonable date_histogram bucket interval for a given time window.
+
+    Targets ~60-120 buckets for readability.  Returns an OpenSearch
+    ``fixed_interval`` value (e.g. ``"1m"``, ``"15m"``, ``"1h"``, ``"1d"``).
+    """
+    target_buckets = 100
+    raw_minutes = window_duration_minutes / target_buckets
+    if raw_minutes <= 1:
+        return "1m"
+    elif raw_minutes <= 5:
+        return "5m"
+    elif raw_minutes <= 15:
+        return "15m"
+    elif raw_minutes <= 60:
+        return "1h"
+    elif raw_minutes <= 360:
+        return "6h"
+    else:
+        return "1d"
+
+
+def _duration_minutes(since: str, until: str) -> float:
+    """Return the duration in minutes between two ISO 8601 timestamps."""
+    try:
+        s = datetime.fromisoformat(since.replace("Z", "+00:00").rstrip("Z"))
+        u = datetime.fromisoformat(until.replace("Z", "+00:00").rstrip("Z"))
+        return (u - s).total_seconds() / 60.0
+    except Exception:
+        return 60.0  # fallback 1h
+
+
+class WazuhAlertTimelineInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    since: str = Field(
+        default="1h",
+        max_length=30,
+        description="Start of time window — ISO 8601 ('2026-07-07T00:00:00Z') or relative "
+                    "('5m', '1h', '24h', '7d', '30d'). Default: '1h'.",
+    )
+    until: Optional[str] = Field(
+        default=None,
+        max_length=30,
+        description="End of time window — ISO 8601 or relative. Defaults to now.",
+    )
+    bucket: str = Field(
+        default="auto",
+        max_length=10,
+        description="Bucket size: '1m', '5m', '15m', '1h', '6h', '1d', or 'auto'. "
+                    "'auto' picks based on window: ≤1h→1m, ≤24h→15m, ≤7d→1h, ≤30d→6h, ≤365d→1d.",
+    )
+    agent_name: Optional[str] = Field(
+        default=None,
+        max_length=64,
+        description="Optional agent name filter.",
+    )
+    rule_groups: Optional[str] = Field(
+        default=None,
+        max_length=256,
+        description="Comma-separated rule groups to filter by (e.g. 'brute_force,authentication_failed').",
+    )
+    rule_level_min: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=16,
+        description="Minimum rule level (e.g., 8 for medium+ severity).",
+    )
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN,
+        description="'markdown' for human-readable timeline, 'json' for structured bucket data.",
+    )
+
+    @field_validator("agent_name")
+    @classmethod
+    def validate_agent_name(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v = v.strip()
+            if not v:
+                return None
+            if len(v) > 64:
+                raise ValueError("agent_name too long (max 64)")
+            if not _AGENT_NAME_SAFE_RE.match(v):
+                raise ValueError("agent_name: use only letters, numbers, hyphen, underscore, dot")
+        return v
+
+    @field_validator("bucket")
+    @classmethod
+    def validate_bucket(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v == "auto":
+            return v
+        if not re.match(r"^(\d+[smhd]|auto)$", v):
+            raise ValueError("bucket: use 'auto', '1m', '5m', '15m', '1h', '6h', or '1d'")
+        return v
+
+    @field_validator("rule_groups")
+    @classmethod
+    def validate_rule_groups(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v = v.strip()
+            if not v:
+                return None
+            for g in v.split(","):
+                g = g.strip()
+                if not g:
+                    raise ValueError("Empty rule group name in comma-separated list")
+                if not _AGENT_NAME_SAFE_RE.match(g):
+                    raise ValueError(f"Invalid rule group name: '{g}'")
+        return v
+
+
+@mcp.tool(
+    name="wazuh_alert_timeline",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def wazuh_alert_timeline(params: WazuhAlertTimelineInput) -> str:
+    """Return a time-bucketed breakdown of Wazuh alerts using OpenSearch date_histogram.
+
+    Instead of fetching individual alert documents, this tool asks the Indexer to
+    bucket alert counts by time interval (per minute, per 15 minutes, per hour, etc.)
+    directly on the server — fast, even across millions of documents.
+
+    Each bucket includes:
+    - Total alert count
+    - Count by severity band (low ≤4, medium 5-9, high ≥10)
+    - Top rules, top source IPs, and top agents within that bucket
+
+    Args:
+        params.since: Start of time window (default '1h').  Accepts ISO 8601 or relative
+                     expressions ('5m', '1h', '24h', '7d', '30d').
+        params.until: End of time window.  Defaults to now.
+        params.bucket: Bucket size — '1m', '5m', '15m', '1h', '6h', '1d', or 'auto'.
+        params.agent_name: Optional agent filter.
+        params.rule_groups: Optional comma-separated rule groups filter.
+        params.rule_level_min: Only count alerts at or above this severity.
+        params.response_format: 'markdown' or 'json'.
+
+    Returns:
+        str: Timeline table with per-bucket counts, severity bands, and top indicators.
+
+    Example usage:
+        - "Show me the alert timeline for the last hour"
+        - "Break down yesterday's brute force alerts by 15-minute intervals"
+        - "What's the attack volume trend over the last 7 days?"
+    """
+    since_str, until_str = _parse_time_window(params.since, params.until)
+
+    # Determine bucket interval
+    if params.bucket == "auto":
+        dur = _duration_minutes(since_str, until_str)
+        bucket_interval = _auto_bucket_interval(dur)
+    else:
+        bucket_interval = params.bucket
+
+    rule_group_list: Optional[list[str]] = None
+    if params.rule_groups:
+        rule_group_list = [g.strip() for g in params.rule_groups.split(",") if g.strip()]
+
+    try:
+        data = await _wazuh_indexer_aggregate(
+            bucket_interval=bucket_interval,
+            since=since_str,
+            until=until_str,
+            agent_name=params.agent_name,
+            rule_groups=rule_group_list,
+            rule_level_min=params.rule_level_min,
+        )
+    except Exception as e:
+        return _handle_api_error(e, context="wazuh_alert_timeline")
+
+    if isinstance(data.get("error"), str):
+        return json.dumps(data, indent=2)
+
+    aggs = data.get("aggregations", {})
+    timeline = aggs.get("alerts_over_time", {})
+    buckets = timeline.get("buckets", [])
+
+    if not buckets:
+        return (
+            "# Alert Timeline — No Data\n\n"
+            f"**Window**: {since_str} → {until_str}\n"
+            f"**Bucket**: {bucket_interval}\n\n"
+            "_No alerts matched the query in this time window._"
+        )
+
+    total_alerts = sum(b.get("doc_count", 0) for b in buckets)
+
+    if params.response_format == ResponseFormat.JSON:
+        return _truncate_if_needed(json.dumps({
+            "window": {"since": since_str, "until": until_str},
+            "bucket_interval": bucket_interval,
+            "total_buckets": len(buckets),
+            "total_alerts": total_alerts,
+            "buckets": [
+                {
+                    "key": b.get("key_as_string", b.get("key", "")),
+                    "doc_count": b.get("doc_count", 0),
+                    "by_level": {
+                        r.get("key", ""): r.get("doc_count", 0)
+                        for r in (b.get("by_level", {}) or {}).get("buckets", [])
+                    },
+                    "top_rules": [
+                        {"key": r.get("key", ""), "count": r.get("doc_count", 0)}
+                        for r in (b.get("top_rules", {}) or {}).get("buckets", [])
+                    ],
+                    "top_srcips": [
+                        {"key": r.get("key", ""), "count": r.get("doc_count", 0)}
+                        for r in (b.get("top_srcips", {}) or {}).get("buckets", [])
+                    ],
+                    "top_agents": [
+                        {"key": r.get("key", ""), "count": r.get("doc_count", 0)}
+                        for r in (b.get("top_agents", {}) or {}).get("buckets", [])
+                    ],
+                }
+                for b in buckets
+            ],
+        }, indent=2, ensure_ascii=False))
+
+    # Markdown
+    dur_str = f"{_duration_minutes(since_str, until_str):.0f} min" if _duration_minutes(since_str, until_str) < 120 else f"{_duration_minutes(since_str, until_str) / 60:.1f}h"
+    lines: list[str] = [
+        f"# Alert Timeline — Last {dur_str}",
+        f"**Window**: {since_str} → {until_str}  |  **Bucket**: {bucket_interval}  |  **Total alerts**: {total_alerts:,}",
+        "",
+        "| Time (UTC) | Total | Low (≤4) | Med (5-9) | High (≥10) | Top Rule | Top Src IP |",
+        "|------------|-------|----------|-----------|------------|----------|-----------|",
+    ]
+
+    for b in buckets:
+        key = b.get("key_as_string", b.get("key", ""))
+        ts = key[:16] if len(key) >= 16 else key  # e.g. "2026-07-07T18:00"
+        total = b.get("doc_count", 0)
+        by_level = {}
+        for lv in (b.get("by_level", {}) or {}).get("buckets", []):
+            by_level[lv.get("key", "")] = lv.get("doc_count", 0)
+        low = by_level.get("low", 0)
+        med = by_level.get("medium", 0)
+        high = by_level.get("high", 0)
+        top_rules = [
+            r.get("key", "")[:30]
+            for r in ((b.get("top_rules") or {}).get("buckets") or [])
+        ]
+        top_rule = top_rules[0] if top_rules else "-"
+        top_srcips = [
+            r.get("key", "")
+            for r in ((b.get("top_srcips") or {}).get("buckets") or [])
+        ]
+        top_ip = top_srcips[0] if top_srcips else "-"
+        lines.append(f"| {ts} | {total} | {low} | {med} | {high} | {top_rule} | {top_ip} |")
+
+    # Peak analysis
+    peak = max(buckets, key=lambda b: b.get("doc_count", 0)) if buckets else None
+    quiet = min(buckets, key=lambda b: b.get("doc_count", 0)) if buckets else None
+
+    lines.append("")
+    lines.append("## Peak Activity")
+    if peak:
+        peak_key = peak.get("key_as_string", peak.get("key", ""))[:16]
+        peak_count = peak.get("doc_count", 0)
+        lines.append(f"- **Peak**: {peak_key} — {peak_count:,} alerts")
+    if quiet:
+        quiet_key = quiet.get("key_as_string", quiet.get("key", ""))[:16]
+        quiet_count = quiet.get("doc_count", 0)
+        lines.append(f"- **Quietest**: {quiet_key} — {quiet_count:,} alerts")
+
+    # Per-severity totals
+    all_low = sum(
+        next((r.get("doc_count", 0) for r in (b.get("by_level", {}) or {}).get("buckets", []) if r.get("key") == "low"), 0)
+        for b in buckets
+    )
+    all_med = sum(
+        next((r.get("doc_count", 0) for r in (b.get("by_level", {}) or {}).get("buckets", []) if r.get("key") == "medium"), 0)
+        for b in buckets
+    )
+    all_high = sum(
+        next((r.get("doc_count", 0) for r in (b.get("by_level", {}) or {}).get("buckets", []) if r.get("key") == "high"), 0)
+        for b in buckets
+    )
+    lines.extend([
+        "",
+        "## Severity Summary",
+        f"- Low (≤4): {all_low:,} ({all_low / max(total_alerts, 1) * 100:.0f}%)",
+        f"- Medium (5-9): {all_med:,} ({all_med / max(total_alerts, 1) * 100:.0f}%)",
+        f"- High (≥10): {all_high:,} ({all_high / max(total_alerts, 1) * 100:.0f}%)",
+        "",
+        "## Query Parameters",
+        f"- Since: `{params.since}`",
+        f"- Bucket: `{bucket_interval}`",
+        f"- Agent: {params.agent_name or 'all'}",
+        f"- Rule groups: {params.rule_groups or 'all'}",
+        f"- Min level: {params.rule_level_min or 'none'}",
+    ])
+
+    return _truncate_if_needed("\n".join(lines))
+
+
+class WazuhAttackVelocityInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    window: str = Field(
+        default="1h",
+        max_length=10,
+        description="Window size for comparison — relative expression: '15m', '1h', '6h', '24h'. "
+                    "'1h' compares the last hour against the hour before that.",
+    )
+    agent_name: Optional[str] = Field(
+        default=None,
+        max_length=64,
+        description="Optional agent name filter.",
+    )
+    rule_groups: Optional[str] = Field(
+        default=None,
+        max_length=256,
+        description="Comma-separated rule groups to filter by.",
+    )
+    bucket: str = Field(
+        default="auto",
+        max_length=10,
+        description="Bucket size within each window: '1m', '5m', '15m', '1h', or 'auto'.",
+    )
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN,
+        description="'markdown' for human-readable, 'json' for structured.",
+    )
+
+    @field_validator("agent_name")
+    @classmethod
+    def validate_agent_name(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v = v.strip()
+            if not v:
+                return None
+            if len(v) > 64:
+                raise ValueError("agent_name too long (max 64)")
+            if not _AGENT_NAME_SAFE_RE.match(v):
+                raise ValueError("agent_name: use only letters, numbers, hyphen, underscore, dot")
+        return v
+
+    @field_validator("window")
+    @classmethod
+    def validate_window(cls, v: str) -> str:
+        if not _RELATIVE_TIME_RE.match(v.strip()):
+            raise ValueError(
+                "window must be a relative expression: '15m', '1h', '6h', '24h', '7d'"
+            )
+        return v.strip()
+
+    @field_validator("rule_groups")
+    @classmethod
+    def validate_rule_groups(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v = v.strip()
+            if not v:
+                return None
+            for g in v.split(","):
+                g = g.strip()
+                if not g:
+                    raise ValueError("Empty rule group name")
+                if not _AGENT_NAME_SAFE_RE.match(g):
+                    raise ValueError(f"Invalid rule group name: '{g}'")
+        return v
+
+
+@mcp.tool(
+    name="wazuh_attack_velocity",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def wazuh_attack_velocity(params: WazuhAttackVelocityInput) -> str:
+    """Compare two adjacent time windows to detect attack acceleration or deceleration.
+
+    Queries the Wazuh Indexer for two adjacent windows of equal duration (current
+    and previous), computes per-bucket deltas, and scores the overall trend:
+    **accelerating** (>+25%), **steady** (−25% to +25%), or **decelerating** (<−25%).
+
+    Also reports the top accelerating rules and source IPs across the two windows.
+
+    Args:
+        params.window: Window size — relative expression like '15m', '1h', '6h', '24h'.
+                      '1h' compares the last hour against the hour before it.
+        params.agent_name: Optional agent filter.
+        params.rule_groups: Optional comma-separated rule groups filter.
+        params.bucket: Bucket granularity within each window. 'auto' picks based on
+                      window size.
+        params.response_format: 'markdown' or 'json'.
+
+    Returns:
+        str: Velocity report with trend classification, per-bucket comparison table,
+        and top accelerating rules / source IPs.
+
+    Example usage:
+        - "Is the brute force attack on the mail server speeding up?"
+        - "Compare the last hour's alert volume to the previous hour"
+    """
+    window_str = params.window
+    m = _RELATIVE_TIME_RE.match(window_str)
+    n, unit = int(m.group(1)), m.group(2)
+    window_delta = _relative_delta(n, unit)
+
+    now = datetime.utcnow()
+    current_start = now - window_delta
+    previous_start = current_start - window_delta
+
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    current_since = current_start.strftime(fmt)
+    current_until = now.strftime(fmt)
+    previous_since = previous_start.strftime(fmt)
+    previous_until = current_start.strftime(fmt)
+
+    # Determine bucket interval
+    dur_min = window_delta.total_seconds() / 60.0
+    if params.bucket == "auto":
+        bucket_interval = _auto_bucket_interval(dur_min)
+    else:
+        bucket_interval = params.bucket
+
+    rule_group_list: Optional[list[str]] = None
+    if params.rule_groups:
+        rule_group_list = [g.strip() for g in params.rule_groups.split(",") if g.strip()]
+
+    # Query both windows
+    try:
+        current_data, previous_data = await asyncio.gather(
+            _wazuh_indexer_aggregate(
+                bucket_interval=bucket_interval,
+                since=current_since,
+                until=current_until,
+                agent_name=params.agent_name,
+                rule_groups=rule_group_list,
+            ),
+            _wazuh_indexer_aggregate(
+                bucket_interval=bucket_interval,
+                since=previous_since,
+                until=previous_until,
+                agent_name=params.agent_name,
+                rule_groups=rule_group_list,
+            ),
+        )
+    except Exception as e:
+        return _handle_api_error(e, context="wazuh_attack_velocity")
+
+    if isinstance(current_data.get("error"), str):
+        return json.dumps(current_data, indent=2)
+    if isinstance(previous_data.get("error"), str):
+        return json.dumps(previous_data, indent=2)
+
+    def extract_buckets(data: dict) -> list[dict]:
+        return (
+            data.get("aggregations", {})
+            .get("alerts_over_time", {})
+            .get("buckets", [])
+        )
+
+    current_buckets = extract_buckets(current_data)
+    previous_buckets = extract_buckets(previous_data)
+
+    total_current = sum(b.get("doc_count", 0) for b in current_buckets)
+    total_previous = sum(b.get("doc_count", 0) for b in previous_buckets)
+
+    if total_previous > 0:
+        velocity_pct = (total_current - total_previous) / total_previous * 100
+    elif total_current > 0:
+        velocity_pct = 100.0  # new attack pattern
+    else:
+        velocity_pct = 0.0
+
+    if velocity_pct > 25:
+        trend = "accelerating"
+        trend_icon = "🔺"
+    elif velocity_pct < -25:
+        trend = "decelerating"
+        trend_icon = "🔻"
+    else:
+        trend = "steady"
+        trend_icon = "➖"
+
+    # Align buckets by position
+    max_buckets = max(len(current_buckets), len(previous_buckets))
+    bucket_rows: list[dict] = []
+    for i in range(max_buckets):
+        cur = current_buckets[i].get("doc_count", 0) if i < len(current_buckets) else 0
+        prev = previous_buckets[i].get("doc_count", 0) if i < len(previous_buckets) else 0
+        delta = cur - prev
+        d_trend = "🔺" if delta > 5 else ("🔻" if delta < -5 else "—")
+        cb = current_buckets[i] if i < len(current_buckets) else {}
+        ts = (cb.get("key_as_string", cb.get("key", "")))[:16] if i < len(current_buckets) else "—"
+        bucket_rows.append({
+            "timestamp": ts,
+            "previous": prev,
+            "current": cur,
+            "delta": delta,
+            "trend": d_trend,
+        })
+
+    if params.response_format == ResponseFormat.JSON:
+        output = {
+            "velocity_pct": round(velocity_pct, 1),
+            "trend": trend,
+            "windows": {
+                "current": {"since": current_since, "until": current_until, "total": total_current},
+                "previous": {"since": previous_since, "until": previous_until, "total": total_previous},
+            },
+            "bucket_interval": bucket_interval,
+            "buckets": bucket_rows,
+        }
+        return _truncate_if_needed(json.dumps(output, indent=2, ensure_ascii=False))
+
+    # Markdown
+    lines: list[str] = [
+        f"# Attack Velocity — Last {window_str} vs Previous {window_str}",
+        "",
+        f"**Current window**: {current_since} → {current_until}  ({total_current:,} alerts)",
+        f"**Previous window**: {previous_since} → {previous_until}  ({total_previous:,} alerts)",
+        f"**Velocity**: {trend_icon} {velocity_pct:+.0f}% — **{trend}**",
+        "",
+        "| Bucket | Prev | Current | Delta | Trend |",
+        "|--------|------|---------|-------|-------|",
+    ]
+    for r in bucket_rows[:50]:  # cap at 50 rows for readability
+        lines.append(
+            f"| {r['timestamp']} | {r['previous']} | {r['current']} | "
+            f"{r['delta']:+d} | {r['trend']} |"
+        )
+
+    # Per-severity velocity
+    def severity_counts(buckets: list[dict], key: str) -> int:
+        return sum(
+            next(
+                (lv.get("doc_count", 0)
+                 for lv in (b.get("by_level", {}) or {}).get("buckets", [])
+                 if lv.get("key") == key),
+                0,
+            )
+            for b in buckets
+        )
+
+    lines.append("")
+    lines.append("## Severity Velocity")
+    for sev_key, sev_label in [("high", "High (≥10)"), ("medium", "Medium (5-9)"), ("low", "Low (≤4)")]:
+        c_val = severity_counts(current_buckets, sev_key)
+        p_val = severity_counts(previous_buckets, sev_key)
+        sev_vel = (c_val - p_val) / max(p_val, 1) * 100 if p_val > 0 else (100 if c_val > 0 else 0)
+        sev_icon = "🔺" if sev_vel > 25 else ("🔻" if sev_vel < -25 else "➖")
+        lines.append(f"- {sev_label}: {p_val} → {c_val} ({sev_icon} {sev_vel:+.0f}%)")
+
+    lines.extend([
+        "",
+        "## Query Parameters",
+        f"- Window: `{params.window}`",
+        f"- Bucket: `{bucket_interval}`",
+        f"- Agent: {params.agent_name or 'all'}",
+        f"- Rule groups: {params.rule_groups or 'all'}",
+    ])
+
+    return _truncate_if_needed("\n".join(lines))
+
 
 # THREAT INTELLIGENCE
 _IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")

@@ -11,7 +11,7 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
 
 ## Architecture
 
-`blue_team_server.py` is a **single, unified MCP server** with 38 tools spanning host forensics, Wazuh SIEM, and multi-source threat intelligence. It supports three transports:
+`blue_team_server.py` is a **single, unified MCP server** with 43 tools spanning host forensics, Wazuh SIEM, and multi-source threat intelligence. It supports three transports:
 
 | Transport | Use case | MCP client connection |
 |---|---|---|
@@ -22,7 +22,7 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
 ```
                           ┌──────────────────────────────────┐
                           │     blue_team_server.py          │
-                          │     38 tools · 1 file · 3 transports  │
+                          │     43 tools · 1 file · 3 transports  │
                           │                                  │
                           │  ┌────────────────────────────┐  │
                           │  │ Host Forensics (26 tools)  │  │
@@ -36,11 +36,14 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
                           │  │ • System health            │  │
                           │  └────────────────────────────┘  │
                           │  ┌────────────────────────────┐  │
-                          │  │ Wazuh SIEM (5 tools)       │  │
+                          │  │ Wazuh SIEM (10 tools)      │  │
                           │  │ • Agent inventory & status │  │
                           │  │ • Security alerts          │  │
                           │  │ • Manager logs             │  │
                           │  │ • OpenSearch indexer query │  │
+                          │  │ • Email/domain compromise  │  │
+                          │  │ • Alert timeline           │  │
+                          │  │ • Attack velocity          │  │
                           │  └────────────────────────────┘  │
                           │  ┌────────────────────────────┐  │
                           │  │ Threat Intel (7 tools)     │  │
@@ -85,7 +88,7 @@ The CrowdSec and GreyNoise tools also ship as separate files for users who prefe
 
 | File | Tools | When to use |
 |---|---|---|
-| `blue_team_server.py` | **All 38 tools** | **Recommended** — full capabilities, cursor pagination, token caching |
+| `blue_team_server.py` | **All 43 tools** | **Recommended** — full capabilities, cursor pagination, token caching |
 | `blue_team_server_crowdsec.py` | 2 CrowdSec CTI tools | Isolated CrowdSec-only server with parallel bulk lookups |
 | `blue_team_server_greynoise.py` | 1 GreyNoise Community tool | Isolated GreyNoise-only server |
 
@@ -99,7 +102,7 @@ The suite has been refactored for **bulk data processing and concurrent workload
 
 #### Cursor-Based Pagination (Bulk Data Without Hard Caps)
 
-All five Wazuh tools support iterative cursor pagination via base64-encoded JSON tokens. Each page returns a `next_cursor`; pass it back as the `cursor` parameter to fetch the next page. `next_cursor` is `null` when the dataset is exhausted.
+All Wazuh tools support iterative cursor pagination via base64-encoded JSON tokens. Each page returns a `next_cursor`; pass it back as the `cursor` parameter to fetch the next page. `next_cursor` is `null` when the dataset is exhausted.
 
 | Tool | Pagination Mechanism | Max per Page | Cursor Shape |
 |---|---|---|---|
@@ -107,6 +110,11 @@ All five Wazuh tools support iterative cursor pagination via base64-encoded JSON
 | `blueteam_wazuh_agents` | Wazuh API `offset`/`limit` | 10,000 | `{"offset": N}` |
 | `blueteam_wazuh_manager_logs` | Wazuh API `offset`/`limit` | **500** (auto capped) | `{"offset": N}` |
 | `blueteam_wazuh_alerts` | Line-offset in local `alerts.json` | 2,000 | `{"scanned": N}` |
+| `wazuh_email_lookup` | OpenSearch `search_after` (sort-key traversal) | 1,000 | `{"search_after": [<sort_values>]}` |
+| `wazuh_domain_lookup` | OpenSearch `search_after` (sort-key traversal) | 10,000 | `{"search_after": [<sort_values>]}` |
+| `wazuh_compromised_emails_analysis` | OpenSearch `search_after` (sort-key traversal) | 1,000 | `{"search_after": [<sort_values>]}` |
+| `wazuh_alert_timeline` | OpenSearch `date_histogram` (size:0, server-side) | ∞ (covers all matching docs) | n/a — no cursor needed |
+| `wazuh_attack_velocity` | OpenSearch `date_histogram` (size:0, server-side) | ∞ (covers all matching docs) | n/a — no cursor needed |
 
 **Agent workflow:**
 ```
@@ -116,6 +124,21 @@ All five Wazuh tools support iterative cursor pagination via base64-encoded JSON
 ```
 
 All input schemas are **backward-compatible** — `cursor` is optional and defaults are unchanged.
+
+#### Relative Time Expressions
+
+All Wazuh tools accept **relative time expressions** for `since`/`until` parameters in addition to ISO 8601 strings:
+
+| Expression | Meaning | Example |
+|---|---|---|
+| `Ns` | N seconds ago | `15s` — last 15 seconds |
+| `Nm` | N minutes ago | `5m` / `30m` — last 5 / 30 minutes |
+| `Nh` | N hours ago | `1h` / `24h` / `6h` — last N hours |
+| `Nd` | N days ago | `1d` / `7d` / `30d` — last N days |
+| `Nw` | N weeks ago | `1w` / `4w` — last N weeks |
+| ISO 8601 | Absolute timestamp (pass-through) | `2026-07-07T17:00:00Z` |
+
+Supported by: `blueteam_wazuh_alerts`, `blueteam_wazuh_indexer_search`, `wazuh_email_lookup`, `wazuh_domain_lookup`, `wazuh_compromised_emails_analysis`, `wazuh_alert_timeline`, `wazuh_attack_velocity`.
 
 #### Paging via `search_after` (`blueteam_wazuh_indexer_search`)
 
@@ -351,7 +374,7 @@ Then point Claude Desktop at it:
 
 Replace `192.168.153.5` with the IP reachable from your workstation (`192.168.153.5` for NAT, `172.16.101.5` for LAB).
 
-Restart Claude Desktop. You should see all 38 blue-team-mcp tools available.
+Restart Claude Desktop. You should see all 43 blue-team-mcp tools available.
 
 ### 4. Remote Service Deployment (systemd)
 
@@ -414,7 +437,7 @@ All tools below are registered on `blue_team_server.py`. Tools not requiring a s
 | `blueteam_capture_traffic` | Live packet capture via tcpdump |
 
 ### Wazuh SIEM
-*All five tools support cursor-based pagination — see [Cursor-Based Pagination](#cursor-based-pagination-bulk-data-without-hard-caps).*
+*All ten tools support cursor-based pagination — see [Cursor-Based Pagination](#cursor-based-pagination-bulk-data-without-hard-caps).*
 
 | Tool | Description |
 |------|-------------|
@@ -423,6 +446,11 @@ All tools below are registered on `blue_team_server.py`. Tools not requiring a s
 | `blueteam_wazuh_manager_logs` | Manager daemon logs — paginated via `cursor`/`limit` (up to 1,000/page) |
 | `blueteam_wazuh_alerts` | Security alerts from alerts.json — paginated via `cursor`/`limit` (up to 2,000/page) |
 | `blueteam_wazuh_indexer_search` | Query OpenSearch for agent alerts/events — paginated via `cursor`/`limit` (up to 10,000/page) |
+| `wazuh_email_lookup` | Find top-N compromised email addresses by scanning `full_log` + `data.account` fields |
+| `wazuh_domain_lookup` | Search alerts by domain name with cursor pagination and source IP aggregation |
+| `wazuh_compromised_emails_analysis` | Correlate compromised emails with attacker IPs, optional Netra enrichment |
+| `wazuh_alert_timeline` | Time-bucketed alert aggregation using OpenSearch `date_histogram` |
+| `wazuh_attack_velocity` | Compare two time windows to detect attack acceleration/deceleration |
 
 ### Threat Intelligence
 | Tool | Description |
@@ -598,6 +626,6 @@ export BLUETEAM_RATE_LIMIT=60
 
 | File | Role |
 |---|---|
-| `blue_team_server.py` | **Primary** — all 38 tools, all three transports (stdio / SSE / Streamable HTTP) |
+| `blue_team_server.py` | **Primary** — all 43 tools, all three transports (stdio / SSE / Streamable HTTP) |
 | `blue_team_server_crowdsec.py` | Standalone CrowdSec-only server (backward compat) |
 | `blue_team_server_greynoise.py` | Standalone GreyNoise-only server (backward compat) |
