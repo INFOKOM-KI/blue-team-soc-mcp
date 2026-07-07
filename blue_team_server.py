@@ -9,7 +9,7 @@ MAESTRO Framework: Aligned with CSA MAESTRO (Layer 3 Agent Frameworks, Layer 5 O
 Tools included:
   - Log analysis (auth, syslog, journald, nginx/apache)
   - Network monitoring (open ports, active connections, traffic capture)
-  - Threat intelligence (IP/domain reputation via AbuseIPDB, VirusTotal)
+  - Threat intelligence (IP/domain reputation via AbuseIPDB, VirusTotal, Netra, CrowdSec, GreyNoise)
   - Fail2ban management (view jails, banned IPs, unban)
   - File integrity checking (AIDE/manual hash comparison)
   - System hardening audit (Lynis, open SUID files, world-writable paths)
@@ -102,6 +102,11 @@ CROWDSEC_API_KEY_ENV = "CROWDSEC_API_KEY"
 # GreyNoise Community (free, no API key required)
 GREYNOISE_COMMUNITY_BASE_URL = "https://api.greynoise.io/v3/community"
 
+# Netra Threat Intelligence (optional — set NETRA_API_KEY to enable the netra_ip_analysis tool)
+NETRA_BASE_URL = "https://yourdreams.gov:8013/api/v1"
+NETRA_API_KEY_ENV = "NETRA_API_KEY"
+NETRA_VERIFY_SSL = os.environ.get("NETRA_VERIFY_SSL", "false").lower() in ("1", "true", "yes")
+
 # Shared HTTP / response config
 HTTP_TIMEOUT = 30.0
 CHARACTER_LIMIT = int(os.environ.get("BLUETEAM_CHARACTER_LIMIT", "25000"))
@@ -127,6 +132,7 @@ _PRIVATE_NETWORKS = [
 _shared_http_client: Optional[httpx.AsyncClient] = None
 _shared_wazuh_client: Optional[httpx.AsyncClient] = None
 _shared_indexer_client: Optional[httpx.AsyncClient] = None
+_shared_netra_client: Optional[httpx.AsyncClient] = None
 
 
 async def _get_http_client() -> httpx.AsyncClient:
@@ -938,6 +944,395 @@ async def greynoise_ip_context(params: GreynoiseIpContextInput) -> str:
         result = json.dumps(output, indent=2, ensure_ascii=False)
     else:
         result = _format_greynoise_markdown(params.ip, raw)
+
+    return _truncate_if_needed(result)
+
+
+# NETRA THREAT INTELLIGENCE
+# Optional: set NETRA_API_KEY to enable the netra_ip_analysis tool.
+# The staging server may use a self-signed certificate — configure
+# NETRA_VERIFY_SSL=true if your deployment uses a trusted CA.
+
+
+async def _get_netra_http_client() -> httpx.AsyncClient:
+    """Return a shared httpx.AsyncClient for the Netra Threat Intelligence API (staging, often self-signed)."""
+    global _shared_netra_client
+    if _shared_netra_client is None or _shared_netra_client.is_closed:
+        _shared_netra_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(HTTP_TIMEOUT),
+            limits=httpx.Limits(max_keepalive_connections=5, max_connections=20),
+            verify=NETRA_VERIFY_SSL,
+        )
+    return _shared_netra_client
+
+
+def _get_netra_api_key() -> str:
+    """Read Netra Threat Intelligence API key from environment."""
+    key = os.environ.get(NETRA_API_KEY_ENV)
+    if not key:
+        raise RuntimeError(
+            f"Environment variable {NETRA_API_KEY_ENV} is not set. "
+            "Set your Netra Threat Intelligence API key before using netra_ip_analysis. "
+            "Request a key from your Netra administrator."
+        )
+    return key
+
+
+async def _netra_request(path: str) -> dict[str, Any]:
+    """Reusable async GET request to the Netra Threat Intelligence API."""
+    headers = {
+        "X-API-Key": _get_netra_api_key(),
+        "accept": "application/json",
+        "User-Agent": "blue-team-mcp/1.0.0 (TangerangKota-CSIRT)",
+    }
+    url = f"{NETRA_BASE_URL}{path}"
+    client = await _get_netra_http_client()
+    response = await client.get(url, headers=headers)
+    response.raise_for_status()
+    return response.json()
+
+
+def _format_netra_markdown(ip: str, raw: dict[str, Any]) -> str:
+    """Render Netra Threat Intelligence API response as a human-readable markdown report.
+
+    Netra aggregates multiple threat-intel sources (VirusTotal, AbuseIPDB, CrowdSec,
+    IPAPI, Argus, and optional ThreatBook/CriminalIP/OpenCTI) and produces a composite
+    threat score plus an AI-generated insight.
+    """
+    data = raw.get("data", {})
+    results = data.get("results", {})
+    meta = raw.get("meta", {})
+
+    ts = results.get("threat_score", {})
+    ai = results.get("ai_insight", {})
+    vt = results.get("virustotal", {})
+    ab = results.get("abuseipdb", {})
+    cs = results.get("crowdsec", {})
+    ipapi = results.get("ipapi", {})
+    argus = results.get("argus_reports", {})
+
+    # Header From Netra Response
+    threat_score_val = ts.get("score", "?")
+    threat_level = ts.get("level", "unknown")
+
+    level_emoji = {
+        "CLEAN": "🟢",
+        "LOW": "🟡",
+        "MEDIUM": "🟠",
+        "HIGH": "🔴",
+        "CRITICAL": "⛔",
+    }
+    emoji = level_emoji.get(threat_level.upper(), "⚪")
+
+    lines = [f"# {emoji} Netra Threat Intelligence — {ip}", ""]
+    lines.append(f"**Threat Level**: {threat_level}  |  **Score**: {threat_score_val}/100")
+
+    # Source availability
+    available = ts.get("sources_available", [])
+    failed = ts.get("sources_failed", [])
+    if available:
+        lines.append(f"\n**Sources queried**: {', '.join(s for s in available if s != 'cyberprotect')}")
+    if failed:
+        lines.append(f"**Sources unavailable**: {', '.join(failed)}")
+
+    # Threat Score Breakdown
+    breakdown = ts.get("breakdown", {})
+    if breakdown:
+        lines.append("")
+        lines.append("## 📊 Threat Score Breakdown")
+        for source, detail in breakdown.items():
+            if not isinstance(detail, dict):
+                continue
+            raw_score = detail.get("raw")
+            weight = detail.get("weight", 0)
+            if raw_score is not None and weight > 0:
+                lines.append(f"- **{source}**: {raw_score:.1f} (weight: {weight:.0%})")
+
+    # AI Insight Netra
+    if ai.get("success") is not False and (ai.get("assessment") or ai.get("indicators")):
+        lines.append("")
+        lines.append("## 🤖 AI Assessment")
+        lines.append(f"**Model**: {ai.get('model', 'unknown')}  |  **Confidence**: {ai.get('confidence', 'N/A')}")
+        lines.append("")
+        lines.append(f"> {ai.get('assessment', 'No assessment available.')}")
+
+        indicators = ai.get("indicators") or []
+        if indicators:
+            lines.append("")
+            lines.append("### Key Indicators")
+            for ind in indicators:
+                lines.append(f"- {ind}")
+
+        actions = ai.get("actions") or []
+        if actions:
+            lines.append("")
+            lines.append("### Recommended Actions")
+            for act in actions:
+                lines.append(f"- {act}")
+
+    # Individual Source Results
+    lines.append("")
+    lines.append("## 🔍 Source Results")
+
+    # VirusTotal
+    if vt.get("success") and vt.get("results"):
+        vt_data = vt["results"].get("data", {})
+        vt_attrs = vt_data.get("attributes", {})
+        vt_stats = vt_attrs.get("last_analysis_stats", {})
+        vt_total = sum(vt_stats.values()) if vt_stats else 0
+        vt_mal = vt_stats.get("malicious", 0)
+        vt_sus = vt_stats.get("suspicious", 0)
+        lines.append(f"- **VirusTotal**: {vt_mal} malicious / {vt_sus} suspicious / {vt_total} total  "
+                     f"| Reputation: {vt_attrs.get('reputation', 'N/A')}  "
+                     f"| ASN: {vt_attrs.get('asn', 'N/A')} ({vt_attrs.get('as_owner', 'N/A')})")
+
+    # AbuseIPDB
+    if ab.get("success") and ab.get("results"):
+        ab_data = ab["results"].get("data", {})
+        lines.append(
+            f"- **AbuseIPDB**: Confidence {ab_data.get('abuseConfidenceScore', '?')}%  "
+            f"| {ab_data.get('totalReports', 0)} reports  "
+            f"| ISP: {ab_data.get('isp', 'N/A')}  "
+            f"| Country: {ab_data.get('countryCode', 'N/A')}"
+        )
+
+    # CrowdSec
+    if cs.get("success") and cs.get("results"):
+        cs_data = cs["results"]
+        cs_reputation = cs_data.get("reputation", "unknown")
+        cs_fps = cs_data.get("classifications", {}).get("false_positives", [])
+        cs_fp_labels = [fp.get("label", "") for fp in cs_fps] if cs_fps else []
+        fp_note = f" (⚠️ known as: {', '.join(cs_fp_labels)})" if cs_fp_labels else ""
+        lines.append(
+            f"- **CrowdSec**: Reputation: {cs_reputation}{fp_note}  "
+            f"| Confidence: {cs_data.get('confidence', '?')}  "
+            f"| AS: {cs_data.get('as_name', 'N/A')} (AS{cs_data.get('as_num', '?')})  "
+            f"| First seen: {cs_data.get('history', {}).get('first_seen', '?')}"
+        )
+
+    # IPAPI / Geo
+    if ipapi.get("success") and ipapi.get("results"):
+        geo = ipapi["results"]
+        lines.append(
+            f"- **IPAPI (Geo)**: {geo.get('city', '')}, {geo.get('regionName', '')}, "
+            f"{geo.get('country', '')} ({geo.get('countryCode', '')})  "
+            f"| ISP: {geo.get('isp', 'N/A')}  "
+            f"| AS: {geo.get('as', 'N/A')}"
+        )
+
+    # Argus Reports
+    if argus.get("success") and argus.get("results"):
+        ar = argus["results"]
+        lines.append(f"- **Argus Reports**: {ar.get('total_reports', 0)} reports  "
+                     f"| Score: {ar.get('scores', 0)}  "
+                     f"| Unique reporters: {ar.get('unique_reporters', 0)}")
+
+    # Failed Sources (with error details) From Netra
+    error_sources = {k: v for k, v in results.items()
+                     if isinstance(v, dict) and v.get("success") is False and v.get("error")}
+    if error_sources:
+        lines.append("")
+        lines.append("## ⚠️ Source Errors")
+        for name, detail in sorted(error_sources.items()):
+            error_msg = str(detail.get("error", "unknown"))
+            # Truncate long error messages
+            if len(error_msg) > 200:
+                error_msg = error_msg[:200] + "..."
+            lines.append(f"- **{name}**: {error_msg}")
+
+    # Meta
+    lines.append("")
+    lines.append("---")
+    analyzed_at = meta.get("analyzed_at", data.get("created_at", "unknown"))
+    lines.append(f"*Analyzed at: {analyzed_at}*")
+
+    rl = meta.get("rate_limit", {})
+    if rl:
+        lines.append(f"*Rate limit: {rl.get('used', '?')}/{rl.get('max', '?')} "
+                     f"({rl.get('remaining', '?')} remaining)*")
+
+    return "\n".join(lines)
+
+
+# Netra Threat Intelligence input model
+class NetraIpAnalysisInput(BaseModel):
+    """Input model for Netra Threat Intelligence IP analysis lookup."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    ip: str = Field(
+        ...,
+        description="Public IPv4 or IPv6 address to analyze through Netra Threat Intelligence "
+        "(e.g. '185.220.101.1').",
+        min_length=3,
+        max_length=45,
+    )
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN,
+        description="'markdown' for a human-readable report, 'json' for structured data.",
+    )
+
+    @field_validator("ip")
+    @classmethod
+    def validate_ip(cls, v: str) -> str:
+        try:
+            ipaddress.ip_address(v)
+        except ValueError as exc:
+            raise ValueError(f"'{v}' is not a valid IP address (IPv4/IPv6).") from exc
+        return v
+
+
+# NETRA THREAT INTELLIGENCE TOOL
+@mcp.tool(
+    name="netra_ip_analysis",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def netra_ip_analysis(params: NetraIpAnalysisInput) -> str:
+    """Analyze a public IP address using Netra Threat Intelligence.
+
+    This tool is READ-ONLY — it queries the Netra Threat Intelligence API to
+    retrieve threat analysis, classification, and contextual data for a given IP.
+
+    Args:
+        params (NetraIpAnalysisInput): Validated parameters containing:
+            - ip (str): Public IPv4/IPv6 address to analyze (e.g. "185.220.101.1")
+            - response_format ('markdown' | 'json'): Output format (default: markdown)
+
+    Returns:
+        str: If markdown, a formatted analysis report with threat score, AI assessment,
+        per-source detection summaries, and rate-limit metadata.
+        If json, a structured object with the same data organized for machine consumption.
+
+    Example usage:
+        - Use when: "Check if IP 185.220.101.1 is malicious according to Netra"
+        - Use when: "Triaging an alert — get Netra's analysis of the source IP"
+        - Do NOT use for private/internal IPs — this tool queries an external API
+
+    Error Handling:
+        - "Error: Invalid or missing API key (401)" if NETRA_API_KEY is missing/wrong
+        - "Error: No data found for this target (404)" if IP has no analysis data
+        - "Error: Rate limit reached (429)" if API quota is exhausted
+        - IP format validation is handled automatically by Pydantic before the request
+    """
+    try:
+        raw = await _netra_request(f"/analysis/{params.ip}")
+    except Exception as e:
+        return _handle_api_error(e, context="netra_ip_analysis")
+
+    if params.response_format == ResponseFormat.JSON:
+        data = raw.get("data", {})
+        results = data.get("results", {})
+        meta = raw.get("meta", {})
+
+        ts = results.get("threat_score", {})
+        ai = results.get("ai_insight", {})
+        vt = results.get("virustotal", {})
+        ab = results.get("abuseipdb", {})
+        cs = results.get("crowdsec", {})
+        ipapi = results.get("ipapi", {})
+        argus = results.get("argus_reports", {})
+
+        # Extract key VT fields
+        vt_attrs = {}
+        if vt.get("success") and vt.get("results"):
+            vt_attrs = vt["results"].get("data", {}).get("attributes", {})
+
+        # Extract key AbuseIPDB fields
+        ab_data = {}
+        if ab.get("success") and ab.get("results"):
+            ab_data = ab["results"].get("data", {})
+
+        # Extract key CrowdSec fields
+        cs_data = {}
+        if cs.get("success") and cs.get("results"):
+            cs_res = cs["results"]
+            cs_data = {
+                "reputation": cs_res.get("reputation"),
+                "confidence": cs_res.get("confidence"),
+                "as_name": cs_res.get("as_name"),
+                "as_num": cs_res.get("as_num"),
+                "first_seen": cs_res.get("history", {}).get("first_seen"),
+                "last_seen": cs_res.get("history", {}).get("last_seen"),
+                "false_positives": [
+                    fp.get("label") for fp in
+                    cs_res.get("classifications", {}).get("false_positives", [])
+                ],
+            }
+
+        # Extract geo
+        geo = {}
+        if ipapi.get("success") and ipapi.get("results"):
+            geo = ipapi["results"]
+
+        output = {
+            "ip": params.ip,
+            "observable": data.get("observable"),
+            "analyzed_at": meta.get("analyzed_at"),
+            "threat_score": {
+                "score": ts.get("score"),
+                "level": ts.get("level"),
+                "breakdown": {
+                    source: {
+                        "raw": detail.get("raw") if isinstance(detail, dict) else None,
+                        "weight": detail.get("weight") if isinstance(detail, dict) else None,
+                    }
+                    for source, detail in ts.get("breakdown", {}).items()
+                    if isinstance(detail, dict) and detail.get("weight", 0) > 0
+                },
+                "sources_available": ts.get("sources_available"),
+                "sources_failed": ts.get("sources_failed"),
+            },
+            "ai_insight": {
+                "assessment": ai.get("assessment"),
+                "indicators": ai.get("indicators"),
+                "actions": ai.get("actions"),
+                "confidence": ai.get("confidence"),
+                "model": ai.get("model"),
+            } if ai.get("success") is not False else None,
+            "virustotal": {
+                "malicious": vt_attrs.get("last_analysis_stats", {}).get("malicious"),
+                "suspicious": vt_attrs.get("last_analysis_stats", {}).get("suspicious"),
+                "harmless": vt_attrs.get("last_analysis_stats", {}).get("harmless"),
+                "undetected": vt_attrs.get("last_analysis_stats", {}).get("undetected"),
+                "reputation": vt_attrs.get("reputation"),
+                "as_owner": vt_attrs.get("as_owner"),
+                "country": vt_attrs.get("country"),
+            } if vt.get("success") else None,
+            "abuseipdb": {
+                "abuse_confidence_score": ab_data.get("abuseConfidenceScore"),
+                "total_reports": ab_data.get("totalReports"),
+                "isp": ab_data.get("isp"),
+                "country": ab_data.get("countryCode"),
+                "usage_type": ab_data.get("usageType"),
+                "last_reported": ab_data.get("lastReportedAt"),
+            } if ab.get("success") else None,
+            "crowdsec": cs_data if cs.get("success") else None,
+            "ipapi_geo": geo if ipapi.get("success") else None,
+            "argus_reports": {
+                "total_reports": argus.get("results", {}).get("total_reports"),
+                "score": argus.get("results", {}).get("scores"),
+            } if argus.get("success") else None,
+            "source_errors": {
+                k: str(v.get("error", "unknown"))[:200]
+                for k, v in results.items()
+                if isinstance(v, dict) and v.get("success") is False and v.get("error")
+            } or None,
+            "rate_limit": {
+                "used": meta.get("rate_limit", {}).get("used"),
+                "max": meta.get("rate_limit", {}).get("max"),
+                "remaining": meta.get("rate_limit", {}).get("remaining"),
+            },
+        }
+        # Strip None values for cleaner output
+        output = {k: v for k, v in output.items() if v is not None}
+        result = json.dumps(output, indent=2, ensure_ascii=False)
+    else:
+        result = _format_netra_markdown(params.ip, raw)
 
     return _truncate_if_needed(result)
 
