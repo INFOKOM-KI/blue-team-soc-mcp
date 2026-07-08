@@ -647,6 +647,7 @@ async def _wazuh_indexer_email_search(
     since: Optional[str] = None,
     until: Optional[str] = None,
     rule_groups: Optional[list[str]] = None,
+    keyword: Optional[str] = None,
 ) -> Dict:
     """Query Wazuh Indexer for alerts containing email-address-like strings.
     Searches ``full_log`` (query_string wildcard ``*@*.*``) and the structured
@@ -682,6 +683,27 @@ async def _wazuh_indexer_email_search(
     if time_range:
         time_range["format"] = "strict_date_optional_time"
         must_clauses.append({"range": {"@timestamp": time_range}})
+
+    if keyword and keyword.strip():
+        _KW_FIELDS = [
+            ("full_log", 3), ("rule.description", 2), ("rule.info", 2),
+            ("data.srcip", 2), ("data.srcip2", 2), ("srcip", 2),
+            ("data.url", 0), ("data.domain", 0), ("data.user_agent", 0), ("data.referrer", 0),
+        ]
+        k = keyword.strip()
+        field_parts = []
+        for fname, boost in _KW_FIELDS:
+            if boost:
+                field_parts.append(f'{fname}: ({k})^{boost}')
+            else:
+                field_parts.append(f'{fname}: ({k})')
+        must_clauses.append({
+            "query_string": {
+                "query": " OR ".join(field_parts),
+                "default_operator": "AND",
+                "lenient": True,
+            }
+        })
 
     query = {
         "bool": {
@@ -735,6 +757,7 @@ async def _wazuh_indexer_domain_search(
     since: Optional[str] = None,
     until: Optional[str] = None,
     include_full_log: bool = False,
+    keyword: Optional[str] = None,
 ) -> Dict:
     """Query Wazuh Indexer for alerts matching a domain name.
 
@@ -765,6 +788,27 @@ async def _wazuh_indexer_domain_search(
     if time_range:
         time_range["format"] = "strict_date_optional_time"
         must_clauses.append({"range": {"@timestamp": time_range}})
+
+    if keyword and keyword.strip():
+        _KW_FIELDS = [
+            ("full_log", 3), ("rule.description", 2), ("rule.info", 2),
+            ("data.srcip", 2), ("data.srcip2", 2), ("srcip", 2),
+            ("data.url", 0), ("data.domain", 0), ("data.user_agent", 0), ("data.referrer", 0),
+        ]
+        k = keyword.strip()
+        field_parts = []
+        for fname, boost in _KW_FIELDS:
+            if boost:
+                field_parts.append(f'{fname}: ({k})^{boost}')
+            else:
+                field_parts.append(f'{fname}: ({k})')
+        must_clauses.append({
+            "query_string": {
+                "query": " OR ".join(field_parts),
+                "default_operator": "AND",
+                "lenient": True,
+            }
+        })
 
     query = {
         "bool": {
@@ -820,6 +864,7 @@ async def _wazuh_indexer_multi_email_search(
     search_after: Optional[list] = None,
     since: Optional[str] = None,
     until: Optional[str] = None,
+    keyword: Optional[str] = None,
 ) -> Dict:
     """Query Wazuh Indexer for alerts mentioning any of the given email addresses.
 
@@ -857,6 +902,27 @@ async def _wazuh_indexer_multi_email_search(
     if time_range:
         time_range["format"] = "strict_date_optional_time"
         must_clauses.append({"range": {"@timestamp": time_range}})
+
+    if keyword and keyword.strip():
+        _KW_FIELDS = [
+            ("full_log", 3), ("rule.description", 2), ("rule.info", 2),
+            ("data.srcip", 2), ("data.srcip2", 2), ("srcip", 2),
+            ("data.url", 0), ("data.domain", 0), ("data.user_agent", 0), ("data.referrer", 0),
+        ]
+        k = keyword.strip()
+        field_parts = []
+        for fname, boost in _KW_FIELDS:
+            if boost:
+                field_parts.append(f'{fname}: ({k})^{boost}')
+            else:
+                field_parts.append(f'{fname}: ({k})')
+        must_clauses.append({
+            "query_string": {
+                "query": " OR ".join(field_parts),
+                "default_operator": "AND",
+                "lenient": True,
+            }
+        })
 
     query = {
         "bool": {
@@ -2734,6 +2800,12 @@ class WazuhEmailLookupInput(BaseModel):
         default=ResponseFormat.MARKDOWN,
         description="'markdown' for human-readable report, 'json' for structured data.",
     )
+    keyword: Optional[str] = Field(
+        default=None,
+        max_length=256,
+        description="Free-text keyword search to further narrow email results. "
+                    "Same syntax as blueteam_wazuh_indexer_search.",
+    )
 
     @field_validator("agent_name")
     @classmethod
@@ -2764,6 +2836,19 @@ class WazuhEmailLookupInput(BaseModel):
                         f"Invalid rule group name: '{g}'. "
                         "Use only letters, numbers, hyphen, underscore, dot."
                     )
+        return v
+
+    @field_validator("keyword")
+    @classmethod
+    def validate_keyword(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v = v.strip()
+            if not v:
+                return None
+            if len(v) > 256:
+                raise ValueError("keyword too long (max 256)")
+            if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", v):
+                raise ValueError("keyword contains invalid control characters")
         return v
 
 
@@ -2830,6 +2915,7 @@ async def wazuh_email_lookup(params: WazuhEmailLookupInput) -> str:
                 since=since_str,
                 until=until_str,
                 rule_groups=rule_group_list,
+                keyword=params.keyword,
             )
             if "error" in data:
                 error_msg = data["error"]
@@ -3013,6 +3099,12 @@ class WazuhDomainLookupInput(BaseModel):
         default=ResponseFormat.MARKDOWN,
         description="'markdown' for human-readable summary, 'json' for structured data.",
     )
+    keyword: Optional[str] = Field(
+        default=None,
+        max_length=256,
+        description="Free-text keyword search to further narrow domain results. "
+                    "Same syntax as blueteam_wazuh_indexer_search.",
+    )
 
     @field_validator("domain")
     @classmethod
@@ -3043,6 +3135,19 @@ class WazuhDomainLookupInput(BaseModel):
                 raise ValueError("agent_name too long (max 64)")
             if not _AGENT_NAME_SAFE_RE.match(v):
                 raise ValueError("agent_name: use only letters, numbers, hyphen, underscore, dot")
+        return v
+
+    @field_validator("keyword")
+    @classmethod
+    def validate_keyword(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v = v.strip()
+            if not v:
+                return None
+            if len(v) > 256:
+                raise ValueError("keyword too long (max 256)")
+            if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", v):
+                raise ValueError("keyword contains invalid control characters")
         return v
 
 
@@ -3096,6 +3201,7 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
             since=since_str,
             until=until_str,
             include_full_log=params.include_full_log,
+            keyword=params.keyword,
         )
     except Exception as e:
         return _handle_api_error(e, context="wazuh_domain_lookup")
@@ -3245,6 +3351,12 @@ class WazuhCompromisedEmailsAnalysisInput(BaseModel):
         description="If true, query Netra for each attacker IP (adds latency). "
                     "Rate limiting applies. Only top 10 IPs are enriched.",
     )
+    keyword: Optional[str] = Field(
+        default=None,
+        max_length=256,
+        description="Free-text keyword search to further narrow results. "
+                    "Same syntax as blueteam_wazuh_indexer_search.",
+    )
     response_format: ResponseFormat = Field(
         default=ResponseFormat.MARKDOWN,
         description="'markdown' for human-readable, 'json' for structured.",
@@ -3278,6 +3390,19 @@ class WazuhCompromisedEmailsAnalysisInput(BaseModel):
                 raise ValueError("agent_name too long (max 64)")
             if not _AGENT_NAME_SAFE_RE.match(v):
                 raise ValueError("agent_name: use only letters, numbers, hyphen, underscore, dot")
+        return v
+
+    @field_validator("keyword")
+    @classmethod
+    def validate_keyword(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v = v.strip()
+            if not v:
+                return None
+            if len(v) > 256:
+                raise ValueError("keyword too long (max 256)")
+            if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", v):
+                raise ValueError("keyword contains invalid control characters")
         return v
 
 
@@ -3346,6 +3471,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
                     search_after=search_after,
                     since=since_str,
                     until=until_str,
+                    keyword=params.keyword,
                 )
                 if "error" in data:
                     # Accumulate partial results
@@ -3905,6 +4031,12 @@ class WazuhAttackVelocityInput(BaseModel):
         max_length=10,
         description="Bucket size within each window: '1m', '5m', '15m', '1h', or 'auto'.",
     )
+    keyword: Optional[str] = Field(
+        default=None,
+        max_length=256,
+        description="Free-text keyword search to narrow the analysis. Same syntax as "
+                    "blueteam_wazuh_indexer_search.",
+    )
     response_format: ResponseFormat = Field(
         default=ResponseFormat.MARKDOWN,
         description="'markdown' for human-readable, 'json' for structured.",
@@ -3945,6 +4077,19 @@ class WazuhAttackVelocityInput(BaseModel):
                     raise ValueError("Empty rule group name")
                 if not _AGENT_NAME_SAFE_RE.match(g):
                     raise ValueError(f"Invalid rule group name: '{g}'")
+        return v
+
+    @field_validator("keyword")
+    @classmethod
+    def validate_keyword(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v = v.strip()
+            if not v:
+                return None
+            if len(v) > 256:
+                raise ValueError("keyword too long (max 256)")
+            if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", v):
+                raise ValueError("keyword contains invalid control characters")
         return v
 
 
@@ -4018,6 +4163,7 @@ async def wazuh_attack_velocity(params: WazuhAttackVelocityInput) -> str:
                 until=current_until,
                 agent_name=params.agent_name,
                 rule_groups=rule_group_list,
+                keyword=params.keyword,
             ),
             _wazuh_indexer_aggregate(
                 bucket_interval=bucket_interval,
@@ -4025,6 +4171,7 @@ async def wazuh_attack_velocity(params: WazuhAttackVelocityInput) -> str:
                 until=previous_until,
                 agent_name=params.agent_name,
                 rule_groups=rule_group_list,
+                keyword=params.keyword,
             ),
         )
     except Exception as e:
