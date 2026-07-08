@@ -574,26 +574,37 @@ async def _wazuh_indexer_search(
     if time_range:
         time_range["format"] = "strict_date_optional_time"
         must_clauses.append({"range": {"@timestamp": time_range}})
-    # Free-text keyword search using simple_query_string: safer than query_string
-    # because it ignores invalid syntax instead of throwing parse errors, and
-    # doesn't expose field-scoped query injection (e.g. "field_name:value").
+    # Free-text keyword search using query_string with field-scoped groups.
+    # Each field gets a boost embedded in the Lucene query string (field: (...)^N).
+    # query_string is used (not simple_query_string) because the Wazuh Indexer
+    # resolves explicit field qualifiers reliably — the same pattern used by
+    # _wazuh_indexer_domain_search and _wazuh_indexer_email_search.
+    # lenient=True prevents parse errors from crashing the entire query.
     if keyword and keyword.strip():
+        _KEYWORD_FIELDS = [
+            ("full_log", 3),
+            ("rule.description", 2),
+            ("rule.info", 2),
+            ("data.srcip", 2),
+            ("data.srcip2", 2),
+            ("srcip", 2),
+            ("data.url", 0),
+            ("data.domain", 0),
+            ("data.user_agent", 0),
+            ("data.referrer", 0),
+        ]
+        k = keyword.strip()
+        field_parts = []
+        for fname, boost in _KEYWORD_FIELDS:
+            if boost:
+                field_parts.append(f'{fname}: ({k})^{boost}')
+            else:
+                field_parts.append(f'{fname}: ({k})')
         must_clauses.append({
-            "simple_query_string": {
-                "query": keyword.strip(),
-                "fields": [
-                    "full_log^3",
-                    "rule.description^2",
-                    "rule.info^2",
-                    "data.srcip^2",
-                    "data.srcip2^2",
-                    "srcip^2",
-                    "data.url",
-                    "data.domain",
-                    "data.user_agent",
-                    "data.referrer",
-                ],
+            "query_string": {
+                "query": " OR ".join(field_parts),
                 "default_operator": "AND",
+                "lenient": True,
             }
         })
     query = {"bool": {"must": must_clauses}} if must_clauses else {"match_all": {}}
@@ -896,6 +907,7 @@ async def _wazuh_indexer_aggregate(
     top_n_rules: int = 3,
     top_n_srcips: int = 5,
     top_n_agents: int = 3,
+    keyword: Optional[str] = None,
 ) -> Dict:
     """Query Wazuh Indexer with a date_histogram aggregation — no document hits.
 
@@ -930,6 +942,27 @@ async def _wazuh_indexer_aggregate(
         filter_clauses.append({"terms": {"rule.groups": list(rule_groups)}})
     if rule_level_min is not None:
         filter_clauses.append({"range": {"rule.level": {"gte": rule_level_min}}})
+    # Free-text keyword filter — same query_string pattern as _wazuh_indexer_search
+    if keyword and keyword.strip():
+        _KW_FIELDS = [
+            ("full_log", 3), ("rule.description", 2), ("rule.info", 2),
+            ("data.srcip", 2), ("data.srcip2", 2), ("srcip", 2),
+            ("data.url", 0), ("data.domain", 0), ("data.user_agent", 0), ("data.referrer", 0),
+        ]
+        k = keyword.strip()
+        field_parts = []
+        for fname, boost in _KW_FIELDS:
+            if boost:
+                field_parts.append(f'{fname}: ({k})^{boost}')
+            else:
+                field_parts.append(f'{fname}: ({k})')
+        filter_clauses.append({
+            "query_string": {
+                "query": " OR ".join(field_parts),
+                "default_operator": "AND",
+                "lenient": True,
+            }
+        })
 
     # Sub-aggregations nested under each date bucket
     sub_aggs: dict = {
@@ -3549,6 +3582,13 @@ class WazuhAlertTimelineInput(BaseModel):
         le=16,
         description="Minimum rule level (e.g., 8 for medium+ severity).",
     )
+    keyword: Optional[str] = Field(
+        default=None,
+        max_length=256,
+        description="Free-text keyword search to narrow the timeline. Same syntax as "
+                    "blueteam_wazuh_indexer_search — supports +term, -term, OR, *wildcard*, "
+                    '\"exact phrase\". Example: \'gambling OR "brute force"\'',
+    )
     response_format: ResponseFormat = Field(
         default=ResponseFormat.MARKDOWN,
         description="'markdown' for human-readable timeline, 'json' for structured bucket data.",
@@ -3565,6 +3605,20 @@ class WazuhAlertTimelineInput(BaseModel):
                 raise ValueError("agent_name too long (max 64)")
             if not _AGENT_NAME_SAFE_RE.match(v):
                 raise ValueError("agent_name: use only letters, numbers, hyphen, underscore, dot")
+        return v
+
+    @field_validator("keyword")
+    @classmethod
+    def validate_keyword(cls, v: Optional[str]) -> Optional[str]:
+        """Sanitize keyword: strip whitespace, reject null bytes / control chars."""
+        if v is not None:
+            v = v.strip()
+            if not v:
+                return None
+            if len(v) > 256:
+                raise ValueError("keyword too long (max 256)")
+            if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", v):
+                raise ValueError("keyword contains invalid control characters")
         return v
 
     @field_validator("bucket")
@@ -3622,6 +3676,7 @@ async def wazuh_alert_timeline(params: WazuhAlertTimelineInput) -> str:
         params.agent_name: Optional agent filter.
         params.rule_groups: Optional comma-separated rule groups filter.
         params.rule_level_min: Only count alerts at or above this severity.
+        params.keyword: Optional free-text keyword filter (e.g. 'gambling OR "brute force"').
         params.response_format: 'markdown' or 'json'.
 
     Returns:
@@ -3653,6 +3708,7 @@ async def wazuh_alert_timeline(params: WazuhAlertTimelineInput) -> str:
             agent_name=params.agent_name,
             rule_groups=rule_group_list,
             rule_level_min=params.rule_level_min,
+            keyword=params.keyword,
         )
     except Exception as e:
         return _handle_api_error(e, context="wazuh_alert_timeline")
