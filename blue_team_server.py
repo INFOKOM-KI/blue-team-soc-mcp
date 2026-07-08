@@ -516,6 +516,8 @@ async def _wazuh_indexer_search(
     srcip: Optional[str] = None,
     since: Optional[str] = None,
     until: Optional[str] = None,
+    keyword: Optional[str] = None,
+    srcips: Optional[list[str]] = None,
 ) -> Dict:
     """Query Wazuh Indexer (OpenSearch) for alerts/events. Read-only _search only.
     Uses search_after cursor pagination — bypasses the 10000 doc max_result_window
@@ -539,6 +541,29 @@ async def _wazuh_indexer_search(
                 "minimum_should_match": 1,
             }
         })
+    # Multi-IP search: OR-of-AND within each IP, AND between different IPs.
+    # Each IP searched across data.srcip, data.srcip2, srcip, and full_log.
+    if srcips:
+        # Deduplicate and strip
+        unique_ips: list[str] = []
+        seen: set[str] = set()
+        for ip in srcips:
+            ip = ip.strip()
+            if ip and ip not in seen:
+                seen.add(ip)
+                unique_ips.append(ip)
+        for ip in unique_ips:
+            must_clauses.append({
+                "bool": {
+                    "should": [
+                        {"match": {"data.srcip": ip}},
+                        {"match": {"data.srcip2": ip}},
+                        {"match": {"srcip": ip}},
+                        {"match_phrase": {"full_log": ip}},
+                    ],
+                    "minimum_should_match": 1,
+                }
+            })
     # Time-range filter on @timestamp (UTC). Accepts ISO 8601 strings.
     # Supports since-only, until-only, or both together.
     time_range: dict[str, str] = {}
@@ -549,6 +574,28 @@ async def _wazuh_indexer_search(
     if time_range:
         time_range["format"] = "strict_date_optional_time"
         must_clauses.append({"range": {"@timestamp": time_range}})
+    # Free-text keyword search using simple_query_string: safer than query_string
+    # because it ignores invalid syntax instead of throwing parse errors, and
+    # doesn't expose field-scoped query injection (e.g. "field_name:value").
+    if keyword and keyword.strip():
+        must_clauses.append({
+            "simple_query_string": {
+                "query": keyword.strip(),
+                "fields": [
+                    "full_log^3",
+                    "rule.description^2",
+                    "rule.info^2",
+                    "data.srcip^2",
+                    "data.srcip2^2",
+                    "srcip^2",
+                    "data.url",
+                    "data.domain",
+                    "data.user_agent",
+                    "data.referrer",
+                ],
+                "default_operator": "AND",
+            }
+        })
     query = {"bool": {"must": must_clauses}} if must_clauses else {"match_all": {}}
     body = {
         "size": min(size, _WAZUH_INDEXER_MAX_SIZE),
@@ -2176,7 +2223,7 @@ async def blueteam_wazuh_manager_logs(params: WazuhLogsInput) -> str:
     }, indent=2))
 
 
-# Path to Wazuh alerts file (on the host where MCP runs; must be Wazuh manager or have mounts)
+# Path to Wazuh alerts file (on the host where MCP runs; must be Wazuh manager or have mounts file system)
 _WAZUH_ALERTS_PATH = "/var/ossec/logs/alerts/alerts.json"
 _WAZUH_ALERTS_MAX_LINES = 2000  # safety cap
 
@@ -2382,11 +2429,63 @@ class WazuhIndexerSearchInput(BaseModel):
         description="ISO 8601 end time in UTC (e.g. '2026-07-05T19:00:00Z'). "
                     "Filters @timestamp < this value. Can be used alone (no since required).",
     )
+    keyword: Optional[str] = Field(
+        default=None,
+        max_length=256,
+        description="Free-text keyword search across full_log, rule.description, rule.info, "
+                    "data.srcip, data.url, data.domain, and other text fields. Supports simple operators: "
+                    "+term (must), -term (must not), term1|term2 (OR), *wildcard*, "
+                    '\"exact phrase\". Example: \'gambling OR "online gambling"\'',
+    )
+    srcips: Optional[list[str]] = Field(
+        default=None,
+        min_length=1,
+        max_length=25,
+        description="List of source IP addresses to filter alerts by (max 25). "
+                    "Matches ANY of the listed IPs across data.srcip, data.srcip2, "
+                    "srcip, and full_log fields. Use for searching alerts by multiple "
+                    "suspicious IPs in a single call. Example: ['114.10.116.20', '51.159.125.199']",
+    )
     cursor: Optional[str] = Field(
         default=None,
         description="Pagination cursor from previous response (next_cursor). Uses search_after "
                     "sort-key traversal — no 10K-doc ceiling. Omit for first page.",
     )
+
+    @field_validator("keyword")
+    @classmethod
+    def validate_keyword(cls, v: Optional[str]) -> Optional[str]:
+        """Sanitize keyword: strip whitespace, reject null bytes / control chars."""
+        if v is not None:
+            v = v.strip()
+            if not v:
+                return None
+            if len(v) > 256:
+                raise ValueError("keyword too long (max 256)")
+            # Reject null bytes and ASCII control chars below 0x20 (except tab)
+            if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", v):
+                raise ValueError("keyword contains invalid control characters")
+        return v
+
+    @field_validator("srcips")
+    @classmethod
+    def validate_srcips(cls, v: Optional[list[str]]) -> Optional[list[str]]:
+        """Validate each IP in the list using ipaddress — IPv4/IPv6 only."""
+        if v is not None:
+            if len(v) > 25:
+                raise ValueError("srcips: max 25 IPs (OpenSearch clause limit)")
+            valid: list[str] = []
+            for ip in v:
+                ip = ip.strip()
+                if not ip:
+                    continue
+                try:
+                    ipaddress.ip_address(ip)
+                except ValueError as exc:
+                    raise ValueError(f"srcips: '{ip}' is not a valid IP address (IPv4/IPv6)") from exc
+                valid.append(ip)
+            return valid if valid else None
+        return v
 
     @field_validator("agent_name")
     @classmethod
@@ -2422,7 +2521,7 @@ class WazuhIndexerSearchInput(BaseModel):
 )
 async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
     """Query Wazuh Indexer (OpenSearch) for alerts/events with cursor pagination.
-    Supports filtering by agent_name, srcip (source IP), or both simultaneously.
+    Supports filtering by agent_name, srcip/s (source IP), keyword, or all simultaneously.
     Requires WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD (port 9200).
 
     Returns one page per call. Pass the returned next_cursor back as the cursor
@@ -2430,7 +2529,10 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
 
     Args:
         params.agent_name: Optional agent name filter (e.g. HYDRA-DC)
-        params.srcip: Optional source IP filter (e.g. '180.254.78.145')
+        params.srcip: Optional single source IP filter (e.g. '180.254.78.145')
+        params.srcips: Optional list of source IPs to match ANY of (max 25)
+                       (e.g. ['114.10.116.20', '51.159.125.199'])
+        params.keyword: Optional free-text keyword search (e.g. 'gambling OR "brute force"')
         params.since: Optional ISO 8601 start time in UTC (e.g. '2026-07-05T18:30:00Z')
         params.until: Optional ISO 8601 end time in UTC (e.g. '2026-07-05T19:00:00Z')
         params.index_type: alerts (default), events, or vulnerabilities
@@ -2459,6 +2561,8 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
         srcip=params.srcip,
         since=params.since,
         until=params.until,
+        keyword=params.keyword,
+        srcips=params.srcips,
     )
     if isinstance(data.get("error"), str):
         return json.dumps(data, indent=2)
