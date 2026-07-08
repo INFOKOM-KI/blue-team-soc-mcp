@@ -110,7 +110,7 @@ NETRA_VERIFY_SSL = os.environ.get("NETRA_VERIFY_SSL", "false").lower() in ("1", 
 
 # Shared HTTP / response config
 HTTP_TIMEOUT = 30.0
-CHARACTER_LIMIT = int(os.environ.get("BLUETEAM_CHARACTER_LIMIT", "25000"))
+CHARACTER_LIMIT = int(os.environ.get("BLUETEAM_CHARACTER_LIMIT", "100000"))
 _WAZUH_INDEXER_MAX_SIZE = int(os.environ.get("WAZUH_INDEXER_MAX_SIZE", "10000"))
 _WAZUH_TOKEN_TTL = 300  # seconds — cache Wazuh JWT for 5 min
 
@@ -518,6 +518,7 @@ async def _wazuh_indexer_search(
     until: Optional[str] = None,
     keyword: Optional[str] = None,
     srcips: Optional[list[str]] = None,
+    fields: Optional[list[str]] = None,
 ) -> Dict:
     """Query Wazuh Indexer (OpenSearch) for alerts/events. Read-only _search only.
     Uses search_after cursor pagination — bypasses the 10000 doc max_result_window
@@ -611,6 +612,21 @@ async def _wazuh_indexer_search(
             }
         })
     query = {"bool": {"must": must_clauses}} if must_clauses else {"match_all": {}}
+    # Default _source: only retrieve essential fields to keep payload small.
+    # The markdown renderer needs rule.level and agent.name — include them in defaults.
+    # Override by passing the 'fields' tool parameter for additional/alternative fields.
+    if fields:
+        _source_fields = fields
+    else:
+        _source_fields = [
+            "@timestamp",
+            "agent.name",
+            "rule.id",
+            "rule.level",
+            "rule.description",
+            "data.srcip",
+            "data.url",
+        ]
     body = {
         "size": min(size, _WAZUH_INDEXER_MAX_SIZE),
         "sort": [
@@ -618,6 +634,7 @@ async def _wazuh_indexer_search(
             {"_id": {"order": "asc"}},
         ],
         "query": query,
+        "_source": _source_fields,
     }
     # search_after must ONLY be present when a non-empty cursor array is supplied.
     # Omitting it on the first page avoids a malformed-query error.
@@ -2558,6 +2575,32 @@ class WazuhIndexerSearchInput(BaseModel):
         description="Pagination cursor from previous response (next_cursor). Uses search_after "
                     "sort-key traversal — no 10K-doc ceiling. Omit for first page.",
     )
+    fields: Optional[list[str]] = Field(
+        default=None,
+        min_length=1,
+        max_length=50,
+        description="Custom _source fields to retrieve (e.g. ['data.url', 'data.srcip', "
+                    "'rule.description']). Omit to use server defaults: @timestamp, agent.name, "
+                    "rule.id, rule.level, rule.description, data.srcip, data.url. "
+                    "Specify fields to reduce payload size or get additional fields "
+                    "like data.file.path, data.username, full_log.",
+    )
+
+    @field_validator("fields")
+    @classmethod
+    def validate_fields(cls, v: Optional[list[str]]) -> Optional[list[str]]:
+        """Validate _source field names — alphanumeric + dot/underscore/hyphen only."""
+        if v is not None:
+            cleaned: list[str] = []
+            for f in v:
+                f = f.strip()
+                if not f:
+                    continue
+                if not re.match(r"^[a-zA-Z0-9._-]+$", f):
+                    raise ValueError(f"fields: invalid field name '{f}'")
+                cleaned.append(f)
+            return cleaned if cleaned else None
+        return v
 
     @field_validator("keyword")
     @classmethod
@@ -2671,6 +2714,7 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
         until=params.until,
         keyword=params.keyword,
         srcips=params.srcips,
+        fields=params.fields,
     )
     if isinstance(data.get("error"), str):
         return json.dumps(data, indent=2)
