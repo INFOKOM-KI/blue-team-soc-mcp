@@ -53,7 +53,7 @@ from collections import Counter
 from typing import Any, Dict, List, Optional
 import httpx
 from mcp.server.fastmcp import FastMCP
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, AliasChoices, field_validator
 
 # Logging - Must go to stderr. stdout is used by the MCP stdio protocol.
 logging.basicConfig(
@@ -519,6 +519,7 @@ async def _wazuh_indexer_search(
     keyword: Optional[str] = None,
     srcips: Optional[list[str]] = None,
     fields: Optional[list[str]] = None,
+    rule_groups: Optional[list[str]] = None,
 ) -> Dict:
     """Query Wazuh Indexer (OpenSearch) for alerts/events. Read-only _search only.
     Uses search_after cursor pagination — bypasses the 10000 doc max_result_window
@@ -565,6 +566,11 @@ async def _wazuh_indexer_search(
                     "minimum_should_match": 1,
                 }
             })
+    # Rule-groups filter: match documents whose rule.groups array contains ANY
+    # of the specified group names. Uses OpenSearch terms query for exact matching
+    # against the array field — more precise than free-text keyword on rule.description.
+    if rule_groups:
+        must_clauses.append({"terms": {"rule.groups": rule_groups}})
     # Time-range filter on @timestamp (UTC). Accepts ISO 8601 AND relative time
     # expressions ('24h', '1h', '7d', '30d', '5m') via _parse_time_window().
     # Supports since-only, until-only, or both together.
@@ -2520,27 +2526,31 @@ _EMAIL_RE = re.compile(
 )
 
 class WazuhIndexerSearchInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid", populate_by_name=True)
     agent_name: Optional[str] = Field(
         default=None,
+        validation_alias=AliasChoices("agent", "host", "hostname"),
         max_length=64,
         description="Agent name to filter (e.g. 'HYDRA-DC'). Leave empty to search all agents.",
     )
-    index_type: str = Field(default="alerts", description="Index: alerts, events, or vulnerabilities")
-    limit: int = Field(default=500, description="Max docs to return per page", ge=1, le=10000)
+    index_type: str = Field(default="alerts", validation_alias=AliasChoices("index", "type"), description="Index: alerts, events, or vulnerabilities")
+    limit: int = Field(default=500, validation_alias=AliasChoices("size", "count", "max"), description="Max docs to return per page", ge=1, le=10000)
     response_format: ResponseFormat = Field(
         default=ResponseFormat.JSON,
+        validation_alias=AliasChoices("format", "output"),
         description="'json' for structured data with documents/cursor/total, "
                     "'markdown' for a compact summary table of results.",
     )
     srcip: Optional[str] = Field(
         default=None,
+        validation_alias=AliasChoices("ip", "src_ip", "source_ip"),
         max_length=45,
         description="Source IP address to filter alerts by (e.g. '180.254.78.145'). "
                     "Searches data.srcip, srcip, and full_log fields. Leave empty for all IPs.",
     )
     since: Optional[str] = Field(
         default=None,
+        validation_alias=AliasChoices("from", "start", "after"),
         max_length=30,
         description="Start of time window — ISO 8601 ('2026-07-05T18:30:00Z') or relative "
                     "('5m', '1h', '24h', '7d', '30d'). "
@@ -2549,12 +2559,14 @@ class WazuhIndexerSearchInput(BaseModel):
     )
     until: Optional[str] = Field(
         default=None,
+        validation_alias=AliasChoices("to", "end", "before"),
         max_length=30,
         description="End of time window — ISO 8601 or relative expression. "
                     "Defaults to now if omitted. Can be used alone (no since required).",
     )
     keyword: Optional[str] = Field(
         default=None,
+        validation_alias=AliasChoices("query", "search"),
         max_length=1024,
         description="Free-text keyword search across full_log, rule.description, rule.info, "
                     "data.srcip, data.url, data.domain, and other text fields. Supports simple operators: "
@@ -2563,6 +2575,7 @@ class WazuhIndexerSearchInput(BaseModel):
     )
     srcips: Optional[list[str]] = Field(
         default=None,
+        validation_alias=AliasChoices("src_ips", "ips", "source_ips"),
         min_length=1,
         max_length=25,
         description="List of source IP addresses to filter alerts by (max 25). "
@@ -2570,13 +2583,26 @@ class WazuhIndexerSearchInput(BaseModel):
                     "srcip, and full_log fields. Use for searching alerts by multiple "
                     "suspicious IPs in a single call. Example: ['114.10.116.20', '51.159.125.199']",
     )
+    rule_groups: Optional[list[str]] = Field(
+        default=None,
+        validation_alias=AliasChoices("rule_group", "rule", "groups"),
+        min_length=1,
+        max_length=50,
+        description="Filter alerts by rule groups (matches ANY of the listed groups). "
+                    "Searches the rule.groups array field via OpenSearch terms query for "
+                    "exact matching — more precise than free-text keyword. "
+                    "Example: ['malicious_login', 'webshell', 'bruteforce', "
+                    "'credential_stuffing', 'authentication_attempt'].",
+    )
     cursor: Optional[str] = Field(
         default=None,
+        validation_alias=AliasChoices("page", "token"),
         description="Pagination cursor from previous response (next_cursor). Uses search_after "
                     "sort-key traversal — no 10K-doc ceiling. Omit for first page.",
     )
     fields: Optional[list[str]] = Field(
         default=None,
+        validation_alias=AliasChoices("field", "columns"),
         min_length=1,
         max_length=50,
         description="Custom _source fields to retrieve (e.g. ['data.url', 'data.srcip', "
@@ -2635,6 +2661,22 @@ class WazuhIndexerSearchInput(BaseModel):
                     raise ValueError(f"srcips: '{ip}' is not a valid IP address (IPv4/IPv6)") from exc
                 valid.append(ip)
             return valid if valid else None
+        return v
+
+    @field_validator("rule_groups")
+    @classmethod
+    def validate_rule_groups(cls, v: Optional[list[str]]) -> Optional[list[str]]:
+        """Validate rule group names — alphanumeric + underscore/hyphen/dot."""
+        if v is not None:
+            cleaned: list[str] = []
+            for g in v:
+                g = g.strip()
+                if not g:
+                    continue
+                if not re.match(r"^[a-zA-Z0-9._-]+$", g):
+                    raise ValueError(f"rule_groups: invalid group name '{g}'")
+                cleaned.append(g)
+            return cleaned if cleaned else None
         return v
 
     @field_validator("agent_name")
@@ -2715,6 +2757,7 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
         keyword=params.keyword,
         srcips=params.srcips,
         fields=params.fields,
+        rule_groups=params.rule_groups,
     )
     if isinstance(data.get("error"), str):
         return json.dumps(data, indent=2)
