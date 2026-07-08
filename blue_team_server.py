@@ -564,13 +564,16 @@ async def _wazuh_indexer_search(
                     "minimum_should_match": 1,
                 }
             })
-    # Time-range filter on @timestamp (UTC). Accepts ISO 8601 strings.
+    # Time-range filter on @timestamp (UTC). Accepts ISO 8601 AND relative time
+    # expressions ('24h', '1h', '7d', '30d', '5m') via _parse_time_window().
     # Supports since-only, until-only, or both together.
     time_range: dict[str, str] = {}
-    if since and since.strip():
-        time_range["gte"] = since.strip()
-    if until and until.strip():
-        time_range["lt"] = until.strip()
+    if since or until:
+        since_parsed, until_parsed = _parse_time_window(since, until)
+        if since_parsed:
+            time_range["gte"] = since_parsed
+        if until_parsed:
+            time_range["lt"] = until_parsed
     if time_range:
         time_range["format"] = "strict_date_optional_time"
         must_clauses.append({"range": {"@timestamp": time_range}})
@@ -2265,8 +2268,8 @@ class WazuhAlertsInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     agent_name: Optional[str] = Field(default=None, max_length=64, description="Filter by agent name (e.g. HYDRA-DC)")
     srcip: Optional[str] = Field(default=None, max_length=45, description="Source IP filter (e.g. '180.254.78.145')")
-    since: Optional[str] = Field(default=None, max_length=30, description="ISO 8601 start time in UTC")
-    until: Optional[str] = Field(default=None, max_length=30, description="ISO 8601 end time in UTC")
+    since: Optional[str] = Field(default=None, max_length=30, description="ISO 8601 or relative time ('24h', '1h', '7d', etc.)")
+    until: Optional[str] = Field(default=None, max_length=30, description="ISO 8601 or relative end time")
     limit: int = Field(default=500, description="Max alerts per page", ge=1, le=2000)
     cursor: Optional[str] = Field(
         default=None,
@@ -2442,6 +2445,11 @@ class WazuhIndexerSearchInput(BaseModel):
     )
     index_type: str = Field(default="alerts", description="Index: alerts, events, or vulnerabilities")
     limit: int = Field(default=500, description="Max docs to return per page", ge=1, le=10000)
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.JSON,
+        description="'json' for structured data with documents/cursor/total, "
+                    "'markdown' for a compact summary table of results.",
+    )
     srcip: Optional[str] = Field(
         default=None,
         max_length=45,
@@ -2451,16 +2459,16 @@ class WazuhIndexerSearchInput(BaseModel):
     since: Optional[str] = Field(
         default=None,
         max_length=30,
-        description="ISO 8601 start time in UTC (e.g. '2026-07-05T18:30:00Z'). "
-                    "Wazuh alerts use the '@timestamp' field in UTC. "
+        description="Start of time window — ISO 8601 ('2026-07-05T18:30:00Z') or relative "
+                    "('5m', '1h', '24h', '7d', '30d'). "
                     "To convert WIB (GMT+7): subtract 7 hours. "
                     "Can be used alone (no until required).",
     )
     until: Optional[str] = Field(
         default=None,
         max_length=30,
-        description="ISO 8601 end time in UTC (e.g. '2026-07-05T19:00:00Z'). "
-                    "Filters @timestamp < this value. Can be used alone (no since required).",
+        description="End of time window — ISO 8601 or relative expression. "
+                    "Defaults to now if omitted. Can be used alone (no since required).",
     )
     keyword: Optional[str] = Field(
         default=None,
@@ -2573,7 +2581,8 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
         params.cursor: next_cursor from previous response (omit for first page)
 
     Returns:
-        str: JSON with documents, total, from, size, count, and next_cursor
+        str: In 'json' mode (default): JSON with documents, total, size, count, next_cursor,
+             and timezone. In 'markdown' mode: a compact summary table of alerts.
     """
     if params.index_type not in _WAZUH_INDEX_PATTERNS:
         return json.dumps({"error": f"index_type must be one of: {list(_WAZUH_INDEX_PATTERNS)}"})
@@ -2625,7 +2634,40 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
         meta["since"] = params.since
     if params.until:
         meta["until"] = params.until
-    return _truncate_if_needed(json.dumps(meta, indent=2))
+
+    if params.response_format == ResponseFormat.JSON:
+        return _truncate_if_needed(json.dumps(meta, indent=2))
+
+    # Markdown: compact summary table
+    lines = [
+        f"# Wazuh Indexer Search Results",
+        f"",
+        f"**Total**: {total_val} ({total_relation}) | **Returned**: {len(docs)} | **Page size**: {params.limit}",
+        f"**Index**: {params.index_type} | **Timezone**: UTC",
+    ]
+    if params.since or params.until:
+        window = f"{params.since or '...'} → {params.until or '...'}"
+        lines.append(f"**Window**: {window}")
+    if next_cursor:
+        lines.append(f"**Cursor**: `{next_cursor[:40]}...` (more pages available)")
+    lines.append("")
+    lines.append("| # | Timestamp (UTC) | Agent | Rule | Level | Src IP | Description |")
+    lines.append("|---|-----------------|-------|------|-------|--------|-------------|")
+    for i, d in enumerate(docs[:100], 1):
+        ts = str(d.get("@timestamp", ""))[:19]
+        agent = str((d.get("agent") or {}).get("name", ""))[:25]
+        rule_id = str((d.get("rule") or {}).get("id", ""))
+        level = str((d.get("rule") or {}).get("level", ""))
+        srcip = str(
+            (d.get("data") or {}).get("srcip")
+            or d.get("srcip", "")
+        )[:18]
+        desc = str((d.get("rule") or {}).get("description", ""))[:60]
+        lines.append(f"| {i} | {ts} | {agent} | {rule_id} | {level} | {srcip} | {desc} |")
+    if len(docs) > 100:
+        lines.append(f"")
+        lines.append(f"_(showing first 100 of {len(docs)} documents — set response_format=json for full output)_")
+    return _truncate_if_needed("\n".join(lines))
 
 
 # Wazuh Email & Domain Lookup
