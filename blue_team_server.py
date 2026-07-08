@@ -2589,14 +2589,14 @@ class WazuhIndexerSearchInput(BaseModel):
     @field_validator("fields")
     @classmethod
     def validate_fields(cls, v: Optional[list[str]]) -> Optional[list[str]]:
-        """Validate _source field names — alphanumeric + dot/underscore/hyphen only."""
+        """Validate _source field names — alphanumeric + @/dot/underscore/hyphen."""
         if v is not None:
             cleaned: list[str] = []
             for f in v:
                 f = f.strip()
                 if not f:
                     continue
-                if not re.match(r"^[a-zA-Z0-9._-]+$", f):
+                if not re.match(r"^[a-zA-Z0-9@._-]+$", f):
                     raise ValueError(f"fields: invalid field name '{f}'")
                 cleaned.append(f)
             return cleaned if cleaned else None
