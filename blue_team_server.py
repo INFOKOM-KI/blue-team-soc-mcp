@@ -2538,7 +2538,7 @@ class WazuhIndexerSearchInput(BaseModel):
     )
     keyword: Optional[str] = Field(
         default=None,
-        max_length=256,
+        max_length=1024,
         description="Free-text keyword search across full_log, rule.description, rule.info, "
                     "data.srcip, data.url, data.domain, and other text fields. Supports simple operators: "
                     "+term (must), -term (must not), term1|term2 (OR), *wildcard*, "
@@ -2567,8 +2567,8 @@ class WazuhIndexerSearchInput(BaseModel):
             v = v.strip()
             if not v:
                 return None
-            if len(v) > 256:
-                raise ValueError("keyword too long (max 256)")
+            if len(v) > 1024:
+                raise ValueError("keyword too long (max 1024)")
             # Reject null bytes and ASCII control chars below 0x20 (except tab)
             if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", v):
                 raise ValueError("keyword contains invalid control characters")
@@ -2784,7 +2784,7 @@ class WazuhEmailLookupInput(BaseModel):
     )
     rule_groups: Optional[str] = Field(
         default=None,
-        max_length=256,
+        max_length=1024,
         description="Comma-separated rule groups to filter by "
                     "(e.g. 'authentication_failed,brute_force'). "
                     "Omit to search all rule groups.",
@@ -2802,7 +2802,7 @@ class WazuhEmailLookupInput(BaseModel):
     )
     keyword: Optional[str] = Field(
         default=None,
-        max_length=256,
+        max_length=1024,
         description="Free-text keyword search to further narrow email results. "
                     "Same syntax as blueteam_wazuh_indexer_search.",
     )
@@ -2845,8 +2845,8 @@ class WazuhEmailLookupInput(BaseModel):
             v = v.strip()
             if not v:
                 return None
-            if len(v) > 256:
-                raise ValueError("keyword too long (max 256)")
+            if len(v) > 1024:
+                raise ValueError("keyword too long (max 1024)")
             if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", v):
                 raise ValueError("keyword contains invalid control characters")
         return v
@@ -3101,7 +3101,7 @@ class WazuhDomainLookupInput(BaseModel):
     )
     keyword: Optional[str] = Field(
         default=None,
-        max_length=256,
+        max_length=1024,
         description="Free-text keyword search to further narrow domain results. "
                     "Same syntax as blueteam_wazuh_indexer_search.",
     )
@@ -3144,8 +3144,8 @@ class WazuhDomainLookupInput(BaseModel):
             v = v.strip()
             if not v:
                 return None
-            if len(v) > 256:
-                raise ValueError("keyword too long (max 256)")
+            if len(v) > 1024:
+                raise ValueError("keyword too long (max 1024)")
             if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", v):
                 raise ValueError("keyword contains invalid control characters")
         return v
@@ -3353,7 +3353,7 @@ class WazuhCompromisedEmailsAnalysisInput(BaseModel):
     )
     keyword: Optional[str] = Field(
         default=None,
-        max_length=256,
+        max_length=1024,
         description="Free-text keyword search to further narrow results. "
                     "Same syntax as blueteam_wazuh_indexer_search.",
     )
@@ -3399,8 +3399,8 @@ class WazuhCompromisedEmailsAnalysisInput(BaseModel):
             v = v.strip()
             if not v:
                 return None
-            if len(v) > 256:
-                raise ValueError("keyword too long (max 256)")
+            if len(v) > 1024:
+                raise ValueError("keyword too long (max 1024)")
             if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", v):
                 raise ValueError("keyword contains invalid control characters")
         return v
@@ -3741,7 +3741,7 @@ class WazuhAlertTimelineInput(BaseModel):
     )
     rule_groups: Optional[str] = Field(
         default=None,
-        max_length=256,
+        max_length=1024,
         description="Comma-separated rule groups to filter by (e.g. 'brute_force,authentication_failed').",
     )
     rule_level_min: Optional[int] = Field(
@@ -3752,7 +3752,7 @@ class WazuhAlertTimelineInput(BaseModel):
     )
     keyword: Optional[str] = Field(
         default=None,
-        max_length=256,
+        max_length=1024,
         description="Free-text keyword search to narrow the timeline. Same syntax as "
                     "blueteam_wazuh_indexer_search — supports +term, -term, OR, *wildcard*, "
                     '\"exact phrase\". Example: \'gambling OR "brute force"\'',
@@ -3783,8 +3783,8 @@ class WazuhAlertTimelineInput(BaseModel):
             v = v.strip()
             if not v:
                 return None
-            if len(v) > 256:
-                raise ValueError("keyword too long (max 256)")
+            if len(v) > 1024:
+                raise ValueError("keyword too long (max 1024)")
             if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", v):
                 raise ValueError("keyword contains invalid control characters")
         return v
@@ -4023,7 +4023,7 @@ class WazuhAttackVelocityInput(BaseModel):
     )
     rule_groups: Optional[str] = Field(
         default=None,
-        max_length=256,
+        max_length=1024,
         description="Comma-separated rule groups to filter by.",
     )
     bucket: str = Field(
@@ -4033,7 +4033,7 @@ class WazuhAttackVelocityInput(BaseModel):
     )
     keyword: Optional[str] = Field(
         default=None,
-        max_length=256,
+        max_length=1024,
         description="Free-text keyword search to narrow the analysis. Same syntax as "
                     "blueteam_wazuh_indexer_search.",
     )
@@ -4086,8 +4086,8 @@ class WazuhAttackVelocityInput(BaseModel):
             v = v.strip()
             if not v:
                 return None
-            if len(v) > 256:
-                raise ValueError("keyword too long (max 256)")
+            if len(v) > 1024:
+                raise ValueError("keyword too long (max 1024)")
             if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", v):
                 raise ValueError("keyword contains invalid control characters")
         return v
