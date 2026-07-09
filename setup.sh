@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Blue Team MCP Server - Setup Script
+# Blue Team MCP Server Setup Script
 # Run this on your DEFENDER HOST (Ubuntu/Debian recommended)
 # Usage: sudo bash setup.sh
 # Programmer : NAuliajati (csirt[at]tangerangkota[.]go[.]id)
@@ -79,13 +79,13 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 # export WAZUH_API_URL="https://192.168.1.180:55000"
 # export WAZUH_API_USER="wazuh-wui"
 # export WAZUH_API_PASSWORD="MyS3cr37P450r.*-"
-# export WAZUH_API_VERIFY_SSL="false"
+# export WAZUH_API_VERIFY_SSL="true"   # TLS verification ON by default — disable only for self-signed labs
 
 # Wazuh Indexer / OpenSearch (optional - for HYDRA-DC Windows events, port 9200)
 # export WAZUH_INDEXER_URL="https://192.168.1.180:9200"
 # export WAZUH_INDEXER_USER="admin"
 # export WAZUH_INDEXER_PASSWORD="your_indexer_password"
-# export WAZUH_INDEXER_VERIFY_SSL="false"
+# export WAZUH_INDEXER_VERIFY_SSL="true"  # TLS verification ON by default — disable only for self-signed labs
 
 # Performance & Tuning Limits
 # export BLUETEAM_CHARACTER_LIMIT="25000"       # max chars per tool response before truncation
@@ -93,6 +93,12 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 # export BLUETEAM_VERIFY_SSL="true"             # SSL cert verification for external API calls
 # export BLUETEAM_BULK_CONCURRENCY="5"          # max parallel IP lookups (CrowdSec bulk)
 # export WAZUH_INDEXER_MAX_SIZE="10000"         # max documents per page in Wazuh Indexer search
+
+# CrowdSec CTI cache TTL (seconds, default 900 = 15 min)
+# export CROWDSEC_CACHE_TTL="900"
+
+# PII redaction (enabled by default — set to false to return raw alert data)
+# export BLUETEAM_REDACT_PII="true"
 
 # Audit and limits (optional)
 # export BLUETEAM_AUDIT_LOG="/var/log/blue-team-mcp-audit.jsonl"
@@ -111,7 +117,7 @@ fi
 # Wrapper scripts
 echo "[5/7] Creating MCP server wrapper scripts..."
 
-# Main wrapper: mcp-server-blueteam (all 41 tools)
+# Main wrapper: mcp-server-blueteam (all 43 tools)
 cat > /usr/local/bin/mcp-server-blueteam << 'EOF'
 #!/usr/bin/env bash
 # Wrapper - Claude Desktop calls this via SSH (MAESTRO-compliant)
@@ -129,15 +135,17 @@ export BLUETEAM_CAPTURE_DIR="${BLUETEAM_CAPTURE_DIR:-/tmp}"
 export BLUETEAM_HTTP_TIMEOUT="${BLUETEAM_HTTP_TIMEOUT:-30.0}"
 export BLUETEAM_CHARACTER_LIMIT="${BLUETEAM_CHARACTER_LIMIT:-25000}"
 export BLUETEAM_VERIFY_SSL="${BLUETEAM_VERIFY_SSL:-true}"
+export CROWDSEC_CACHE_TTL="${CROWDSEC_CACHE_TTL:-900}"
+export BLUETEAM_REDACT_PII="${BLUETEAM_REDACT_PII:-true}"
 export WAZUH_INDEXER_MAX_SIZE="${WAZUH_INDEXER_MAX_SIZE:-10000}"
 export WAZUH_API_URL="${WAZUH_API_URL:-}"
 export WAZUH_API_USER="${WAZUH_API_USER:-wazuh-wui}"
 export WAZUH_API_PASSWORD="${WAZUH_API_PASSWORD:-}"
-export WAZUH_API_VERIFY_SSL="${WAZUH_API_VERIFY_SSL:-false}"
+export WAZUH_API_VERIFY_SSL="${WAZUH_API_VERIFY_SSL:-true}"
 export WAZUH_INDEXER_URL="${WAZUH_INDEXER_URL:-}"
 export WAZUH_INDEXER_USER="${WAZUH_INDEXER_USER:-admin}"
 export WAZUH_INDEXER_PASSWORD="${WAZUH_INDEXER_PASSWORD:-}"
-export WAZUH_INDEXER_VERIFY_SSL="${WAZUH_INDEXER_VERIFY_SSL:-false}"
+export WAZUH_INDEXER_VERIFY_SSL="${WAZUH_INDEXER_VERIFY_SSL:-true}"
 export MCP_TRANSPORT="${MCP_TRANSPORT:-stdio}"
 export MCP_HOST="${MCP_HOST:-127.0.0.1}"
 export MCP_PORT="${MCP_PORT:-8000}"
@@ -145,7 +153,9 @@ exec /opt/blue-team-mcp/venv/bin/python3 /opt/blue-team-mcp/blue_team_server.py 
 EOF
 chmod +x /usr/local/bin/mcp-server-blueteam
 
-# Standalone wrapper: mcp-server-crowdsec (2 CrowdSec CTI tools)
+# DEPRECATED standalone wrapper: mcp-server-crowdsec
+# CrowdSec CTI tools are now integrated into the unified server (mcp-server-blueteam).
+# This wrapper is kept for backward compatibility only.
 cat > /usr/local/bin/mcp-server-crowdsec << 'EOF'
 #!/usr/bin/env bash
 # Wrapper - CrowdSec-only MCP server with parallel bulk lookups
@@ -162,7 +172,9 @@ exec /opt/blue-team-mcp/venv/bin/python3 /opt/blue-team-mcp/blue_team_server_cro
 EOF
 chmod +x /usr/local/bin/mcp-server-crowdsec
 
-# Standalone wrapper: mcp-server-greynoise (1 GreyNoise Community tool)
+# DEPRECATED standalone wrapper: mcp-server-greynoise
+# GreyNoise Community tools are now integrated into the unified server (mcp-server-blueteam).
+# This wrapper is kept for backward compatibility only.
 cat > /usr/local/bin/mcp-server-greynoise << 'EOF'
 #!/usr/bin/env bash
 # Wrapper - GreyNoise-only MCP server (free, no API key required)
@@ -211,9 +223,9 @@ echo "  GreyNoise Community needs no key — greynoise_ip_context works immediat
 echo ""
 echo "Wrapper entry points installed:"
 echo ""
-echo "  mcp-server-blueteam    — All 41 tools (Wazuh, threat intel, host forensics)"
-echo "  mcp-server-crowdsec    — CrowdSec CTI only (2 tools, parallel bulk lookups)"
-echo "  mcp-server-greynoise   — GreyNoise Community only (1 tool, no API key needed)"
+echo "  mcp-server-blueteam    — All 43 tools (Wazuh, threat intel, host forensics)"
+echo "  mcp-server-crowdsec    — DEPRECATED — CrowdSec CTI is in the unified server"
+echo "  mcp-server-greynoise   — DEPRECATED — GreyNoise is in the unified server"
 echo ""
 echo "Run as a remote HTTP service (no SSH needed):"
 echo ""

@@ -75,6 +75,7 @@ TIMEOUT = 30           # seconds for subprocess calls
 MAX_GREP_PATTERN_LENGTH = 200   # ReDoS mitigation
 BLUETEAM_AUDIT_LOG = os.environ.get("BLUETEAM_AUDIT_LOG", "")
 BLUETEAM_RATE_LIMIT = int(os.environ.get("BLUETEAM_RATE_LIMIT", "0"))  # max calls/min, 0=disabled
+BLUETEAM_REDACT_PII = os.environ.get("BLUETEAM_REDACT_PII", "true").lower() in ("1", "true", "yes")
 
 # Path safety: allowlist for blueteam_hash_file (colon-separated, e.g. /var:/etc:/home:/opt)
 ALLOWED_PATH_PREFIXES = [
@@ -88,17 +89,23 @@ CAPTURE_OUTPUT_DIR = os.environ.get("BLUETEAM_CAPTURE_DIR", "/tmp")
 WAZUH_API_URL = os.environ.get("WAZUH_API_URL", "").rstrip("/")
 WAZUH_API_USER = os.environ.get("WAZUH_API_USER", "wazuh-wui")
 WAZUH_API_PASSWORD = os.environ.get("WAZUH_API_PASSWORD", "")
-WAZUH_API_VERIFY_SSL = os.environ.get("WAZUH_API_VERIFY_SSL", "false").lower() in ("1", "true", "yes")
+WAZUH_API_VERIFY_SSL = os.environ.get("WAZUH_API_VERIFY_SSL", "true").lower() in ("1", "true", "yes")
+if not WAZUH_API_VERIFY_SSL:
+    logger.warning("WAZUH_API_VERIFY_SSL is disabled — TLS certificate verification is OFF for Wazuh Manager API connections")
 
 # Wazuh Indexer / OpenSearch (optional - for blueteam_wazuh_indexer_search; HYDRA-DC events live here)
 WAZUH_INDEXER_URL = os.environ.get("WAZUH_INDEXER_URL", "").rstrip("/")
 WAZUH_INDEXER_USER = os.environ.get("WAZUH_INDEXER_USER", "admin")
 WAZUH_INDEXER_PASSWORD = os.environ.get("WAZUH_INDEXER_PASSWORD", "")
-WAZUH_INDEXER_VERIFY_SSL = os.environ.get("WAZUH_INDEXER_VERIFY_SSL", "false").lower() in ("1", "true", "yes")
+WAZUH_INDEXER_VERIFY_SSL = os.environ.get("WAZUH_INDEXER_VERIFY_SSL", "true").lower() in ("1", "true", "yes")
+if not WAZUH_INDEXER_VERIFY_SSL:
+    logger.warning("WAZUH_INDEXER_VERIFY_SSL is disabled — TLS certificate verification is OFF for Wazuh Indexer/OpenSearch connections")
 
 # CrowdSec CTI (optional — set CROWDSEC_API_KEY to enable the crowdsec_ip_reputation tools)
 CROWDSEC_BASE_URL = "https://cti.api.crowdsec.net"
 CROWDSEC_API_KEY_ENV = "CROWDSEC_API_KEY"
+CROWDSEC_CACHE_TTL = int(os.environ.get("CROWDSEC_CACHE_TTL", "900"))  # seconds, default 15 min
+_crowdsec_cache: dict[str, tuple[float, dict[str, Any]]] = {}  # ip -> (expiry_timestamp, data)
 
 # GreyNoise Community (free, no API key required)
 GREYNOISE_COMMUNITY_BASE_URL = "https://api.greynoise.io/v3/community"
@@ -318,6 +325,232 @@ def _truncate_if_needed(text: str) -> str:
         "Use a smaller limit per page (e.g. limit=50) or iterate with the next_cursor "
         "to process results incrementally.]"
     )
+
+
+# Circuit Breaker - prevents cascading failures when upstream APIs are down.
+# CLOSED - normal operation, calls pass through
+# OPEN - fail-fast for recovery_timeout seconds after failure_threshold failures
+# HALF_OPEN - single probe call allowed; success -> CLOSED, failure -> OPEN
+class CircuitBreakerOpenError(Exception):
+    """Raised when a call is attempted while the circuit breaker is OPEN."""
+
+class CircuitBreaker:
+    """Async-safe circuit breaker for external API calls.
+
+    Usage:
+        cb = CircuitBreaker("crowdsec", failure_threshold=5, recovery_timeout=60)
+        data = await cb.call(_crowdsec_request, f"/v2/smoke/{ip}")
+    """
+
+    def __init__(
+        self,
+        name: str,
+        failure_threshold: int = 5,
+        recovery_timeout: float = 60.0,
+    ) -> None:
+        self.name = name
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self._failure_count = 0
+        self._state: str = "CLOSED"  # CLOSED | OPEN | HALF_OPEN
+        self._opened_at: float = 0.0
+        self._lock = asyncio.Lock()
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    async def call(self, fn, *args: Any, **kwargs: Any) -> Any:
+        """Execute ``fn(*args, **kwargs)`` with circuit-breaker protection.
+
+        Returns the callable's result on success.
+        Raises ``CircuitBreakerOpenError`` if the circuit is OPEN.
+        Re-raises the original exception on failure.
+        """
+        async with self._lock:
+            now = time.monotonic()
+
+            if self._state == "OPEN":
+                if now - self._opened_at >= self.recovery_timeout:
+                    self._state = "HALF_OPEN"
+                    logger.info(
+                        "Circuit breaker '%s' → HALF_OPEN (probing after %.0fs timeout)",
+                        self.name, self.recovery_timeout,
+                    )
+                else:
+                    remaining = self.recovery_timeout - (now - self._opened_at)
+                    logger.warning(
+                        "Circuit breaker '%s' is OPEN — failing fast (%.0fs remaining)",
+                        self.name, remaining,
+                    )
+                    raise CircuitBreakerOpenError(
+                        f"Circuit breaker '{self.name}' is OPEN. "
+                        f"Upstream API is unavailable. Retry in {remaining:.0f}s."
+                    )
+
+        # Execute the call outside the lock to avoid blocking concurrent callers
+        try:
+            result = await fn(*args, **kwargs)
+        except Exception:
+            async with self._lock:
+                self._failure_count += 1
+                if self._state == "HALF_OPEN":
+                    logger.warning(
+                        "Circuit breaker '%s' HALF_OPEN probe FAILED (%d/%d) → OPEN",
+                        self.name, self._failure_count, self.failure_threshold,
+                    )
+                    self._state = "OPEN"
+                    self._opened_at = time.monotonic()
+                elif self._failure_count >= self.failure_threshold:
+                    logger.error(
+                        "Circuit breaker '%s' threshold reached (%d failures) → OPEN",
+                        self.name, self._failure_count,
+                    )
+                    self._state = "OPEN"
+                    self._opened_at = time.monotonic()
+            raise
+
+        # Success — reset
+        async with self._lock:
+            if self._state == "HALF_OPEN":
+                logger.info(
+                    "Circuit breaker '%s' HALF_OPEN probe SUCCEEDED → CLOSED", self.name,
+                )
+            self._failure_count = 0
+            self._state = "CLOSED"
+
+        return result
+
+
+# Per-service circuit breakers - one per external API trust domain
+_cb_crowdsec = CircuitBreaker("crowdsec_cti", failure_threshold=5, recovery_timeout=60)
+_cb_wazuh_indexer = CircuitBreaker("wazuh_indexer", failure_threshold=5, recovery_timeout=60)
+
+
+# PII redaction patterns - applied to alert payloads when BLUETEAM_REDACT_PII is enabled
+_REDACT_EMAIL_RE = re.compile(r"([a-zA-Z0-9._%+-]+)@([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})")
+_REDACT_HOSTNAME_RE = re.compile(r"(?<![a-zA-Z0-9-])([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.(?:[a-zA-Z]{2,}|xn--[a-zA-Z0-9]+))(?![a-zA-Z0-9.])")
+
+# Credential/secret stripping patterns - applied BEFORE PII redaction.
+# Prevents tokens, keys, and secrets in Wazuh full_log fields from leaking to the LLM.
+# Each entry is (compiled_regex, replacement_string). Applied in order.
+_CREDENTIAL_STRIP_RULES: list[tuple[re.Pattern, str]] = [
+    # Bearer tokens: "Authorization: Bearer eyJ..." -> "Authorization: Bearer <BEARER_REDACTED>"
+    (re.compile(r'Authorization:\s*Bearer\s+\S+', re.IGNORECASE),
+     'Authorization: Bearer <BEARER_REDACTED>'),
+    # Basic auth: "Authorization: Basic dXNlcjpwYXNz..." -> "Authorization: Basic <BASIC_REDACTED>"
+    (re.compile(r'Authorization:\s*Basic\s+\S+', re.IGNORECASE),
+     'Authorization: Basic <BASIC_REDACTED>'),
+    # x-api-key / X-API-Key headers
+    (re.compile(r'x-api-key:\s*\S+', re.IGNORECASE),
+     'x-api-key: <API_KEY_REDACTED>'),
+    # api_key / apikey query params or inline assignments
+    (re.compile(r'(?:api[_-]?key)\s*[=:]\s*\S+', re.IGNORECASE),
+     'api_key=<API_KEY_REDACTED>'),
+    # JWT tokens — three base64url segments separated by dots, header starts with "eyJ"
+    (re.compile(r'\beyJ[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{0,1000}\b'),
+     '<JWT_REDACTED>'),
+    # Private key PEM blocks (RSA, EC, OpenSSH, DSA, Ed25519, generic)
+    (re.compile(
+        r'-----BEGIN (?:RSA |EC |OPENSSH |DSA |ED25519 |ENCRYPTED )?PRIVATE KEY-----'
+        r'.*?'
+        r'-----END (?:RSA |EC |OPENSSH |DSA |ED25519 |ENCRYPTED )?PRIVATE KEY-----',
+        re.DOTALL,
+    ), '<PRIVATE_KEY_REDACTED>'),
+    # AWS access key IDs: "AKIA" plus secret key pattern "wJalrXUtn..."
+    (re.compile(r'\bAKIA[0-9A-Z]{16}\b'), '<AWS_ACCESS_KEY_REDACTED>'),
+    # Stripe secret keys: sk_live_ / sk_test_
+    (re.compile(r'\bsk_(?:live|test)_[a-zA-Z0-9]{24,}\b'), '<STRIPE_KEY_REDACTED>'),
+    # GitHub personal access tokens: ghp_*, gho_*, ghu_*, ghs_*, ghr_*
+    (re.compile(r'\bgh[pousr]_[A-Za-z0-9_]{36,}\b'), '<GITHUB_TOKEN_REDACTED>'),
+    # GitLab personal access tokens: glpat-
+    (re.compile(r'\bglpat-[A-Za-z0-9_-]{20,}\b'), '<GITLAB_TOKEN_REDACTED>'),
+    # OpenAI / Anthropic API keys: sk- (but NOT Stripe sk_live/sk_test which are handled above)
+    (re.compile(r'\b(?:sk-(?!live|test)|sk-ant-)[a-zA-Z0-9_-]{20,}\b'), '<AI_API_KEY_REDACTED>'),
+    # Generic password/secret/passwd/pwd query params or inline: "password=value" -> "password=<REDACTED>"
+    (re.compile(r'(password|passwd|pwd|secret)\s*[=:]\s*\S+', re.IGNORECASE),
+     r'\1=<PASSWORD_REDACTED>'),
+    # Slack tokens: xoxb-, xoxp-, xoxa-, xoxr-
+    (re.compile(r'\bxox[abpro]-[0-9]+-[0-9]+-[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)?\b'),
+     '<SLACK_TOKEN_REDACTED>'),
+    # Google API keys: AIza (35 chars)
+    (re.compile(r'\bAIza[0-9A-Za-z_-]{35}\b'), '<GOOGLE_API_KEY_REDACTED>'),
+]
+
+
+def _redact_alert_data(data: Any, *, bypass: bool = False) -> Any:
+    """Apply redacted-but-real PII and credential masking to alert payloads (PRD FR-17).
+
+    Credential stripping (applied first):
+      - Bearer / Basic auth headers → ``Authorization: Bearer <BEARER_REDACTED>``
+      - API keys (x-api-key, api_key=) → ``x-api-key: <API_KEY_REDACTED>``
+      - JWT tokens (eyJ… base64url segments) → ``<JWT_REDACTED>``
+      - Private key PEM blocks → ``<PRIVATE_KEY_REDACTED>``
+      - AWS / Stripe / GitHub / GitLab / Slack / Google / AI API keys → ``<TOKEN_REDACTED>``
+      - Password / secret query params → ``password=<PASSWORD_REDACTED>``
+
+    PII masking (applied second):
+      - Email addresses → ``u***r@d***n.com``  (preserve first/last local + domain chars)
+      - Internal IPs (RFC1918) → ``10.***.***.1``  (mask middle octets)
+
+    Controlled by BLUETEAM_REDACT_PII env var (default: True). The per-call
+    ``bypass`` parameter overrides this — when ``bypass=True``, raw data is
+    returned regardless of the server default (useful for internal audit
+    investigations that need unredacted payloads).
+
+    Returns the redacted copy — original is never mutated.
+    """
+    if bypass or not BLUETEAM_REDACT_PII:
+        return data
+
+    if isinstance(data, str):
+        # --- credential / secret stripping (applied first, before PII redaction) ---
+        # Strip bearer tokens, API keys, JWTs, private keys, and password params
+        # from Wazuh full_log fields so they never reach the LLM context.
+        for pattern, replacement in _CREDENTIAL_STRIP_RULES:
+            data = pattern.sub(replacement, data)
+
+        # Email redaction: preserve first and last char of local part, first and last domain section
+        def _redact_email(m: re.Match) -> str:
+            local, domain = m.group(1), m.group(2)
+            if len(local) <= 2:
+                rlocal = local[0] + "*" * (len(local) - 1)
+            else:
+                rlocal = local[0] + "*" * max(1, len(local) - 2) + local[-1]
+            parts = domain.split(".")
+            if len(parts) >= 2:
+                parts[0] = parts[0][0] + "*" * max(1, len(parts[0]) - 2) + parts[0][-1] if len(parts[0]) > 2 else parts[0]
+            return f"{rlocal}@{'.'.join(parts)}"
+
+        data = _REDACT_EMAIL_RE.sub(_redact_email, data)
+
+        # RFC1918 IP masking: 10.x.x.x, 172.16-31.x.x, 192.168.x.x
+        def _redact_rfc1918(m: re.Match) -> str:
+            ip = m.group(0)
+            octets = ip.split(".")
+            if octets[0] == "10":
+                return f"10.{'***'}.{'***'}.{octets[3]}"
+            elif octets[0] == "172" and 16 <= int(octets[1]) <= 31:
+                return f"172.{octets[1]}.{'***'}.{octets[3]}"
+            elif octets[0] == "192" and octets[1] == "168":
+                return f"192.168.{'***'}.{octets[3]}"
+            return ip
+
+        data = re.sub(
+            r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})\b",
+            _redact_rfc1918,
+            data,
+        )
+        return data
+
+    if isinstance(data, dict):
+        return {k: _redact_alert_data(v) for k, v in data.items()}
+
+    if isinstance(data, list):
+        return [_redact_alert_data(item) for item in data]
+
+    return data
+
 
 # Input validation and sanitization helpers
 def _sanitize_regex(pattern: str) -> str:
@@ -646,7 +879,8 @@ async def _wazuh_indexer_search(
     # Omitting it on the first page avoids a malformed-query error.
     if search_after:
         body["search_after"] = search_after
-    try:
+
+    async def _do_indexer_http() -> dict[str, Any]:
         client = await _get_indexer_client()
         resp = await client.post(
             url,
@@ -656,6 +890,9 @@ async def _wazuh_indexer_search(
         )
         resp.raise_for_status()
         return resp.json()
+
+    try:
+        return await _cb_wazuh_indexer.call(_do_indexer_http)
     except httpx.HTTPStatusError as e:
         return {"error": f"Indexer API error: {e.response.status_code}", "detail": e.response.text[:500]}
     except Exception as e:
@@ -1136,17 +1373,46 @@ def _get_crowdsec_api_key() -> str:
     return key
 
 async def _crowdsec_request(path: str) -> dict[str, Any]:
-    """Reusable async GET request to the CrowdSec CTI API."""
+    """Reusable async GET request to the CrowdSec CTI API.
+
+    Implements an in-memory TTL cache (default 15 min, configurable via
+    CROWDSEC_CACHE_TTL) per PRD FR-2a / SKILLS.md §3.1. Cache entries are
+    keyed by the exact path (which includes the IP). Error responses (HTTP
+    4xx/5xx) are never cached.
+    """
+    # --- cache lookup ---
+    now = time.monotonic()
+    if path in _crowdsec_cache:
+        expiry, data = _crowdsec_cache[path]
+        if now < expiry:
+            logger.debug("CrowdSec cache HIT for %s (expires in %.0fs)", path, expiry - now)
+            return data
+        else:
+            logger.debug("CrowdSec cache EXPIRED for %s", path)
+            del _crowdsec_cache[path]
+
     headers = {
         "x-api-key": _get_crowdsec_api_key(),
         "accept": "application/json",
         "User-Agent": "blue-team-mcp/1.0.0 (TangerangKota-CSIRT)",
     }
     url = f"{CROWDSEC_BASE_URL}{path}"
-    client = await _get_http_client()
-    response = await client.get(url, headers=headers)
-    response.raise_for_status()
-    return response.json()
+
+    # circuit-breaker-wrapped HTTP call — cache hits skip this entirely
+    async def _do_crowdsec_http() -> dict[str, Any]:
+        client = await _get_http_client()
+        response = await client.get(url, headers=headers)
+        response.raise_for_status()
+        return response.json()
+
+    data = await _cb_crowdsec.call(_do_crowdsec_http)
+
+    # --- cache store ---
+    _crowdsec_cache[path] = (now + CROWDSEC_CACHE_TTL, data)
+    merged = len(_crowdsec_cache)
+    logger.debug("CrowdSec cache STORE for %s (TTL=%ds, cache_size=%d)", path, CROWDSEC_CACHE_TTL, merged)
+
+    return data
 
 def _format_crowdsec_markdown(ip: str, raw: dict[str, Any]) -> str:
     """Render CrowdSec CTI API response as a human-readable markdown report."""
@@ -1968,7 +2234,7 @@ class LogInput(BaseModel):
 
 @mcp.tool(
     name="blueteam_read_auth_log",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
 async def blueteam_read_auth_log(params: LogInput) -> str:
     """Read and optionally filter /var/log/auth.log for SSH, sudo, and PAM events.
@@ -1998,7 +2264,7 @@ async def blueteam_read_auth_log(params: LogInput) -> str:
 
 @mcp.tool(
     name="blueteam_read_syslog",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
 async def blueteam_read_syslog(params: LogInput) -> str:
     """Read /var/log/syslog or journalctl for general system events.
@@ -2034,7 +2300,7 @@ class WebLogInput(BaseModel):
 
 @mcp.tool(
     name="blueteam_read_web_log",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
 async def blueteam_read_web_log(params: WebLogInput) -> str:
     """Read nginx or Apache access/error logs. Great for spotting web attacks.
@@ -2082,7 +2348,7 @@ class JournalInput(BaseModel):
 
 @mcp.tool(
     name="blueteam_journalctl",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
 async def blueteam_journalctl(params: JournalInput) -> str:
     """Query systemd journal for any service. Useful for services without flat log files.
@@ -2109,7 +2375,7 @@ async def blueteam_journalctl(params: JournalInput) -> str:
 # NETWORK MONITORING
 @mcp.tool(
     name="blueteam_list_listening_ports",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
 async def blueteam_list_listening_ports() -> str:
     """List all TCP/UDP ports currently listening, with owning process.
@@ -2126,7 +2392,7 @@ async def blueteam_list_listening_ports() -> str:
 
 @mcp.tool(
     name="blueteam_list_connections",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
 async def blueteam_list_connections() -> str:
     """List all established TCP connections with remote IPs and local processes.
@@ -2147,11 +2413,12 @@ class CaptureInput(BaseModel):
     count: int = Field(default=100, description="Number of packets to capture", ge=1, le=5000)
     filter_expr: Optional[str] = Field(default=None, max_length=200, description="BPF filter expression, e.g. 'port 80', 'host 10.0.0.5'")
     output_file: Optional[str] = Field(default=None, max_length=256, description="Optional path to save .pcap file (must be under CAPTURE_OUTPUT_DIR)")
+    bypass_redaction: bool = Field(default=False, description="When true, return raw internal IPs without RFC1918 masking. Overrides BLUETEAM_REDACT_PII for this call only — use for internal audit investigations.")
 
 
 @mcp.tool(
     name="blueteam_capture_traffic",
-    annotations={"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True}
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True}
 )
 async def blueteam_capture_traffic(params: CaptureInput) -> str:
     """Capture live network traffic using tcpdump. Requires root or CAP_NET_RAW.
@@ -2193,6 +2460,11 @@ async def blueteam_capture_traffic(params: CaptureInput) -> str:
     result = r["stdout"] + r["stderr"]
     if output_path and r["returncode"] == 0:
         result = json.dumps({"status": "captured", "file": output_path, "packets": params.count})
+    else:
+        # Redact internal RFC1918 IPs from stdout text output (PRD FR-17, AGENTS.md §3.3).
+        # Connection metadata contains internal endpoint IPs; mask them without altering
+        # the packet-capture file itself (which is forensic evidence and always unredacted).
+        result = _redact_alert_data(result, bypass=params.bypass_redaction)
     _audit_log("blueteam_capture_traffic", {"interface": params.interface, "count": params.count}, result[:200])
     return result
 
@@ -2207,7 +2479,7 @@ class WazuhAgentsInput(BaseModel):
 
 @mcp.tool(
     name="blueteam_wazuh_agents",
-    annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
 async def blueteam_wazuh_agents(params: WazuhAgentsInput) -> str:
     """List Wazuh agents with cursor pagination — one page per call.
@@ -2258,7 +2530,7 @@ async def blueteam_wazuh_agents(params: WazuhAgentsInput) -> str:
 
 @mcp.tool(
     name="blueteam_wazuh_agents_summary",
-    annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
 async def blueteam_wazuh_agents_summary() -> str:
     """Get Wazuh agent count by status (active, disconnected, pending, never_connected).
@@ -2293,7 +2565,7 @@ class WazuhLogsInput(BaseModel):
 
 @mcp.tool(
     name="blueteam_wazuh_manager_logs",
-    annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
 async def blueteam_wazuh_manager_logs(params: WazuhLogsInput) -> str:
     """Fetch Wazuh manager logs with cursor pagination — one page per call.
@@ -2364,11 +2636,12 @@ class WazuhAlertsInput(BaseModel):
         default=None,
         description="Pagination cursor from previous response (next_cursor). Omit for first page.",
     )
+    bypass_redaction: bool = Field(default=False, description="When true, return raw alert data without PII masking. Overrides BLUETEAM_REDACT_PII for this call only — use for internal audit investigations.")
 
 
 @mcp.tool(
     name="blueteam_wazuh_alerts",
-    annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
 )
 async def blueteam_wazuh_alerts(params: WazuhAlertsInput) -> str:
     """Read Wazuh security alerts — local alerts.json first, auto-fallback to Indexer.
@@ -2444,7 +2717,7 @@ async def blueteam_wazuh_alerts(params: WazuhAlertsInput) -> str:
             "count": len(docs),
             "limit": params.limit,
             "next_cursor": next_cursor,
-            "alerts": docs,
+            "alerts": _redact_alert_data(docs, bypass=params.bypass_redaction),
         }, indent=2))
 
     # Decode cursor to find how many lines were already scanned
@@ -2611,6 +2884,7 @@ class WazuhIndexerSearchInput(BaseModel):
                     "Specify fields to reduce payload size or get additional fields "
                     "like data.file.path, data.username, full_log.",
     )
+    bypass_redaction: bool = Field(default=False, description="When true, return raw alert documents without PII masking. Overrides BLUETEAM_REDACT_PII for this call only — use for internal audit investigations.")
 
     @field_validator("fields")
     @classmethod
@@ -2709,7 +2983,7 @@ class WazuhIndexerSearchInput(BaseModel):
 
 @mcp.tool(
     name="blueteam_wazuh_indexer_search",
-    annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
 async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
     """Query Wazuh Indexer (OpenSearch) for alerts/events with cursor pagination.
@@ -2789,6 +3063,7 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
         meta["until"] = params.until
 
     if params.response_format == ResponseFormat.JSON:
+        meta["documents"] = _redact_alert_data(meta["documents"], bypass=params.bypass_redaction)
         return _truncate_if_needed(json.dumps(meta, indent=2))
 
     # Markdown: compact summary table
@@ -4388,6 +4663,7 @@ class IPInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     ip: str = Field(..., max_length=45, description="IPv4 or IPv6 address to look up")
     max_age_days: int = Field(default=90, description="Only return reports from the last N days", ge=1, le=365)
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN, description="Output format: 'markdown' (default) or 'json'")
 
     @field_validator("ip")
     @classmethod
@@ -4401,7 +4677,7 @@ class IPInput(BaseModel):
 
 @mcp.tool(
     name="blueteam_lookup_ip_abuseipdb",
-    annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
 async def blueteam_lookup_ip_abuseipdb(params: IPInput) -> str:
     """Check an IP address against AbuseIPDB for known malicious activity reports.
@@ -4410,9 +4686,10 @@ async def blueteam_lookup_ip_abuseipdb(params: IPInput) -> str:
     Args:
         params.ip: IP address to check
         params.max_age_days: Lookback window in days
+        params.response_format: 'markdown' (default) or 'json'
 
     Returns:
-        str: JSON with abuse confidence score, report count, country, ISP, usage type
+        str: Markdown report (default) or JSON with abuse confidence score, report count, etc.
     """
     if not ABUSEIPDB_API_KEY:
         return json.dumps({
@@ -4427,7 +4704,7 @@ async def blueteam_lookup_ip_abuseipdb(params: IPInput) -> str:
             params={"ipAddress": params.ip, "maxAgeInDays": str(params.max_age_days), "verbose": ""}
         )
         d = data.get("data", {})
-        return json.dumps({
+        result = {
             "ip": d.get("ipAddress"),
             "abuse_confidence_score": d.get("abuseConfidenceScore"),
             "total_reports": d.get("totalReports"),
@@ -4438,7 +4715,28 @@ async def blueteam_lookup_ip_abuseipdb(params: IPInput) -> str:
             "domain": d.get("domain"),
             "is_tor": d.get("isTor"),
             "is_vpn": d.get("isPublic"),
-        }, indent=2)
+        }
+        if params.response_format == ResponseFormat.JSON:
+            return json.dumps(result, indent=2)
+        # markdown
+        score = result["abuse_confidence_score"] or 0
+        severity = "🔴 Malicious" if score >= 80 else ("🟠 Suspicious" if score >= 40 else "🟢 Clean")
+        lines = [
+            f"# AbuseIPDB — {result['ip']}",
+            "",
+            f"| Field | Value |",
+            f"|-------|-------|",
+            f"| **Confidence Score** | {score}% — {severity} |",
+            f"| **Total Reports** | {result['total_reports']} |",
+            f"| **Last Reported** | {result['last_reported'] or 'N/A'} |",
+            f"| **Country** | {result['country'] or 'N/A'} |",
+            f"| **ISP** | {result['isp'] or 'N/A'} |",
+            f"| **Usage Type** | {result['usage_type'] or 'N/A'} |",
+            f"| **Domain** | {result['domain'] or 'N/A'} |",
+            f"| **Tor Exit Node** | {result['is_tor']} |",
+            f"| **VPN/Public** | {result['is_vpn']} |",
+        ]
+        return "\n".join(lines)
     except httpx.HTTPStatusError as e:
         return json.dumps({"error": f"AbuseIPDB API error: {e.response.status_code}", "detail": e.response.text})
     except Exception as e:
@@ -4450,6 +4748,7 @@ _HASH_RE = re.compile(r"^[a-fA-F0-9]{32,64}$")
 class HashInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     hash_value: str = Field(..., max_length=64, description="MD5 (32), SHA1 (40), or SHA256 (64) hash hex")
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN, description="Output format: 'markdown' (default) or 'json'")
 
     @field_validator("hash_value")
     @classmethod
@@ -4461,7 +4760,7 @@ class HashInput(BaseModel):
 
 @mcp.tool(
     name="blueteam_lookup_hash_virustotal",
-    annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
 async def blueteam_lookup_hash_virustotal(params: HashInput) -> str:
     """Check a file hash against VirusTotal to see if it's known malware.
@@ -4469,9 +4768,10 @@ async def blueteam_lookup_hash_virustotal(params: HashInput) -> str:
 
     Args:
         params.hash_value: MD5/SHA1/SHA256 of the file
+        params.response_format: 'markdown' (default) or 'json'
 
     Returns:
-        str: JSON with detection ratio, malware names, and scan date
+        str: Markdown report (default) or JSON with detection ratio, malware names
     """
     if not VIRUSTOTAL_API_KEY:
         return json.dumps({
@@ -4487,22 +4787,45 @@ async def blueteam_lookup_hash_virustotal(params: HashInput) -> str:
         attrs = data.get("data", {}).get("attributes", {})
         stats = attrs.get("last_analysis_stats", {})
         results = attrs.get("last_analysis_results", {})
-        # Only include detections (positives)
         detections = {
             engine: r["result"]
             for engine, r in results.items()
             if r.get("category") == "malicious"
         }
-        return json.dumps({
+        detection_ratio = f"{stats.get('malicious', 0)}/{sum(stats.values())}"
+        result = {
             "hash": params.hash_value,
             "name": attrs.get("meaningful_name"),
             "type": attrs.get("type_description"),
             "size_bytes": attrs.get("size"),
             "first_seen": attrs.get("first_submission_date"),
             "last_analysis_date": attrs.get("last_analysis_date"),
-            "detections": f"{stats.get('malicious', 0)}/{sum(stats.values())}",
+            "detections": detection_ratio,
             "malware_names": detections,
-        }, indent=2)
+        }
+        if params.response_format == ResponseFormat.JSON:
+            return json.dumps(result, indent=2)
+        # markdown
+        malicious = stats.get("malicious", 0)
+        severity = "🔴 Malicious" if malicious > 0 else "🟢 Clean"
+        lines = [
+            f"# VirusTotal Hash Lookup — `{params.hash_value}`",
+            "",
+            f"| Field | Value |",
+            f"|-------|-------|",
+            f"| **File Name** | {result['name'] or 'N/A'} |",
+            f"| **Type** | {result['type'] or 'N/A'} |",
+            f"| **Size** | {result['size_bytes'] or 'N/A'} bytes |",
+            f"| **Detections** | {detection_ratio} — {severity} |",
+            f"| **First Seen** | {result['first_seen'] or 'N/A'} |",
+            f"| **Last Analysis** | {result['last_analysis_date'] or 'N/A'} |",
+        ]
+        if detections:
+            lines.append("")
+            lines.append("## Detected Malware Names")
+            for engine, name in sorted(detections.items()):
+                lines.append(f"- **{engine}**: {name}")
+        return "\n".join(lines)
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             return json.dumps({"result": "Not found in VirusTotal — hash is unknown or clean"})
@@ -4514,6 +4837,7 @@ async def blueteam_lookup_hash_virustotal(params: HashInput) -> str:
 class DomainInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     domain: str = Field(..., max_length=253, description="Domain name to look up, e.g. 'example.com'")
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN, description="Output format: 'markdown' (default) or 'json'")
 
     @field_validator("domain")
     @classmethod
@@ -4527,16 +4851,17 @@ class DomainInput(BaseModel):
 
 @mcp.tool(
     name="blueteam_lookup_domain_virustotal",
-    annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
 async def blueteam_lookup_domain_virustotal(params: DomainInput) -> str:
     """Check a domain against VirusTotal for malicious reputation.
 
     Args:
         params.domain: Domain to check
+        params.response_format: 'markdown' (default) or 'json'
 
     Returns:
-        str: JSON with reputation score and detection details
+        str: Markdown report (default) or JSON with reputation score and detection details
     """
     if not VIRUSTOTAL_API_KEY:
         return json.dumps({"error": "VIRUSTOTAL_API_KEY not set. See blueteam_lookup_hash_virustotal for setup."})
@@ -4547,15 +4872,38 @@ async def blueteam_lookup_domain_virustotal(params: DomainInput) -> str:
         )
         attrs = data.get("data", {}).get("attributes", {})
         stats = attrs.get("last_analysis_stats", {})
-        return json.dumps({
+        detection_ratio = f"{stats.get('malicious', 0)}/{sum(stats.values())}"
+        result = {
             "domain": params.domain,
             "reputation": attrs.get("reputation"),
             "categories": attrs.get("categories", {}),
-            "detections": f"{stats.get('malicious', 0)}/{sum(stats.values())}",
+            "detections": detection_ratio,
             "registrar": attrs.get("registrar"),
             "creation_date": attrs.get("creation_date"),
-            "whois": attrs.get("whois", "")[:500],
-        }, indent=2)
+            "whois": (attrs.get("whois", "") or "")[:500],
+        }
+        if params.response_format == ResponseFormat.JSON:
+            return json.dumps(result, indent=2)
+        # markdown
+        malicious = stats.get("malicious", 0)
+        severity = "🔴 Malicious" if malicious > 0 else ("🟠 Suspicious" if (attrs.get("reputation") or 0) < 0 else "🟢 Clean")
+        lines = [
+            f"# VirusTotal Domain Lookup — `{params.domain}`",
+            "",
+            f"| Field | Value |",
+            f"|-------|-------|",
+            f"| **Reputation** | {result['reputation']} |",
+            f"| **Detections** | {detection_ratio} — {severity} |",
+            f"| **Registrar** | {result['registrar'] or 'N/A'} |",
+            f"| **Creation Date** | {result['creation_date'] or 'N/A'} |",
+        ]
+        cats = result.get("categories") or {}
+        if cats:
+            lines.append("")
+            lines.append("## Categories")
+            for engine, cat in sorted(cats.items()):
+                lines.append(f"- **{engine}**: {cat}")
+        return "\n".join(lines)
     except Exception as e:
         return json.dumps({"error": str(e)})
 
@@ -4564,7 +4912,7 @@ async def blueteam_lookup_domain_virustotal(params: DomainInput) -> str:
 # FAIL2BAN
 @mcp.tool(
     name="blueteam_fail2ban_status",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
 async def blueteam_fail2ban_status() -> str:
     """List all active fail2ban jails and their ban counts.
@@ -4585,7 +4933,7 @@ class JailInput(BaseModel):
 
 @mcp.tool(
     name="blueteam_fail2ban_jail_status",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
 async def blueteam_fail2ban_jail_status(params: JailInput) -> str:
     """Get detailed status of a specific fail2ban jail, including all banned IPs.
@@ -4619,7 +4967,7 @@ class UnbanInput(BaseModel):
 
 @mcp.tool(
     name="blueteam_fail2ban_unban",
-    annotations={"readOnlyHint": False, "destructiveHint": True}
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True}
 )
 async def blueteam_fail2ban_unban(params: UnbanInput) -> str:
     """Unban an IP address from a specific fail2ban jail.
@@ -4652,7 +5000,7 @@ class HashFileInput(BaseModel):
 
 @mcp.tool(
     name="blueteam_hash_file",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
 async def blueteam_hash_file(params: HashFileInput) -> str:
     """Compute a cryptographic hash of a file. Use to detect tampering.
@@ -4707,7 +5055,7 @@ async def blueteam_hash_file(params: HashFileInput) -> str:
 
 @mcp.tool(
     name="blueteam_find_suid_files",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
 async def blueteam_find_suid_files() -> str:
     """Find all SUID/SGID binaries on the system. Unexpected SUID files
@@ -4722,7 +5070,7 @@ async def blueteam_find_suid_files() -> str:
 
 @mcp.tool(
     name="blueteam_find_world_writable",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
 async def blueteam_find_world_writable() -> str:
     """Find world-writable files and directories (excluding /proc, /sys, /dev).
@@ -4751,7 +5099,7 @@ class RootkitInput(BaseModel):
 
 @mcp.tool(
     name="blueteam_rootkit_scan",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True}
 )
 async def blueteam_rootkit_scan(params: RootkitInput) -> str:
     """Run a rootkit scanner (rkhunter or chkrootkit) to check for known rootkits.
@@ -4780,7 +5128,7 @@ async def blueteam_rootkit_scan(params: RootkitInput) -> str:
 # SYSTEM HARDENING
 @mcp.tool(
     name="blueteam_lynis_audit",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}
 )
 async def blueteam_lynis_audit() -> str:
     """Run a Lynis system hardening audit. Checks hundreds of security controls
@@ -4797,7 +5145,7 @@ async def blueteam_lynis_audit() -> str:
 
 @mcp.tool(
     name="blueteam_check_updates",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True}
 )
 async def blueteam_check_updates() -> str:
     """Check for available security updates (Debian/Ubuntu: apt, RHEL: dnf/yum).
@@ -4819,7 +5167,7 @@ async def blueteam_check_updates() -> str:
 
 @mcp.tool(
     name="blueteam_check_open_firewall",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
 async def blueteam_check_open_firewall() -> str:
     """Show current firewall rules (iptables/nftables/ufw). Identifies
@@ -4844,7 +5192,7 @@ async def blueteam_check_open_firewall() -> str:
 # USER & SESSION MONITORING
 @mcp.tool(
     name="blueteam_who_is_logged_in",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
 async def blueteam_who_is_logged_in() -> str:
     """Show currently logged-in users, their source IPs, and session times.
@@ -4859,7 +5207,7 @@ async def blueteam_who_is_logged_in() -> str:
 
 @mcp.tool(
     name="blueteam_last_logins",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
 async def blueteam_last_logins() -> str:
     """Show recent login history from /var/log/wtmp. Includes successful
@@ -4874,7 +5222,7 @@ async def blueteam_last_logins() -> str:
 
 @mcp.tool(
     name="blueteam_failed_logins",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
 async def blueteam_failed_logins() -> str:
     """Show all failed login attempts from /var/log/btmp (lastb).
@@ -4894,7 +5242,7 @@ async def blueteam_failed_logins() -> str:
 
 @mcp.tool(
     name="blueteam_sudo_history",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
 async def blueteam_sudo_history() -> str:
     """Show recent sudo command usage from auth.log.
@@ -4910,7 +5258,7 @@ async def blueteam_sudo_history() -> str:
 
 @mcp.tool(
     name="blueteam_list_users",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
 async def blueteam_list_users() -> str:
     """List all local user accounts with UID, GID, home dir, and shell.
@@ -4954,7 +5302,7 @@ async def blueteam_list_users() -> str:
 
 @mcp.tool(
     name="blueteam_check_ssh_authorized_keys",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
 async def blueteam_check_ssh_authorized_keys() -> str:
     """List all SSH authorized_keys files across all user home directories.
@@ -4987,7 +5335,7 @@ async def blueteam_check_ssh_authorized_keys() -> str:
 # PROCESS & CRON ANALYSIS
 @mcp.tool(
     name="blueteam_list_processes",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
 async def blueteam_list_processes() -> str:
     """List all running processes with CPU, memory, PID, and command line.
@@ -5002,7 +5350,7 @@ async def blueteam_list_processes() -> str:
 
 @mcp.tool(
     name="blueteam_list_cron_jobs",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
 async def blueteam_list_cron_jobs() -> str:
     """List all system and user cron jobs. Attackers often add cron jobs
@@ -5040,7 +5388,7 @@ async def blueteam_list_cron_jobs() -> str:
 # SYSTEM HEALTH
 @mcp.tool(
     name="blueteam_system_health",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
 async def blueteam_system_health() -> str:
     """Get an overview of system health: uptime, disk, memory, CPU load.
@@ -5076,26 +5424,69 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--transport",
-        choices=["stdio", "sse", "streamable_http", "http"],
+        choices=["stdio", "streamable_http", "http"],
         default=os.environ.get("MCP_TRANSPORT", "stdio"),
         help="MCP transport to use (default: stdio, or env MCP_TRANSPORT).",
     )
     parser.add_argument(
         "--host",
         default=os.environ.get("MCP_HOST", "127.0.0.1"),
-        help="Bind host for sse/streamable_http transports (default: 127.0.0.1).",
+        help="Bind host for streamable_http transport (default: 127.0.0.1).",
     )
     parser.add_argument(
         "--port",
         type=int,
         default=int(os.environ.get("MCP_PORT", "8000")),
-        help="Port for sse/streamable_http transports (default: 8000).",
+        help="Port for streamable_http transport (default: 8000).",
     )
     return parser
 
 
+def _validate_configuration() -> None:
+    """Validate required secrets at startup and warn on missing optional credentials.
+
+    Per CLAUDE.md Hard Rule 8 and AGENTS.md §1.4 checklist item 2: fail fast
+    on missing configuration. All API keys are optional (the server starts
+    without them and tools that need them return actionable errors at call
+    time), but we emit clear WARNINGs so operators know which tools will be
+    unavailable before a request fails.
+    """
+    _check = lambda var, name, doc_url: (
+        logger.warning(
+            "%s is not set — %s tools will be unavailable. "
+            "Set the environment variable and restart. Docs: %s",
+            name, name.split("_")[0], doc_url
+        )
+        if not os.environ.get(var, "").strip()
+        else None
+    )
+
+    _check("CROWDSEC_API_KEY", "CROWDSEC_API_KEY",
+           "https://docs.crowdsec.net/docs/cti_api/getting_started")
+    _check("ABUSEIPDB_API_KEY", "ABUSEIPDB_API_KEY",
+           "https://docs.abuseipdb.com/")
+    _check("VIRUSTOTAL_API_KEY", "VIRUSTOTAL_API_KEY",
+           "https://docs.virustotal.com/reference/overview")
+    _check("NETRA_API_KEY", "NETRA_API_KEY",
+           "https://netra.tangerangkota.go.id/docs")
+
+    if not os.environ.get("WAZUH_API_URL", "").strip():
+        logger.warning(
+            "WAZUH_API_URL is not set — Wazuh Manager API tools "
+            "(blueteam_wazuh_agents, blueteam_wazuh_manager_logs, etc.) "
+            "will be unavailable."
+        )
+    if not os.environ.get("WAZUH_INDEXER_URL", "").strip():
+        logger.warning(
+            "WAZUH_INDEXER_URL is not set — Wazuh Indexer/OpenSearch tools "
+            "(blueteam_wazuh_indexer_search, wazuh_email_lookup, etc.) "
+            "will be unavailable."
+        )
+
+
 def main() -> None:
     """Start the MCP server on the selected transport."""
+    _validate_configuration()
     args = _build_arg_parser().parse_args()
 
     if args.transport == "stdio":
@@ -5108,8 +5499,8 @@ def main() -> None:
     mcp.settings.port = args.port
 
     # Update transport security to allow the actual host the client connects to.
-    # FastMCP auto-enables DNS rebinding protection for localhost only - if we're
-    # binding to a different IP (e.g. 172.16.9.125 or 0.0.0.0), we must add it
+    # FastMCP auto-enables DNS rebinding protection for localhost only
+    # binding to a different IP (e.g. 172.16.9.125 or 0.0.0.0) must add it
     # to the allowed_hosts so the Host header validation passes (MCP spec security).
     if args.host not in ("127.0.0.1", "localhost", "::1"):
         transport_security = mcp.settings.transport_security
@@ -5128,12 +5519,7 @@ def main() -> None:
             f"http://{args.host}:*",
         ])
 
-    if args.transport == "sse":
-        logger.info(
-            "Starting blue_team_mcp via SSE transport on %s:%s", args.host, args.port
-        )
-        mcp.run(transport="sse")
-    elif args.transport in ("streamable_http", "http"):
+    if args.transport in ("streamable_http", "http"):
         logger.info(
             "Starting blue_team_mcp via Streamable HTTP transport on %s:%s",
             args.host,

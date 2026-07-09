@@ -11,18 +11,17 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
 
 ## Architecture
 
-`blue_team_server.py` is a **single, unified MCP server** with 43 tools spanning host forensics, Wazuh SIEM, and multi-source threat intelligence. It supports three transports:
+`blue_team_server.py` is a **single, unified MCP server** with 43 tools spanning host forensics, Wazuh SIEM, and multi-source threat intelligence. It supports two transports:
 
 | Transport | Use case | MCP client connection |
 |---|---|---|
 | `stdio` | Local subprocess or SSH pipe | Direct (Claude Desktop stdio) |
-| `sse` | Legacy remote HTTP service | `http://<host>:<port>/sse` |
-| `streamable_http` | Modern remote HTTP service (**recommended**) | `http://<host>:<port>/mcp` |
+| `streamable_http` | Remote HTTP service | `http://<host>:<port>/mcp` |
 
 ```
                           ┌──────────────────────────────────┐
                           │     blue_team_server.py          │
-                          │     43 tools · 1 file · 3 transports  │
+                          │     43 tools · 1 file · 2 transports  │
                           │                                  │
                           │  ┌────────────────────────────┐  │
                           │  │ Host Forensics (26 tools)  │  │
@@ -54,9 +53,9 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
                           │  │ • Netra multi-source        │  │
                           │  └────────────────────────────┘  │
                           └──────────────────────────────────┘
-                            │          │           │
-                       stdio        SSE    streamable_http
-                      (default)   :8000/sse   :8000/mcp
+                            │              │
+                       stdio      streamable_http
+                      (default)      :8000/mcp
 ```
 
 ### Two deployment modes
@@ -71,26 +70,24 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
                                                └─────────────────────────┘
 ```
 
-**Mode 2 — Remote service (SSE / Streamable HTTP):** The server runs as a persistent HTTP service. Any MCP client connects over the network — no SSH required.
+**Mode 2 — Remote service (Streamable HTTP):** The server runs as a persistent HTTP service. Any MCP client connects over the network — no SSH required.
 
 ```
-┌─────────────────────┐     HTTP (SSE or       ┌─────────────────────────┐
-│   Any MCP Client    │     Streamable HTTP)    │    Defender Host        │
-│   (Claude Desktop,  │ ────────────────────── │   systemd service:      │
-│    custom client)   │     http://<host>:8000    │   blue_team_server.py   │
+┌─────────────────────┐     Streamable HTTP     ┌─────────────────────────┐
+│   Any MCP Client    │ ────────────────────── │    Defender Host        │
+│   (Claude Desktop,  │     http://<host>:8000    │   systemd service:      │
+│    custom client)   │                        │   blue_team_server.py   │
 └─────────────────────┘                        │   --transport http      │
                                                └─────────────────────────┘
 ```
 
-### Standalone files (optional backward-compat)
+### Standalone files (archived)
 
-The CrowdSec and GreyNoise tools also ship as separate files for users who prefer modular deployment. **All standalone servers share the same performance architecture** as the main server (shared `httpx.AsyncClient` with connection pooling, configurable timeouts and character limits).
+The CrowdSec and GreyNoise standalone servers (`blue_team_server_crowdsec.py`, `blue_team_server_greynoise.py`) have been moved to `archive/`. Both tools are fully integrated into the unified server.
 
 | File | Tools | When to use |
 |---|---|---|
-| `blue_team_server.py` | **All 43 tools** | **Recommended** — full capabilities, cursor pagination, token caching |
-| `blue_team_server_crowdsec.py` | 2 CrowdSec CTI tools | Isolated CrowdSec-only server with parallel bulk lookups |
-| `blue_team_server_greynoise.py` | 1 GreyNoise Community tool | Isolated GreyNoise-only server |
+| `blue_team_server.py` | **All 43 tools** | **Recommended** — full capabilities, circuit breaker, credential stripping, PII redaction |
 
 ---
 
@@ -182,8 +179,8 @@ Four dedicated `httpx.AsyncClient` instances, one per SSL trust domain:
 |---|---|---|
 | `_get_http_client()` | `True` (public CA) | AbuseIPDB, VirusTotal, CrowdSec CTI, GreyNoise |
 | `_get_netra_http_client()` | `NETRA_VERIFY_SSL` (default `false`) | Netra Threat Intelligence (staging-gitlab:8013) |
-| `_get_wazuh_client()` | `WAZUH_API_VERIFY_SSL` (default `false`) | Wazuh Manager API (port 55000) |
-| `_get_indexer_client()` | `WAZUH_INDEXER_VERIFY_SSL` (default `false`) | OpenSearch (port 9200) |
+| `_get_wazuh_client()` | `WAZUH_API_VERIFY_SSL` (default `true`) | Wazuh Manager API (port 55000) |
+| `_get_indexer_client()` | `WAZUH_INDEXER_VERIFY_SSL` (default `true`) | OpenSearch (port 9200) |
 
 Each client pools connections independently (20 keepalive / 100 max for public APIs; 5 / 20 for Netra staging; 10 / 50 for Wazuh and Indexer). SSL verification is set at client creation — no per-request `verify=` keyword arguments.
 
@@ -195,15 +192,21 @@ Cached for **300 seconds (5 minutes)** with automatic cache clearance on authent
 
 `_run_async()` wraps synchronous subprocess calls in `asyncio.to_thread()`, preventing 30 tools from blocking the event loop under concurrent load.
 
-### CrowdSec Server (`blue_team_server_crowdsec.py`) — Point-Lookup API
+### CrowdSec CTI — In-Memory TTL Cache + Bulk Lookups
 
-This server operates exclusively as a **stateless point-lookup API**. It queries the CrowdSec CTI Smoke endpoint (`GET /v2/smoke/{ip}`) for single-IP reputation data. It does **not** implement cursor pagination, `search_after`, or any offset mechanism — by design, not oversight. There is no search index, no result window, and no deep-paging concern.
+CrowdSec IP reputation is integrated directly into the unified server (`blue_team_server.py`). The standalone `blue_team_server_crowdsec.py` and `blue_team_server_greynoise.py` files have been archived — all functionality is available through the main server.
 
-#### Connection Pooling
+#### In-Memory Cache (CrowdSec CTI Only)
 
-Shared `httpx.AsyncClient` with **10 keepalive**, **50 max connections**, SSL verification controlled by `BLUETEAM_VERIFY_SSL`.
+Per `SKILLS.md` §3.1, CrowdSec CTI responses are cached in-process with configurable TTL:
 
-#### Parallel Bulk IP Lookups
+- **Default TTL**: 900 seconds (15 minutes) — configurable via `CROWDSEC_CACHE_TTL`
+- **Cache scope**: per-IP, per-path — identical requests hit the cache; different IPs do not
+- **Error exclusion**: HTTP 4xx/5xx responses are NEVER cached (structurally excluded — `raise_for_status()` throws before the cache-store point)
+- **Cache hit**: returns stored data immediately with no HTTP call
+- **Cache expired**: stale entry is deleted, fresh HTTP call is made, result is re-cached
+
+#### Parallel Bulk IP Lookups (CrowdSec Only)
 
 `crowdsec_ip_reputation_bulk` executes up to 10 IP lookups concurrently via `asyncio.gather()` bounded by an `asyncio.Semaphore`:
 
@@ -211,13 +214,59 @@ Shared `httpx.AsyncClient` with **10 keepalive**, **50 max connections**, SSL ve
 - **Error isolation**: per-IP failure does not affect sibling lookups
 - **Latency**: ~5× speedup vs serial iteration
 
-### GreyNoise Server (`blue_team_server_greynoise.py`) — Point-Lookup API
+### Circuit Breaker (External API Resilience)
 
-This server also operates as a **stateless point-lookup API**. It queries GreyNoise Community (`GET /v3/community/{ip}`) for single-IP scanner/RIOT classification. No pagination, no cursors, no offset logic.
+Ported from the Wazuh-MCP-Server resilience pattern. A three-state circuit breaker prevents cascading failures when upstream APIs are unreachable — the LLM sees actionable errors instead of retrying indefinitely against a dead backend.
 
-#### Connection Pooling
+**State machine:**
+```
+CLOSED ──5 consecutive failures──▶ OPEN ──60s timeout──▶ HALF_OPEN
+  ▲                                 ▲                      │
+  │                                 │                 probe fails?
+  │                                 └──────────────────────┘ yes
+  │                                                        │
+  └────────── probe succeeds ──────────────────────────────┘ no
+```
 
-Shared `httpx.AsyncClient` with **10 keepalive**, **50 max connections**, SSL verification controlled by `BLUETEAM_VERIFY_SSL`.
+**Per-service breakers:**
+
+| Breaker | Guards | Threshold | Recovery | Applied at |
+|---------|--------|-----------|----------|------------|
+| `_cb_crowdsec` | CrowdSec CTI API (`cti.api.crowdsec.net`) | 5 failures | 60s | `_crowdsec_request()` HTTP GET |
+| `_cb_wazuh_indexer` | Wazuh Indexer / OpenSearch | 5 failures | 60s | `_wazuh_indexer_search()` HTTP POST |
+
+**Key properties:**
+- **Async-safe**: `asyncio.Lock` protects state transitions under concurrent load
+- **Cache-aware**: CrowdSec cache hits skip the circuit breaker entirely (no API call → no failure counted)
+- **Self-healing**: HALF_OPEN probe on success → CLOSED with all counters reset
+- **Actionable errors**: `CircuitBreakerOpenError` includes remaining timeout so the LLM sees a retry hint
+
+### Credential & Secret Stripping (Output Sanitization)
+
+Ported from the Wazuh-MCP-Server output sanitization pattern. Before any Wazuh alert or traffic capture data reaches the LLM context, `_redact_alert_data()` strips credentials, API keys, and secret material from `full_log` and other text fields.
+
+**Applied automatically** to all output from `blueteam_wazuh_alerts`, `blueteam_wazuh_indexer_search`, and `blueteam_capture_traffic`. Controlled by `BLUETEAM_REDACT_PII` (default: `true`) with a per-call `bypass_redaction` parameter for audit investigations.
+
+**Stripping rules (15 regex patterns, applied before PII masking):**
+
+| Category | Patterns detected | Replacement |
+|----------|------------------|-------------|
+| Auth headers | `Authorization: Bearer <token>`, `Authorization: Basic <creds>` | `<BEARER_REDACTED>`, `<BASIC_REDACTED>` |
+| API keys | `x-api-key: <key>`, `api_key=<value>` | `<API_KEY_REDACTED>` |
+| JWT tokens | 3-segment base64url tokens starting with `eyJ` | `<JWT_REDACTED>` |
+| Private keys | PEM blocks (`-----BEGIN ... PRIVATE KEY-----`) | `<PRIVATE_KEY_REDACTED>` |
+| Cloud keys | AWS (`AKIA...`), Google (`AIza...`) | `<AWS_ACCESS_KEY_REDACTED>`, `<GOOGLE_API_KEY_REDACTED>` |
+| Payment keys | Stripe (`sk_live_...`, `sk_test_...`) | `<STRIPE_KEY_REDACTED>` |
+| VCS tokens | GitHub (`ghp_...`, `gho_...`, etc.), GitLab (`glpat-...`) | `<GITHUB_TOKEN_REDACTED>`, `<GITLAB_TOKEN_REDACTED>` |
+| AI API keys | Anthropic (`sk-ant-...`), OpenAI (`sk-proj-...`) | `<AI_API_KEY_REDACTED>` |
+| Messaging | Slack (`xoxb-...`, `xoxp-...`, etc.) | `<SLACK_TOKEN_REDACTED>` |
+| Passwords | `password=`, `passwd=`, `pwd=`, `secret=` params | `password=<PASSWORD_REDACTED>` |
+
+The credential stripping runs **before** PII masking (email/RFC1918 IP redaction) inside `_redact_alert_data()`. Both layers are independently controlled by the same `BLUETEAM_REDACT_PII` guard. The original alert data on disk is never modified.
+
+### GreyNoise Community — Free, No API Key
+
+GreyNoise context lookups (`greynoise_ip_context`) are integrated into the unified server and require no authentication. The Community API classifies IPs as internet scanners (noise), business services (RIOT), or both — with interpretation guidance in the markdown output.
 
 ---
 
