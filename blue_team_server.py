@@ -2807,7 +2807,7 @@ class WazuhIndexerSearchInput(BaseModel):
         description="Agent name to filter (e.g. 'HYDRA-DC'). Leave empty to search all agents.",
     )
     index_type: str = Field(default="alerts", validation_alias=AliasChoices("index", "type"), description="Index: alerts, events, or vulnerabilities")
-    limit: int = Field(default=500, validation_alias=AliasChoices("size", "count", "max"), description="Max docs to return per page", ge=1, le=10000)
+    limit: int = Field(default=500, validation_alias=AliasChoices("size", "count", "max"), description="Max docs to return per page (0 = count-only, no documents)", ge=0, le=10000)
     response_format: ResponseFormat = Field(
         default=ResponseFormat.JSON,
         validation_alias=AliasChoices("format", "output"),
