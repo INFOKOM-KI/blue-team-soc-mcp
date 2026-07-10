@@ -178,7 +178,7 @@ Four dedicated `httpx.AsyncClient` instances, one per SSL trust domain:
 | Client | `verify` | Endpoints |
 |---|---|---|
 | `_get_http_client()` | `True` (public CA) | AbuseIPDB, VirusTotal, CrowdSec CTI, GreyNoise |
-| `_get_netra_http_client()` | `NETRA_VERIFY_SSL` (default `false`) | Netra Threat Intelligence (staging-gitlab:8013) |
+| `_get_netra_http_client()` | `NETRA_VERIFY_SSL` (default `false`) | Netra Threat Intelligence (<your_CTI>:8013) |
 | `_get_wazuh_client()` | `WAZUH_API_VERIFY_SSL` (default `true`) | Wazuh Manager API (port 55000) |
 | `_get_indexer_client()` | `WAZUH_INDEXER_VERIFY_SSL` (default `true`) | OpenSearch (port 9200) |
 
