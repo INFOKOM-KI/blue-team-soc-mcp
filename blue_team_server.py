@@ -4,7 +4,7 @@ Blue Team MCP Server
 A defensive security MCP server for Claude Desktop and Compatible with any MCP Host. 
 Mirroring the Kali mcp-kali-server setup but for blue team / defenders / SOC.
 
-MAESTRO Framework: Aligned with CSA MAESTRO (Layer 3 Agent Frameworks, Layer 5 Observability, Layer 6 Security & Compliance).
+MAESTRO Framework (Currently under Development): Aligned with CSA MAESTRO (Layer 3 Agent Frameworks, Layer 5 Observability, Layer 6 Security & Compliance).
 
 Tools included:
   - Log analysis (auth, syslog, journald, nginx/apache)
@@ -64,7 +64,6 @@ logging.basicConfig(
 logger = logging.getLogger("blue_team_mcp")
 
 # Server init
-
 mcp = FastMCP("blue_team_mcp")
 
 # Configuration (set via environment variables)
@@ -101,7 +100,7 @@ WAZUH_INDEXER_VERIFY_SSL = os.environ.get("WAZUH_INDEXER_VERIFY_SSL", "true").lo
 if not WAZUH_INDEXER_VERIFY_SSL:
     logger.warning("WAZUH_INDEXER_VERIFY_SSL is disabled — TLS certificate verification is OFF for Wazuh Indexer/OpenSearch connections")
 
-# CrowdSec CTI (optional — set CROWDSEC_API_KEY to enable the crowdsec_ip_reputation tools)
+# CrowdSec CTI (optional - set CROWDSEC_API_KEY to enable the crowdsec_ip_reputation tools)
 CROWDSEC_BASE_URL = "https://cti.api.crowdsec.net"
 CROWDSEC_API_KEY_ENV = "CROWDSEC_API_KEY"
 CROWDSEC_CACHE_TTL = int(os.environ.get("CROWDSEC_CACHE_TTL", "900"))  # seconds, default 15 min
@@ -296,8 +295,8 @@ def _handle_api_error(e: Exception, context: str = "") -> str:
     if isinstance(e, httpx.HTTPStatusError):
         status = e.response.status_code
         if status == 400:
-            return f"{prefix}Error: Bad request (400) — the API rejected the parameters. "
-            "Try a smaller limit (e.g. limit=50) or a different filter."
+            return (f"{prefix}Error: Bad request (400) — the API rejected the parameters. "
+                    "Try a smaller limit (e.g. limit=50) or a different filter.")
         if status == 401:
             return f"{prefix}Error: Invalid or missing API key (401). Check your environment variables."
         if status == 404:
@@ -309,6 +308,8 @@ def _handle_api_error(e: Exception, context: str = "") -> str:
         return f"{prefix}Error: API request failed with status {status}."
     if isinstance(e, httpx.TimeoutException):
         return f"{prefix}Error: Request timed out after {HTTP_TIMEOUT}s. Try again."
+    if isinstance(e, CircuitBreakerOpenError):
+        return f"{prefix}Error: Circuit breaker is open — {e}"
     if isinstance(e, RuntimeError):
         return f"{prefix}Error: {e}"
     logger.exception("Unexpected error in %s", context)
@@ -325,6 +326,11 @@ def _truncate_if_needed(text: str) -> str:
         "Use a smaller limit per page (e.g. limit=50) or iterate with the next_cursor "
         "to process results incrementally.]"
     )
+
+
+def _escape_md_table(value: str) -> str:
+    """Escape pipe and newline characters for safe markdown table rendering."""
+    return value.replace("|", "\\|").replace("\n", " ").replace("\r", "")
 
 
 # Circuit Breaker - prevents cascading failures when upstream APIs are down.
@@ -504,7 +510,7 @@ def _redact_alert_data(data: Any, *, bypass: bool = False) -> Any:
         return data
 
     if isinstance(data, str):
-        # --- credential / secret stripping (applied first, before PII redaction) ---
+        # Credential / secret stripping (applied first, before PII redaction)
         # Strip bearer tokens, API keys, JWTs, private keys, and password params
         # from Wazuh full_log fields so they never reach the LLM context.
         for pattern, replacement in _CREDENTIAL_STRIP_RULES:
@@ -877,7 +883,7 @@ async def _wazuh_indexer_search(
     }
     # search_after must ONLY be present when a non-empty cursor array is supplied.
     # Omitting it on the first page avoids a malformed-query error.
-    if search_after:
+    if search_after is not None:
         body["search_after"] = search_after
 
     async def _do_indexer_http() -> dict[str, Any]:
@@ -965,13 +971,13 @@ async def _wazuh_indexer_email_search(
             }
         })
 
-    query = {
-        "bool": {
-            "must": must_clauses,
-            "should": should_clauses,
-            "minimum_should_match": 1,
-        }
+    bool_part: dict[str, list] = {
+        "should": should_clauses,
+        "minimum_should_match": 1,
     }
+    if must_clauses:
+        bool_part["must"] = must_clauses
+    query = {"bool": bool_part}
 
     body: dict = {
         "size": min(size, _WAZUH_INDEXER_MAX_SIZE),
@@ -990,7 +996,7 @@ async def _wazuh_indexer_email_search(
             "agent.name",
         ],
     }
-    if search_after:
+    if search_after is not None:
         body["search_after"] = search_after
 
     try:
@@ -1070,13 +1076,13 @@ async def _wazuh_indexer_domain_search(
             }
         })
 
-    query = {
-        "bool": {
-            "must": must_clauses,
-            "should": should_clauses,
-            "minimum_should_match": 1,
-        }
+    bool_part: dict[str, list] = {
+        "should": should_clauses,
+        "minimum_should_match": 1,
     }
+    if must_clauses:
+        bool_part["must"] = must_clauses
+    query = {"bool": bool_part}
 
     _source_fields: list[str] = [
         "data.srcip",
@@ -1098,7 +1104,7 @@ async def _wazuh_indexer_domain_search(
         "query": query,
         "_source": _source_fields,
     }
-    if search_after:
+    if search_after is not None:
         body["search_after"] = search_after
 
     try:
@@ -1184,13 +1190,13 @@ async def _wazuh_indexer_multi_email_search(
             }
         })
 
-    query = {
-        "bool": {
-            "must": must_clauses,
-            "should": should_clauses,
-            "minimum_should_match": 1,
-        }
+    bool_part: dict[str, list] = {
+        "should": should_clauses,
+        "minimum_should_match": 1,
     }
+    if must_clauses:
+        bool_part["must"] = must_clauses
+    query = {"bool": bool_part}
 
     body: dict = {
         "size": min(size, _WAZUH_INDEXER_MAX_SIZE),
@@ -1207,7 +1213,7 @@ async def _wazuh_indexer_multi_email_search(
             "agent.name",
         ],
     }
-    if search_after:
+    if search_after is not None:
         body["search_after"] = search_after
 
     try:
@@ -1380,7 +1386,7 @@ async def _crowdsec_request(path: str) -> dict[str, Any]:
     keyed by the exact path (which includes the IP). Error responses (HTTP
     4xx/5xx) are never cached.
     """
-    # --- cache lookup ---
+    #cache lookup
     now = time.monotonic()
     if path in _crowdsec_cache:
         expiry, data = _crowdsec_cache[path]
@@ -1407,7 +1413,7 @@ async def _crowdsec_request(path: str) -> dict[str, Any]:
 
     data = await _cb_crowdsec.call(_do_crowdsec_http)
 
-    # --- cache store ---
+    #Cache store
     _crowdsec_cache[path] = (now + CROWDSEC_CACHE_TTL, data)
     merged = len(_crowdsec_cache)
     logger.debug("CrowdSec cache STORE for %s (TTL=%ds, cache_size=%d)", path, CROWDSEC_CACHE_TTL, merged)
@@ -2885,6 +2891,15 @@ class WazuhIndexerSearchInput(BaseModel):
                     "like data.file.path, data.username, full_log.",
     )
     bypass_redaction: bool = Field(default=False, description="When true, return raw alert documents without PII masking. Overrides BLUETEAM_REDACT_PII for this call only — use for internal audit investigations.")
+    max_scanned: Optional[int] = Field(
+        default=None,
+        ge=1000,
+        le=500000,
+        description="When set, auto-paginate through all matching alerts up to this limit. "
+                    "Returns an aggregated summary (total counts, top IPs, top rules) "
+                    "across ALL scanned pages. When None (default), returns a single "
+                    "page with next_cursor for manual pagination.",
+    )
 
     @field_validator("fields")
     @classmethod
@@ -2981,6 +2996,180 @@ class WazuhIndexerSearchInput(BaseModel):
                 raise ValueError("srcip must be a valid IP address or CIDR range")
         return v
 
+async def _wazuh_indexer_search_full_scan(
+    params: "WazuhIndexerSearchInput",
+    index_pattern: str,
+    initial_search_after: Optional[list],
+) -> str:
+    """Auto-paginate through all matching indexer documents and return a summary.
+
+    Loops internally with ``search_after``, scanning up to ``params.max_scanned``
+    documents across all pages.  Accumulates global counters for source IPs and
+    rule descriptions.  Returns a summary with coverage metadata.
+    """
+    internal_page_size = 1000
+    total_scanned = 0
+    global_total_val: Optional[int] = None
+    global_total_relation = "eq"
+    global_srcip_counter: Counter[str] = Counter()
+    global_rule_counter: Counter[str] = Counter()
+    sample_docs: list[dict] = []
+    search_after = initial_search_after
+    exhausted = False
+    pages = 0
+
+    while total_scanned < params.max_scanned:
+        remaining = params.max_scanned - total_scanned
+        page_size = min(internal_page_size, remaining)
+        data = await _wazuh_indexer_search(
+            index_pattern=index_pattern,
+            agent_name=params.agent_name,
+            size=page_size,
+            search_after=search_after,
+            srcip=params.srcip,
+            since=params.since,
+            until=params.until,
+            keyword=params.keyword,
+            srcips=params.srcips,
+            fields=params.fields,
+            rule_groups=params.rule_groups,
+        )
+        if isinstance(data.get("error"), str):
+            return json.dumps(data, indent=2)
+
+        hits = data.get("hits", {})
+        total = hits.get("total", {})
+        if global_total_val is None:
+            global_total_val = total.get("value", 0) if isinstance(total, dict) else total
+            global_total_relation = total.get("relation", "eq") if isinstance(total, dict) else "eq"
+
+        hit_list = hits.get("hits", [])
+        docs = [h.get("_source", h) for h in hit_list]
+        pages += 1
+
+        if not docs:
+            exhausted = True
+            break
+
+        # Keep first 50 docs from page 1 as a sample
+        if not sample_docs and pages == 1:
+            sample_docs = docs[:50]
+
+        # Aggregate counters across all docs
+        for doc in docs:
+            ip = (doc.get("data") or {}).get("srcip") or doc.get("srcip", "")
+            if ip:
+                global_srcip_counter[ip] += 1
+            rule = doc.get("rule") or {}
+            rule_id = rule.get("id", "")
+            rule_desc = rule.get("description", "")
+            if rule_id:
+                global_rule_counter[f"{rule_id}: {rule_desc}"] += 1
+
+        total_scanned += len(docs)
+
+        last_sort = hit_list[-1].get("sort")
+        if not last_sort or len(docs) < page_size:
+            exhausted = True
+            break
+        search_after = last_sort
+
+    coverage = "complete" if exhausted else "partial"
+    total_display = (
+        f"{global_total_val or 0:,}"
+        + ("+" if global_total_relation == "gte" else "")
+    )
+
+    # Apply redaction to sample docs
+    sample_docs = _redact_alert_data(sample_docs, bypass=params.bypass_redaction)
+
+    if params.response_format == ResponseFormat.JSON:
+        output: dict = {
+            "mode": "full_scan",
+            "index": params.index_type,
+            "total": {"value": global_total_val, "relation": global_total_relation},
+            "scanned": total_scanned,
+            "pages": pages,
+            "coverage": coverage,
+            "timezone": "UTC",
+            "aggregations": {
+                "top_srcips": [
+                    {"ip": ip, "count": c}
+                    for ip, c in global_srcip_counter.most_common(30)
+                ],
+                "top_rules": [
+                    {"rule": r, "count": c}
+                    for r, c in global_rule_counter.most_common(20)
+                ],
+            },
+            "sample_documents": sample_docs,
+        }
+        if params.since:
+            output["since"] = params.since
+        if params.until:
+            output["until"] = params.until
+        return _truncate_if_needed(json.dumps(output, indent=2, ensure_ascii=False))
+
+    #Markdown output
+    lines: list[str] = [
+        f"# Wazuh Indexer Search (Full Scan)",
+        "",
+        f"**Total matches in indexer**: {total_display}",
+        f"**Scanned**: {total_scanned:,} docs across {pages} page(s)",
+        f"**Coverage**: {coverage} "
+        + ("(all matching alerts retrieved)" if coverage == "complete"
+           else f"(hit max_scanned={params.max_scanned:,} limit)"),
+        f"**Index**: {params.index_type} | **Timezone**: UTC",
+    ]
+    if params.since or params.until:
+        window_str = f"{params.since or '...'} → {params.until or '...'}"
+        lines.append(f"**Window**: {window_str}")
+    lines.append("")
+
+    if global_srcip_counter:
+        lines.append("## Top Source IPs (global)")
+        lines.append("| IP | Alert Count |")
+        lines.append("|----|-------------|")
+        for ip, c in global_srcip_counter.most_common(20):
+            lines.append(f"| {_escape_md_table(ip)} | {c:,} |")
+        lines.append("")
+
+    if global_rule_counter:
+        lines.append("## Top Rules (global)")
+        lines.append("| Rule | Count |")
+        lines.append("|------|-------|")
+        for r, c in global_rule_counter.most_common(15):
+            lines.append(f"| {_escape_md_table(r)} | {c:,} |")
+        lines.append("")
+
+    if sample_docs:
+        lines.append("## Sample Alerts (first 20 from page 1)")
+        lines.append("")
+        lines.append("| # | Timestamp (UTC) | Agent | Rule | Level | Src IP | Description |")
+        lines.append("|---|-----------------|-------|------|-------|--------|-------------|")
+        for i, d in enumerate(sample_docs[:20], 1):
+            ts = str(d.get("@timestamp", ""))[:19]
+            agent = str((d.get("agent") or {}).get("name", ""))[:25]
+            rule_id = str((d.get("rule") or {}).get("id", ""))
+            level = str((d.get("rule") or {}).get("level", ""))
+            srcip = str(
+                (d.get("data") or {}).get("srcip")
+                or d.get("srcip", "")
+            )[:18]
+            desc = str((d.get("rule") or {}).get("description", ""))[:60]
+            lines.append(f"| {i} | {_escape_md_table(ts)} | {_escape_md_table(agent)} | {_escape_md_table(rule_id)} | {_escape_md_table(level)} | {_escape_md_table(srcip)} | {_escape_md_table(desc)} |")
+        lines.append("")
+
+    if coverage != "complete":
+        lines.append(
+            f"\n**Note:** Results are partial - scan hit the "
+            f"`max_scanned={params.max_scanned:,}` limit. "
+            f"Increase `max_scanned` (up to 500,000) for full coverage."
+        )
+
+    return _truncate_if_needed("\n".join(lines))
+
+
 @mcp.tool(
     name="blueteam_wazuh_indexer_search",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
@@ -2990,8 +3179,14 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
     Supports filtering by agent_name, srcip/s (source IP), keyword, or all simultaneously.
     Requires WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD (port 9200).
 
-    Returns one page per call. Pass the returned next_cursor back as the cursor
-    parameter to fetch the next page. next_cursor is null when all results are exhausted.
+    **Two modes**:
+
+    - **Single-page** (default, ``max_scanned`` not set): Returns one page per call.
+      Pass the returned ``next_cursor`` back as the ``cursor`` parameter to fetch
+      the next page. ``next_cursor`` is null when all results are exhausted.
+    - **Full-scan** (set ``max_scanned`` to an integer ≥1000): Auto-paginates
+      internally across ALL matching pages and returns an aggregated summary
+      (global top IPs, top rules) with a sample of documents.
 
     Args:
         params.agent_name: Optional agent name filter (e.g. HYDRA-DC)
@@ -3002,8 +3197,9 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
         params.since: Optional ISO 8601 start time in UTC (e.g. '2026-07-05T18:30:00Z')
         params.until: Optional ISO 8601 end time in UTC (e.g. '2026-07-05T19:00:00Z')
         params.index_type: alerts (default), events, or vulnerabilities
-        params.limit: Max documents per page (default 100, max 10000)
+        params.limit: Max documents per page in single-page mode (default 100, max 10000)
         params.cursor: next_cursor from previous response (omit for first page)
+        params.max_scanned: When set, run full-scan auto-pagination (see above)
 
     Returns:
         str: In 'json' mode (default): JSON with documents, total, size, count, next_cursor,
@@ -3019,6 +3215,12 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
         decoded = _decode_cursor(params.cursor)
         if decoded:
             search_after = decoded.get("search_after")
+
+    # Auto-pagination mode — scan ALL pages internally, return aggregate
+    if params.max_scanned is not None:
+        return await _wazuh_indexer_search_full_scan(
+            params, index_pattern, search_after
+        )
 
     data = await _wazuh_indexer_search(
         index_pattern=index_pattern,
@@ -3091,7 +3293,7 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
             or d.get("srcip", "")
         )[:18]
         desc = str((d.get("rule") or {}).get("description", ""))[:60]
-        lines.append(f"| {i} | {ts} | {agent} | {rule_id} | {level} | {srcip} | {desc} |")
+        lines.append(f"| {i} | {_escape_md_table(ts)} | {_escape_md_table(agent)} | {_escape_md_table(rule_id)} | {_escape_md_table(level)} | {_escape_md_table(srcip)} | {_escape_md_table(desc)} |")
     if len(docs) > 100:
         lines.append(f"")
         lines.append(f"_(showing first 100 of {len(docs)} documents — set response_format=json for full output)_")
@@ -3399,7 +3601,7 @@ async def wazuh_email_lookup(params: WazuhEmailLookupInput) -> str:
     for i, (email, count) in enumerate(top_emails, 1):
         ips = len(email_srcips.get(email, set()))
         top_groups = ", ".join(sorted(email_groups.get(email, set()))[:4])
-        lines.append(f"| {i} | {email} | {count:,} | {ips} | {top_groups} |")
+        lines.append(f"| {i} | {_escape_md_table(email)} | {count:,} | {ips} | {_escape_md_table(top_groups)} |")
 
     lines.extend([
         "",
@@ -3467,6 +3669,16 @@ class WazuhDomainLookupInput(BaseModel):
         description="Free-text keyword search to further narrow domain results. "
                     "Same syntax as blueteam_wazuh_indexer_search.",
     )
+    max_scanned: Optional[int] = Field(
+        default=None,
+        ge=1000,
+        le=500000,
+        description="When set, auto-paginate through all matching alerts up to this limit. "
+                    "Returns aggregated results (counts, top IPs, top rules) across ALL "
+                    "scanned pages — no need to manually iterate with next_cursor. "
+                    "When None (default), returns a single page with next_cursor for "
+                    "manual pagination. include_full_log is forced to False in this mode.",
+    )
 
     @field_validator("domain")
     @classmethod
@@ -3513,6 +3725,195 @@ class WazuhDomainLookupInput(BaseModel):
         return v
 
 
+async def _wazuh_domain_lookup_full_scan(
+    params: "WazuhDomainLookupInput",
+    since_str: str,
+    until_str: str,
+    initial_search_after: Optional[list],
+) -> str:
+    """Auto-paginate through all matching alerts and return an aggregated summary.
+
+    Loops internally with ``search_after`` cursors, scanning up to
+    ``params.max_scanned`` documents across all pages.  Accumulates global
+    counters for source IPs, rule groups, and rule IDs.  Returns a summary
+    with coverage metadata so the caller knows whether the scan was complete
+    or hit the ``max_scanned`` ceiling.
+    """
+    internal_page_size = 1000
+    total_scanned = 0
+    global_total_val: Optional[int] = None
+    global_total_relation = "eq"
+    global_srcip_counter: Counter[str] = Counter()
+    global_rule_group_counter: Counter[str] = Counter()
+    global_rule_counter: Counter[str] = Counter()
+    sample_docs: list[dict] = []
+    search_after = initial_search_after
+    exhausted = False
+    pages = 0
+
+    while total_scanned < params.max_scanned:
+        remaining = params.max_scanned - total_scanned
+        page_size = min(internal_page_size, remaining)
+        try:
+            data = await _wazuh_indexer_domain_search(
+                domain=params.domain,
+                agent_name=params.agent_name,
+                size=page_size,
+                search_after=search_after,
+                since=since_str,
+                until=until_str,
+                include_full_log=False,  # full scan never includes full_log
+                keyword=params.keyword,
+            )
+        except Exception as e:
+            return _handle_api_error(e, context="wazuh_domain_lookup")
+
+        if isinstance(data.get("error"), str):
+            return json.dumps(data, indent=2)
+
+        hits = data.get("hits", {})
+        total = hits.get("total", {})
+        if global_total_val is None:
+            global_total_val = total.get("value", 0) if isinstance(total, dict) else total
+            global_total_relation = total.get("relation", "eq") if isinstance(total, dict) else "eq"
+
+        hit_list = hits.get("hits", [])
+        docs = [h.get("_source", h) for h in hit_list]
+        pages += 1
+
+        if not docs:
+            exhausted = True
+            break
+
+        # Keep first 50 docs from page 1 as a sample
+        if not sample_docs and pages == 1:
+            sample_docs = docs[:50]
+
+        # Aggregate counters across all docs
+        for doc in docs:
+            ip = (doc.get("data") or {}).get("srcip", "")
+            if ip:
+                global_srcip_counter[ip] += 1
+            rule = doc.get("rule") or {}
+            for g in rule.get("groups", []):
+                global_rule_group_counter[g] += 1
+            rule_id = rule.get("id", "")
+            rule_desc = rule.get("description", "")
+            if rule_id:
+                global_rule_counter[f"{rule_id}: {rule_desc}"] += 1
+
+        total_scanned += len(docs)
+
+        # Advance cursor for next page
+        last_sort = hit_list[-1].get("sort")
+        if not last_sort or len(docs) < page_size:
+            exhausted = True
+            break
+        search_after = last_sort
+
+    coverage = "complete" if exhausted else "partial"
+    total_display = (
+        f"{global_total_val or 0:,}"
+        + ("+" if global_total_relation == "gte" else "")
+    )
+
+    if params.response_format == ResponseFormat.JSON:
+        output = {
+            "domain": params.domain,
+            "mode": "full_scan",
+            "total": {"value": global_total_val, "relation": global_total_relation},
+            "scanned": total_scanned,
+            "pages": pages,
+            "coverage": coverage,
+            "timezone": "UTC",
+            "since": since_str,
+            "until": until_str,
+            "agent": params.agent_name or "all agents",
+            "aggregations": {
+                "top_srcips": [
+                    {"ip": ip, "count": c}
+                    for ip, c in global_srcip_counter.most_common(30)
+                ],
+                "top_rule_groups": [
+                    {"group": g, "count": c}
+                    for g, c in global_rule_group_counter.most_common(30)
+                ],
+                "top_rules": [
+                    {"rule": r, "count": c}
+                    for r, c in global_rule_counter.most_common(20)
+                ],
+            },
+            "sample_alerts": sample_docs,
+        }
+        return _truncate_if_needed(json.dumps(output, indent=2, ensure_ascii=False))
+
+    #Markdown output
+    lines: list[str] = [
+        f"#Wazuh Domain Lookup - {params.domain} (Full Scan)",
+        "",
+        f"**Total matches in indexer**: {total_display}",
+        f"**Scanned**: {total_scanned:,} docs across {pages} page(s)",
+        f"**Coverage**: {coverage} "
+        + ("(all matching alerts retrieved)" if coverage == "complete"
+           else f"(hit max_scanned={params.max_scanned:,} limit)"),
+        f"**Time window**: {since_str} to {until_str}",
+        f"**Agent**: {params.agent_name or 'all agents'}",
+        "",
+    ]
+
+    if global_srcip_counter:
+        lines.append("## Top Source IPs (global)")
+        lines.append("| IP | Alert Count |")
+        lines.append("|----|-------------|")
+        for ip, c in global_srcip_counter.most_common(20):
+            lines.append(f"| {_escape_md_table(ip)} | {c:,} |")
+        lines.append("")
+
+    if global_rule_group_counter:
+        lines.append("## Top Rule Groups (global)")
+        lines.append("| Group | Count |")
+        lines.append("|-------|-------|")
+        for g, c in global_rule_group_counter.most_common(15):
+            lines.append(f"| {_escape_md_table(g)} | {c:,} |")
+        lines.append("")
+
+    if global_rule_counter:
+        lines.append("## Top Rules (global)")
+        lines.append("| Rule | Count |")
+        lines.append("|------|-------|")
+        for r, c in global_rule_counter.most_common(15):
+            lines.append(f"| {_escape_md_table(r)} | {c:,} |")
+        lines.append("")
+
+    if sample_docs:
+        lines.append("## Sample Alerts (first 50 from page 1)")
+        lines.append("")
+        lines.append("| Time (UTC) | Agent | Rule | Level | Src IP | Account |")
+        lines.append("|------------|-------|------|-------|--------|---------|")
+        for doc in sample_docs[:20]:
+            ts = (doc.get("@timestamp") or "")[:19]
+            agent = (doc.get("agent") or {}).get("name", "-")
+            rule = doc.get("rule") or {}
+            rule_str = f"{rule.get('id', '-')}: {rule.get('description', '-')}"
+            level = rule.get("level", "-")
+            ip = (doc.get("data") or {}).get("srcip", "-")
+            account = (doc.get("data") or {}).get("account", "-")
+            lines.append(
+                f"| {ts} | {_escape_md_table(agent)} | {_escape_md_table(rule_str)} "
+                f"| {level} | {_escape_md_table(ip)} | {_escape_md_table(account)} |"
+            )
+        lines.append("")
+
+    if coverage != "complete":
+        lines.append(
+            f"---\n**Note:** Results are partial — scan hit the "
+            f"`max_scanned={params.max_scanned:,}` limit. "
+            f"Increase `max_scanned` (up to 500,000) for full coverage."
+        )
+
+    return _truncate_if_needed("\n".join(lines))
+
+
 @mcp.tool(
     name="wazuh_domain_lookup",
     annotations={
@@ -3526,24 +3927,37 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
     """Search Wazuh alerts for a specific domain name.
 
     Queries the structured ``data.domain`` field (boosted) and also searches
-    ``full_log`` for the domain as a phrase.  Results are paginated via cursor;
-    call repeatedly with the ``next_cursor`` from each response to fetch all pages.
+    ``full_log`` for the domain as a phrase.
+
+    **Two modes**:
+
+    - **Single-page** (default, ``max_scanned`` not set): Returns one page of
+      results with a ``next_cursor``.  Call repeatedly with the cursor to manually
+      iterate through all pages.
+    - **Full-scan** (set ``max_scanned`` to an integer ≥1000): Auto-paginates
+      internally across ALL matching pages and returns an aggregated summary
+      (global top IPs, top rule groups, top rules).  Set ``max_scanned`` high
+      enough to cover the time window — the scan stops when the indexer is
+      exhausted or the ceiling is hit.
 
     Args:
         params.domain: Domain to search for (e.g. 'tangerangkota.go.id')
         params.agent_name: Optional agent filter
         params.since: ISO 8601 start in UTC (default: 365 days ago)
         params.until: ISO 8601 end in UTC (default: now)
-        params.limit: Max alerts per page (1-10000, default 500)
-        params.include_full_log: Include raw log lines (default false — they can be huge)
+        params.limit: Max alerts per page in single-page mode (1-10000, default 500)
+        params.include_full_log: Include raw log lines (default false — forced false in full-scan mode)
         params.cursor: Pagination cursor from previous response
         params.response_format: 'markdown' or 'json'
+        params.max_scanned: When set, run full-scan auto-pagination (see above)
+        params.keyword: Free-text keyword to further narrow results
 
     Returns:
-        str: Paged alert results with aggregations (top source IPs, top rule groups).
+        str: Paged alert results (single-page) or aggregated summary (full-scan).
 
     Example usage:
         - "Search for all alerts involving tangerangkota.go.id"
+        - "Get the complete picture for this domain over the past 12h — use full-scan"
         - "Show me who's hitting the mail server domain"
     """
     since_str, until_str = _parse_time_window(params.since, params.until)
@@ -3553,6 +3967,12 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
         decoded = _decode_cursor(params.cursor)
         if decoded:
             search_after = decoded.get("search_after")
+
+    # Auto-pagination mode — scan ALL pages internally, return aggregate
+    if params.max_scanned is not None:
+        return await _wazuh_domain_lookup_full_scan(
+            params, since_str, until_str, search_after
+        )
 
     try:
         data = await _wazuh_indexer_domain_search(
@@ -3650,7 +4070,7 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
         level = rule.get("level", "-")
         ip = (doc.get("data") or {}).get("srcip", "-")
         account = (doc.get("data") or {}).get("account", "-")
-        lines.append(f"| {ts} | {agent} | {rule_str} | {level} | {ip} | {account} |")
+        lines.append(f"| {ts} | {_escape_md_table(agent)} | {_escape_md_table(rule_str)} | {level} | {ip} | {_escape_md_table(account)} |")
 
     lines.append("")
     if srcip_counter:
@@ -3658,7 +4078,7 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
         lines.append("| IP | Alert Count |")
         lines.append("|----|-------------|")
         for ip, c in srcip_counter.most_common(20):
-            lines.append(f"| {ip} | {c:,} |")
+            lines.append(f"| {_escape_md_table(ip)} | {c:,} |")
         lines.append("")
 
     if rule_group_counter:
@@ -3666,13 +4086,13 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
         lines.append("| Group | Count |")
         lines.append("|-------|-------|")
         for g, c in rule_group_counter.most_common(10):
-            lines.append(f"| {g} | {c:,} |")
+            lines.append(f"| {_escape_md_table(g)} | {c:,} |")
         lines.append("")
 
     if next_cursor:
-        lines.append(f"---\n**Next cursor**: `{next_cursor}`")
+        lines.append(f"\n**Next cursor**: `{next_cursor}`")
     else:
-        lines.append("---\n**No more pages** — all results returned.")
+        lines.append("\n**No more pages** - all results returned.")
 
     return _truncate_if_needed("\n".join(lines))
 
@@ -3974,7 +4394,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
             level = nr.get("threat_level", "-")
             country = nr.get("country_name") or nr.get("country") or "-"
             lines.append(
-                f"| {i} | {ip} | {count:,} | {targeted} | {score} | {level} | {country} |"
+                f"| {i} | {_escape_md_table(ip)} | {count:,} | {targeted} | {score} | {_escape_md_table(str(level))} | {_escape_md_table(str(country))} |"
             )
     else:
         lines.append(
@@ -3985,7 +4405,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
         )
         for i, (ip, count) in enumerate(top_ips, 1):
             targeted = len(ip_to_emails.get(ip, set()))
-            lines.append(f"| {i} | {ip} | {count:,} | {targeted} |")
+            lines.append(f"| {i} | {_escape_md_table(ip)} | {count:,} | {targeted} |")
 
     lines.append("")
     lines.append("## Per-Email Summary")
@@ -3999,7 +4419,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
             lines.append("|----|-------|-------------|")
             for ip, c in ips_for_email.most_common(10):
                 level = (netra_results.get(ip) or {}).get("threat_level", "-")
-                lines.append(f"| {ip} | {c:,} | {level} |")
+                lines.append(f"| {_escape_md_table(ip)} | {c:,} | {_escape_md_table(str(level))} |")
         else:
             lines.append("_No attacker IPs found for this email._")
         lines.append("")
@@ -4321,7 +4741,7 @@ async def wazuh_alert_timeline(params: WazuhAlertTimelineInput) -> str:
             for r in ((b.get("top_srcips") or {}).get("buckets") or [])
         ]
         top_ip = top_srcips[0] if top_srcips else "-"
-        lines.append(f"| {ts} | {total} | {low} | {med} | {high} | {top_rule} | {top_ip} |")
+        lines.append(f"| {ts} | {total} | {low} | {med} | {high} | {_escape_md_table(top_rule)} | {_escape_md_table(top_ip)} |")
 
     # Peak analysis
     peak = max(buckets, key=lambda b: b.get("doc_count", 0)) if buckets else None
@@ -4618,7 +5038,7 @@ async def wazuh_attack_velocity(params: WazuhAttackVelocityInput) -> str:
     ]
     for r in bucket_rows[:50]:  # cap at 50 rows for readability
         lines.append(
-            f"| {r['timestamp']} | {r['previous']} | {r['current']} | "
+            f"| {_escape_md_table(r['timestamp'])} | {r['previous']} | {r['current']} | "
             f"{r['delta']:+d} | {r['trend']} |"
         )
 

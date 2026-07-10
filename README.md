@@ -103,13 +103,13 @@ All Wazuh tools support iterative cursor pagination via base64-encoded JSON toke
 
 | Tool | Pagination Mechanism | Max per Page | Cursor Shape |
 |---|---|---|---|
-| `blueteam_wazuh_indexer_search` | OpenSearch `search_after` (sort-key traversal) | 10,000 | `{"search_after": [<sort_values>]}` |
+| `blueteam_wazuh_indexer_search` | OpenSearch `search_after` (sort-key traversal) — also supports **auto-pagination** via `max_scanned` | 10,000 | `{"search_after": [<sort_values>]}` |
 | `blueteam_wazuh_agents` | Wazuh API `offset`/`limit` | 10,000 | `{"offset": N}` |
 | `blueteam_wazuh_manager_logs` | Wazuh API `offset`/`limit` | **500** (auto capped) | `{"offset": N}` |
 | `blueteam_wazuh_alerts` | Line-offset in local `alerts.json` | 2,000 | `{"scanned": N}` |
 | `wazuh_email_lookup` | OpenSearch `search_after` (sort-key traversal) | 1,000 | `{"search_after": [<sort_values>]}` |
-| `wazuh_domain_lookup` | OpenSearch `search_after` (sort-key traversal) | 10,000 | `{"search_after": [<sort_values>]}` |
-| `wazuh_compromised_emails_analysis` | OpenSearch `search_after` (sort-key traversal) | 1,000 | `{"search_after": [<sort_values>]}` |
+| `wazuh_domain_lookup` | OpenSearch `search_after` (sort-key traversal) — also supports **auto-pagination** via `max_scanned` | 10,000 | `{"search_after": [<sort_values>]}` |
+| `wazuh_compromised_emails_analysis` | OpenSearch `search_after` (sort-key traversal) — auto-paginates internally per batch | 1,000 | `{"search_after": [<sort_values>]}` |
 | `wazuh_alert_timeline` | OpenSearch `date_histogram` (size:0, server-side) | ∞ (covers all matching docs) | n/a — no cursor needed |
 | `wazuh_attack_velocity` | OpenSearch `date_histogram` (size:0, server-side) | ∞ (covers all matching docs) | n/a — no cursor needed |
 
@@ -278,7 +278,7 @@ All environment variables accepted by the suite. Variables marked **[unified]** 
 
 | Variable | Default | Description |
 |---|---|---|
-| `BLUETEAM_CHARACTER_LIMIT` | `25000` | Maximum characters per tool response before truncation |
+| `BLUETEAM_CHARACTER_LIMIT` | `100000` | Maximum characters per tool response before truncation |
 | `BLUETEAM_HTTP_TIMEOUT` | `30.0` | HTTP request timeout in seconds (applies to `_get_http_client()`) |
 | `BLUETEAM_VERIFY_SSL` | `true` | SSL certificate verification for the shared HTTP client (set `false` for proxies or mirror endpoints with self-signed certs) |
 
@@ -486,7 +486,7 @@ All tools below are registered on `blue_team_server.py`. Tools not requiring a s
 | `blueteam_capture_traffic` | Live packet capture via tcpdump |
 
 ### Wazuh SIEM
-*All ten tools support cursor-based pagination — see [Cursor-Based Pagination](#cursor-based-pagination-bulk-data-without-hard-caps).*
+*All ten tools support cursor-based pagination — see [Cursor-Based Pagination](#cursor-based-pagination-bulk-data-without-hard-caps). `blueteam_wazuh_indexer_search` and `wazuh_domain_lookup` also support **auto-pagination** via the `max_scanned` parameter for full-period coverage in a single call.*
 
 | Tool | Description |
 |------|-------------|
@@ -494,12 +494,12 @@ All tools below are registered on `blue_team_server.py`. Tools not requiring a s
 | `blueteam_wazuh_agents_summary` | Agent count by status (active/disconnected) |
 | `blueteam_wazuh_manager_logs` | Manager daemon logs — paginated via `cursor`/`limit` (up to 1,000/page) |
 | `blueteam_wazuh_alerts` | Security alerts from alerts.json — paginated via `cursor`/`limit` (up to 2,000/page) |
-| `blueteam_wazuh_indexer_search` | Query OpenSearch for agent alerts/events — paginated via `cursor`/`limit` (up to 10,000/page) |
-| `wazuh_email_lookup` | Find top-N compromised email addresses by scanning `full_log` + `data.account` fields |
-| `wazuh_domain_lookup` | Search alerts by domain name with cursor pagination and source IP aggregation |
-| `wazuh_compromised_emails_analysis` | Correlate compromised emails with attacker IPs, optional Netra enrichment |
-| `wazuh_alert_timeline` | Time-bucketed alert aggregation using OpenSearch `date_histogram` |
-| `wazuh_attack_velocity` | Compare two time windows to detect attack acceleration/deceleration |
+| `blueteam_wazuh_indexer_search` | Query OpenSearch for agent alerts/events — paginated via `cursor`/`limit` (up to 10,000/page). Set `max_scanned` for auto-pagination. |
+| `wazuh_email_lookup` | Find top-N compromised email addresses by scanning `full_log` + `data.account` fields (auto-paginates up to `max_scanned`) |
+| `wazuh_domain_lookup` | Search alerts by domain name with cursor pagination and source IP aggregation. Set `max_scanned` for auto-pagination. |
+| `wazuh_compromised_emails_analysis` | Correlate compromised emails with attacker IPs, optional Netra enrichment (auto-paginates per batch) |
+| `wazuh_alert_timeline` | Time-bucketed alert aggregation using OpenSearch `date_histogram` — covers ALL matching alerts |
+| `wazuh_attack_velocity` | Compare two time windows to detect attack acceleration/deceleration — covers ALL matching alerts |
 
 ### Threat Intelligence
 | Tool | Description |

@@ -88,7 +88,7 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 # export WAZUH_INDEXER_VERIFY_SSL="true"  # TLS verification ON by default — disable only for self-signed labs
 
 # Performance & Tuning Limits
-# export BLUETEAM_CHARACTER_LIMIT="25000"       # max chars per tool response before truncation
+# export BLUETEAM_CHARACTER_LIMIT="100000"       # max chars per tool response before truncation
 # export BLUETEAM_HTTP_TIMEOUT="30.0"           # HTTP request timeout in seconds
 # export BLUETEAM_VERIFY_SSL="true"             # SSL cert verification for external API calls
 # export BLUETEAM_BULK_CONCURRENCY="5"          # max parallel IP lookups (CrowdSec bulk)
@@ -133,7 +133,7 @@ export BLUETEAM_RATE_LIMIT="${BLUETEAM_RATE_LIMIT:-0}"
 export BLUETEAM_ALLOWED_PATHS="${BLUETEAM_ALLOWED_PATHS:-/var:/etc:/home:/opt:/usr}"
 export BLUETEAM_CAPTURE_DIR="${BLUETEAM_CAPTURE_DIR:-/tmp}"
 export BLUETEAM_HTTP_TIMEOUT="${BLUETEAM_HTTP_TIMEOUT:-30.0}"
-export BLUETEAM_CHARACTER_LIMIT="${BLUETEAM_CHARACTER_LIMIT:-25000}"
+export BLUETEAM_CHARACTER_LIMIT="${BLUETEAM_CHARACTER_LIMIT:-100000}"
 export BLUETEAM_VERIFY_SSL="${BLUETEAM_VERIFY_SSL:-true}"
 export CROWDSEC_CACHE_TTL="${CROWDSEC_CACHE_TTL:-900}"
 export BLUETEAM_REDACT_PII="${BLUETEAM_REDACT_PII:-true}"
@@ -162,7 +162,7 @@ cat > /usr/local/bin/mcp-server-crowdsec << 'EOF'
 [[ -f /opt/blue-team-mcp/config.env ]] && source /opt/blue-team-mcp/config.env
 export CROWDSEC_API_KEY="${CROWDSEC_API_KEY:-}"
 export BLUETEAM_HTTP_TIMEOUT="${BLUETEAM_HTTP_TIMEOUT:-30.0}"
-export BLUETEAM_CHARACTER_LIMIT="${BLUETEAM_CHARACTER_LIMIT:-25000}"
+export BLUETEAM_CHARACTER_LIMIT="${BLUETEAM_CHARACTER_LIMIT:-100000}"
 export BLUETEAM_VERIFY_SSL="${BLUETEAM_VERIFY_SSL:-true}"
 export BLUETEAM_BULK_CONCURRENCY="${BLUETEAM_BULK_CONCURRENCY:-5}"
 export MCP_TRANSPORT="${MCP_TRANSPORT:-stdio}"
@@ -180,7 +180,7 @@ cat > /usr/local/bin/mcp-server-greynoise << 'EOF'
 # Wrapper - GreyNoise-only MCP server (free, no API key required)
 [[ -f /opt/blue-team-mcp/config.env ]] && source /opt/blue-team-mcp/config.env
 export BLUETEAM_HTTP_TIMEOUT="${BLUETEAM_HTTP_TIMEOUT:-30.0}"
-export BLUETEAM_CHARACTER_LIMIT="${BLUETEAM_CHARACTER_LIMIT:-25000}"
+export BLUETEAM_CHARACTER_LIMIT="${BLUETEAM_CHARACTER_LIMIT:-100000}"
 export BLUETEAM_VERIFY_SSL="${BLUETEAM_VERIFY_SSL:-true}"
 export MCP_TRANSPORT="${MCP_TRANSPORT:-stdio}"
 export MCP_HOST="${MCP_HOST:-127.0.0.1}"
@@ -214,7 +214,7 @@ echo "  WAZUH_API_URL, WAZUH_API_USER, WAZUH_API_PASSWORD,"
 echo "  WAZUH_INDEXER_URL, WAZUH_INDEXER_PASSWORD."
 echo ""
 echo "  Performance tuning (all optional, defaults shown):"
-echo "    BLUETEAM_CHARACTER_LIMIT=25000"
+echo "    BLUETEAM_CHARACTER_LIMIT=100000"
 echo "    BLUETEAM_HTTP_TIMEOUT=30.0"
 echo "    BLUETEAM_BULK_CONCURRENCY=5       (CrowdSec parallel lookups)"
 echo "    WAZUH_INDEXER_MAX_SIZE=10000      (docs per page in indexer search)"
