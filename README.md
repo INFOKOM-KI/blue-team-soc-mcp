@@ -11,7 +11,7 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
 
 ## Architecture
 
-`blue_team_server.py` is a **single, unified MCP server** with 43 tools spanning host forensics, Wazuh SIEM, and multi-source threat intelligence. It supports two transports:
+`blue_team_server.py` is a **single, unified MCP server** with 46 tools spanning host forensics, Wazuh SIEM, and multi-source threat intelligence. It supports two transports:
 
 | Transport | Use case | MCP client connection |
 |---|---|---|
@@ -21,7 +21,7 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
 ```
                           ┌──────────────────────────────────┐
                           │     blue_team_server.py          │
-                          │     43 tools · 1 file · 2 transports  │
+                          │     46 tools · 1 file · 2 transports  │
                           │                                  │
                           │  ┌────────────────────────────┐  │
                           │  │ Host Forensics (26 tools)  │  │
@@ -87,7 +87,7 @@ The CrowdSec and GreyNoise standalone servers (`blue_team_server_crowdsec.py`, `
 
 | File | Tools | When to use |
 |---|---|---|
-| `blue_team_server.py` | **All 43 tools** | **Recommended** — full capabilities, circuit breaker, credential stripping, PII redaction |
+| `blue_team_server.py` | **All 46 tools** | **Recommended** — full capabilities, circuit breaker, credential stripping, PII redaction |
 
 ---
 
@@ -103,6 +103,9 @@ All Wazuh tools support iterative cursor pagination via base64-encoded JSON toke
 
 | Tool | Pagination Mechanism | Max per Page | Cursor Shape |
 |---|---|---|---|
+| `wazuh_alert_aggregate_analysis` | OpenSearch `size:0` aggregations (server-side) — covers ALL matching docs, **no document limit** | ∞ (covers all matching docs) | n/a — no cursor needed |
+| `wazuh_alert_dsl_query` | OpenSearch `size:0` aggregations (user-supplied DSL) — covers ALL matching docs | ∞ (covers all matching docs) | n/a — no cursor needed |
+| `wazuh_alert_focused_crawl` | OpenSearch `search_after` (sort-key traversal) | 200 | `{"search_after": [<sort_values>]}` |
 | `blueteam_wazuh_indexer_search` | OpenSearch `search_after` (sort-key traversal) — also supports **auto-pagination** via `max_scanned` | 10,000 | `{"search_after": [<sort_values>]}` |
 | `blueteam_wazuh_agents` | Wazuh API `offset`/`limit` | 10,000 | `{"offset": N}` |
 | `blueteam_wazuh_manager_logs` | Wazuh API `offset`/`limit` | **500** (auto capped) | `{"offset": N}` |
@@ -321,9 +324,10 @@ All environment variables accepted by the suite. Variables marked **[unified]** 
 
 | Variable | Default | Description |
 |---|---|---|
-| `MCP_TRANSPORT` | `stdio` | Transport mode: `stdio`, `sse`, or `streamable_http` |
-| `MCP_HOST` | `127.0.0.1` | Bind address for SSE/HTTP transports |
-| `MCP_PORT` | `8000` | Bind port for SSE/HTTP transports |
+| `MCP_TRANSPORT` | `stdio` | Transport mode: `stdio` or `streamable_http` |
+| `MCP_HOST` | `127.0.0.1` | Bind address for Streamable HTTP transport |
+| `MCP_PORT` | `8000` | Bind port for Streamable HTTP transport |
+| `BLUE_TEAM_MCP_SERVER_NAME` | `blue_team_mcp` | Server name reported to MCP clients — use lowercase to avoid LLM casing mismatches |
 | `LOG_LEVEL` | `INFO` | Python logging level |
 
 ### Security & Auditing
@@ -423,7 +427,7 @@ Then point Claude Desktop at it:
 
 Replace `192.168.153.5` with the IP reachable from your workstation (`192.168.153.5` for NAT, `172.16.101.5` for LAB).
 
-Restart Claude Desktop. You should see all 43 blue-team-mcp tools available.
+Restart Claude Desktop. You should see all 46 blue-team-mcp tools available.
 
 ### 4. Remote Service Deployment (systemd)
 
@@ -457,10 +461,10 @@ sudo systemctl start blue-team-mcp
 sudo systemctl status blue-team-mcp (make sure service is running)
 ```
 
-The server is now reachable at `http://<host>:8000/mcp` (Streamable HTTP) or `http://<host>:8000/sse` (SSE).
+The server is now reachable at `http://<host>:8000/mcp` (Streamable HTTP).
 
 Transport can be controlled via environment variables instead of CLI flags:
-- `MCP_TRANSPORT` — `stdio` (default), `sse`, or `streamable_http`
+- `MCP_TRANSPORT` — `stdio` (default) or `streamable_http`
 - `MCP_HOST` — bind address (default `127.0.0.1`; use `0.0.0.0` for remote access)
 - `MCP_PORT` — bind port (default `8000`)
 
@@ -486,7 +490,7 @@ All tools below are registered on `blue_team_server.py`. Tools not requiring a s
 | `blueteam_capture_traffic` | Live packet capture via tcpdump |
 
 ### Wazuh SIEM
-*All ten tools support cursor-based pagination — see [Cursor-Based Pagination](#cursor-based-pagination-bulk-data-without-hard-caps). `blueteam_wazuh_indexer_search` and `wazuh_domain_lookup` also support **auto-pagination** via the `max_scanned` parameter for full-period coverage in a single call.*
+*All thirteen tools support cursor-based pagination — see [Cursor-Based Pagination](#cursor-based-pagination-bulk-data-without-hard-caps). `blueteam_wazuh_indexer_search`, `wazuh_domain_lookup`, and `wazuh_alert_focused_crawl` also support **auto-pagination** via the `max_scanned` or `next_cursor` parameter for full-period coverage in a single call.*
 
 | Tool | Description |
 |------|-------------|
@@ -495,6 +499,9 @@ All tools below are registered on `blue_team_server.py`. Tools not requiring a s
 | `blueteam_wazuh_manager_logs` | Manager daemon logs — paginated via `cursor`/`limit` (up to 1,000/page) |
 | `blueteam_wazuh_alerts` | Security alerts from alerts.json — paginated via `cursor`/`limit` (up to 2,000/page) |
 | `blueteam_wazuh_indexer_search` | Query OpenSearch for agent alerts/events — paginated via `cursor`/`limit` (up to 10,000/page). Set `max_scanned` for auto-pagination. |
+| `wazuh_alert_aggregate_analysis` | 🆕 **Tier 1** — Full-period statistical analysis via `size:0` OpenSearch aggregations. Modes: topology, anomaly, correlation, trend, summary. **No document limit** |
+| `wazuh_alert_dsl_query` | 🆕 **Tier 2** — Power-user escape hatch: submit raw OpenSearch DSL with `size:0` enforced. For custom aggregations not covered by Tier 1 |
+| `wazuh_alert_focused_crawl` | 🆕 **Tier 3** — Surgical drill-down: retrieve representative alert samples for specific hot spots identified by Tiers 1 & 2 |
 | `wazuh_email_lookup` | Find top-N compromised email addresses by scanning `full_log` + `data.account` fields (auto-paginates up to `max_scanned`) |
 | `wazuh_domain_lookup` | Search alerts by domain name with cursor pagination and source IP aggregation. Set `max_scanned` for auto-pagination. |
 | `wazuh_compromised_emails_analysis` | Correlate compromised emails with attacker IPs, optional Netra enrichment (auto-paginates per batch) |
@@ -675,6 +682,21 @@ export BLUETEAM_RATE_LIMIT=60
 
 | File | Role |
 |---|---|
-| `blue_team_server.py` | **Primary** — all 43 tools, all three transports (stdio / SSE / Streamable HTTP) |
-| `blue_team_server_crowdsec.py` | Standalone CrowdSec-only server (backward compat) |
-| `blue_team_server_greynoise.py` | Standalone GreyNoise-only server (backward compat) |
+| `blue_team_server.py` | **Primary** — all 46 tools, both transports (stdio / Streamable HTTP) |
+
+### Legacy Naming Debt
+
+Five Wazuh tools use the prefix `wazuh_` without the `blueteam_` namespace
+qualifier, while the other Wazuh tools use `blueteam_wazuh_`:
+
+| Current Name | Preferred (Future) | Status |
+|---|---|---|
+| `wazuh_email_lookup` | `blueteam_wazuh_email_lookup` | Active — do not rename (backward compat) |
+| `wazuh_domain_lookup` | `blueteam_wazuh_domain_lookup` | Active — do not rename (backward compat) |
+| `wazuh_compromised_emails_analysis` | `blueteam_wazuh_compromised_emails_analysis` | Active — do not rename (backward compat) |
+| `wazuh_alert_timeline` | `blueteam_wazuh_alert_timeline` | Active — do not rename (backward compat) |
+| `wazuh_attack_velocity` | `blueteam_wazuh_attack_velocity` | Active — do not rename (backward compat) |
+
+Per CLAUDE.md Hard Rule 1, these names are frozen to avoid breaking active
+client workflows. A future major version may introduce the `blueteam_wazuh_`
+aliases alongside a deprecation window for the short names.

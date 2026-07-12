@@ -63,8 +63,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger("blue_team_mcp")
 
-# Server init
-mcp = FastMCP("blue_team_mcp")
+# Server name — normalized to lowercase to prevent LLM casing mismatches.
+# Users configure this via BLUE_TEAM_MCP_SERVER_NAME env var for total naming freedom.
+_MCP_SERVER_NAME = os.environ.get("BLUE_TEAM_MCP_SERVER_NAME", "blue_team_mcp").strip().lower()
+if os.environ.get("BLUE_TEAM_MCP_SERVER_NAME", "").strip() and os.environ.get("BLUE_TEAM_MCP_SERVER_NAME", "").strip() != _MCP_SERVER_NAME:
+    logger.warning(
+        "BLUE_TEAM_MCP_SERVER_NAME contains uppercase characters — "
+        "normalized to '%s'. Some LLM clients may mishandle case-sensitive "
+        "server names; if you experience tool-routing issues, "
+        "use an all-lowercase name.",
+        _MCP_SERVER_NAME,
+    )
+mcp = FastMCP(_MCP_SERVER_NAME)
 
 # Configuration (set via environment variables)
 ABUSEIPDB_API_KEY = os.environ.get("ABUSEIPDB_API_KEY", "")
@@ -75,6 +85,7 @@ MAX_GREP_PATTERN_LENGTH = 200   # ReDoS mitigation
 BLUETEAM_AUDIT_LOG = os.environ.get("BLUETEAM_AUDIT_LOG", "")
 BLUETEAM_RATE_LIMIT = int(os.environ.get("BLUETEAM_RATE_LIMIT", "0"))  # max calls/min, 0=disabled
 BLUETEAM_REDACT_PII = os.environ.get("BLUETEAM_REDACT_PII", "true").lower() in ("1", "true", "yes")
+BLUETEAM_REDACT_EMAILS = os.environ.get("BLUETEAM_REDACT_EMAILS", "true").lower() in ("1", "true", "yes")
 
 # Path safety: allowlist for blueteam_hash_file (colon-separated, e.g. /var:/etc:/home:/opt)
 ALLOWED_PATH_PREFIXES = [
@@ -289,6 +300,22 @@ def _is_private_or_reserved(ip: str) -> bool:
         return False
     return any(addr in net for net in _PRIVATE_NETWORKS)
 
+
+def _validate_public_ip(v: str) -> str:
+    """Reject private/reserved IPs for public threat-intel tools (SSRF guard — MCP05).
+
+    Called by field validators AFTER ``ipaddress.ip_address()`` confirms the string
+    is a valid IP.  Wazuh Manager/Indexer tools are exempted — they legitimately
+    target internal infrastructure.
+    """
+    if _is_private_or_reserved(v):
+        raise ValueError(
+            f"'{v}' is a private/reserved IP address. "
+            "This tool only accepts public IPs for threat intelligence lookup. "
+            "Use Wazuh Indexer search tools for internal IP investigation."
+        )
+    return v
+
 def _handle_api_error(e: Exception, context: str = "") -> str:
     """Consistent, actionable error formatting for all API-based tools."""
     prefix = f"[{context}] " if context else ""
@@ -430,6 +457,7 @@ class CircuitBreaker:
 
 # Per-service circuit breakers - one per external API trust domain
 _cb_crowdsec = CircuitBreaker("crowdsec_cti", failure_threshold=5, recovery_timeout=60)
+_cb_wazuh_manager = CircuitBreaker("wazuh_manager", failure_threshold=5, recovery_timeout=60)
 _cb_wazuh_indexer = CircuitBreaker("wazuh_indexer", failure_threshold=5, recovery_timeout=60)
 
 
@@ -483,77 +511,100 @@ _CREDENTIAL_STRIP_RULES: list[tuple[re.Pattern, str]] = [
     (re.compile(r'\bAIza[0-9A-Za-z_-]{35}\b'), '<GOOGLE_API_KEY_REDACTED>'),
 ]
 
+# Forensic email hashing — preserves domain visibility for SOC analysis while
+# keeping the raw email out of the LLM context.  The hash is deterministic
+# (SHA-256 salted with BLUETEAM_REDACT_SALT, defaulting to hostname-derived)
+# so the same email produces the same hash across tool calls and server restarts.
+_REDACT_SALT = os.environ.get(
+    "BLUETEAM_REDACT_SALT",
+    hashlib.sha256(os.uname().nodename.encode()).hexdigest()[:16]
+)
+
+
+def _hash_email_for_audit(email: str) -> str:
+    """Return an 8-char hex hash prefix for forensic cross-referencing.
+
+    Deterministic: same (salt, email) → same hash every time.  The analyst
+    can verify by computing SHA-256 locally:
+
+        echo -n "<salt>:admin@corp.gov" | sha256sum | cut -c1-8
+
+    and matching the result against the ``[h:xxxxxxxx]`` suffix in the output.
+    """
+    return hashlib.sha256(f"{_REDACT_SALT}:{email}".encode()).hexdigest()[:8]
+
 
 def _redact_alert_data(data: Any, *, bypass: bool = False) -> Any:
     """Apply redacted-but-real PII and credential masking to alert payloads (PRD FR-17).
 
-    Credential stripping (applied first):
-      - Bearer / Basic auth headers → ``Authorization: Bearer <BEARER_REDACTED>``
-      - API keys (x-api-key, api_key=) → ``x-api-key: <API_KEY_REDACTED>``
-      - JWT tokens (eyJ… base64url segments) → ``<JWT_REDACTED>``
-      - Private key PEM blocks → ``<PRIVATE_KEY_REDACTED>``
-      - AWS / Stripe / GitHub / GitLab / Slack / Google / AI API keys → ``<TOKEN_REDACTED>``
-      - Password / secret query params → ``password=<PASSWORD_REDACTED>``
+    **Three independent layers — apply in strict priority order:**
 
-    PII masking (applied second):
-      - Email addresses → ``u***r@d***n.com``  (preserve first/last local + domain chars)
-      - Internal IPs (RFC1918) → ``10.***.***.1``  (mask middle octets)
+    1. **Credential stripping** (layer 1 — MANDATORY, never configurable):
+       Bearer tokens, Basic auth, API keys, JWTs, PEM keys, cloud/VCS/AI/Slack/
+       Stripe/Google keys, and password params are ALWAYS stripped.  There is no
+       legitimate operational use case for sending credentials to an LLM.
 
-    Controlled by BLUETEAM_REDACT_PII env var (default: True). The per-call
-    ``bypass`` parameter overrides this — when ``bypass=True``, raw data is
-    returned regardless of the server default (useful for internal audit
-    investigations that need unredacted payloads).
+    2. **Email redaction** (layer 2 — controlled by ``BLUETEAM_REDACT_EMAILS``):
+       Masks the local part (preserving first/last char + forensic hash), keeps
+       the domain FULLY visible for threat intelligence.  Set to ``false`` when
+       SOC analysts need to identify specific compromised accounts.
+
+    3. **Internal IP masking** (layer 3 — controlled by ``BLUETEAM_REDACT_PII``):
+       Masks RFC1918 addresses (10.x, 172.16-31.x, 192.168.x).  **Public IPs
+       (attacker IoCs) are NEVER masked** — only internal infrastructure addresses.
+
+    The per-call ``bypass`` parameter skips layers 2 and 3 only — credential
+    stripping can NEVER be bypassed because it has no legitimate use case.
 
     Returns the redacted copy — original is never mutated.
     """
-    if bypass or not BLUETEAM_REDACT_PII:
-        return data
-
     if isinstance(data, str):
-        # Credential / secret stripping (applied first, before PII redaction)
-        # Strip bearer tokens, API keys, JWTs, private keys, and password params
-        # from Wazuh full_log fields so they never reach the LLM context.
+        # Layer 1: Credential stripping (MANDATORY — no env var override) ──
+        # These patterns protect against secrets in Wazuh full_log fields.
+        # Bypass is NOT honored here — credentials must never reach the LLM.
         for pattern, replacement in _CREDENTIAL_STRIP_RULES:
             data = pattern.sub(replacement, data)
 
-        # Email redaction: preserve first and last char of local part, first and last domain section
-        def _redact_email(m: re.Match) -> str:
-            local, domain = m.group(1), m.group(2)
-            if len(local) <= 2:
-                rlocal = local[0] + "*" * (len(local) - 1)
-            else:
-                rlocal = local[0] + "*" * max(1, len(local) - 2) + local[-1]
-            parts = domain.split(".")
-            if len(parts) >= 2:
-                parts[0] = parts[0][0] + "*" * max(1, len(parts[0]) - 2) + parts[0][-1] if len(parts[0]) > 2 else parts[0]
-            return f"{rlocal}@{'.'.join(parts)}"
+        # Layer 2: Email redaction (BLUETEAM_REDACT_EMAILS) ──
+        if not bypass and BLUETEAM_REDACT_EMAILS:
+            def _redact_email(m: re.Match) -> str:
+                local, domain = m.group(1), m.group(2)
+                full_email = f"{local}@{domain}"
+                forensic_hash = _hash_email_for_audit(full_email)
+                if len(local) <= 2:
+                    rlocal = local[0] + "*" * (len(local) - 1)
+                else:
+                    rlocal = local[0] + "*" * max(1, len(local) - 2) + local[-1]
+                return f"{rlocal}@{domain} [h:{forensic_hash}]"
 
-        data = _REDACT_EMAIL_RE.sub(_redact_email, data)
+            data = _REDACT_EMAIL_RE.sub(_redact_email, data)
 
-        # RFC1918 IP masking: 10.x.x.x, 172.16-31.x.x, 192.168.x.x
-        def _redact_rfc1918(m: re.Match) -> str:
-            ip = m.group(0)
-            octets = ip.split(".")
-            if octets[0] == "10":
-                return f"10.{'***'}.{'***'}.{octets[3]}"
-            elif octets[0] == "172" and 16 <= int(octets[1]) <= 31:
-                return f"172.{octets[1]}.{'***'}.{octets[3]}"
-            elif octets[0] == "192" and octets[1] == "168":
-                return f"192.168.{'***'}.{octets[3]}"
-            return ip
+        # Layer 3: RFC1918 internal IP masking (BLUETEAM_REDACT_PII) ──
+        # Public IPs (attacker IoCs) are NEVER masked — only internal infra.
+        if not bypass and BLUETEAM_REDACT_PII:
+            def _redact_rfc1918(m: re.Match) -> str:
+                ip = m.group(0)
+                octets = ip.split(".")
+                if octets[0] == "10":
+                    return f"10.{'***'}.{'***'}.{octets[3]}"
+                elif octets[0] == "172" and 16 <= int(octets[1]) <= 31:
+                    return f"172.{octets[1]}.{'***'}.{octets[3]}"
+                elif octets[0] == "192" and octets[1] == "168":
+                    return f"192.168.{'***'}.{octets[3]}"
+                return ip
 
-        data = re.sub(
-            r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})\b",
-            _redact_rfc1918,
+            data = re.sub(
+                r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})\b",
+                _redact_rfc1918,
             data,
         )
         return data
 
     if isinstance(data, dict):
-        return {k: _redact_alert_data(v) for k, v in data.items()}
+        return {k: _redact_alert_data(v, bypass=bypass) for k, v in data.items()}
 
     if isinstance(data, list):
-        return [_redact_alert_data(item) for item in data]
+        return [_redact_alert_data(item, bypass=bypass) for item in data]
 
     return data
 
@@ -698,17 +749,26 @@ async def _wazuh_get_token() -> Optional[str]:
         return _wazuh_token
     try:
         url = f"{WAZUH_API_URL}/security/user/authenticate?raw=true"
-        client = await _get_wazuh_client()
-        resp = await client.post(
-            url,
-            auth=(WAZUH_API_USER, WAZUH_API_PASSWORD),
-        )
-        resp.raise_for_status()
-        _wazuh_token = resp.text.strip().strip('"')
+
+        async def _do_wazuh_auth_http() -> str:
+            client = await _get_wazuh_client()
+            resp = await client.post(
+                url,
+                auth=(WAZUH_API_USER, WAZUH_API_PASSWORD),
+            )
+            resp.raise_for_status()
+            return resp.text.strip().strip('"')
+
+        _wazuh_token = await _cb_wazuh_manager.call(_do_wazuh_auth_http)
         _wazuh_token_expiry = now + _WAZUH_TOKEN_TTL
         return _wazuh_token
     except httpx.HTTPStatusError as e:
         logger.warning("Wazuh auth failed: HTTP %s — %s", e.response.status_code, e.response.text[:200])
+        _wazuh_token = None
+        _wazuh_token_expiry = 0.0
+        return None
+    except CircuitBreakerOpenError as e:
+        logger.warning("Wazuh auth failed: circuit breaker open — %s", e)
         _wazuh_token = None
         _wazuh_token_expiry = 0.0
         return None
@@ -734,16 +794,28 @@ async def _wazuh_api_get(path: str, params: Dict[str, str] = None) -> Dict:
         }
     url = f"{WAZUH_API_URL}{path}"
     try:
-        client = await _get_wazuh_client()
-        resp = await client.get(
-            url,
-            headers={"Authorization": f"Bearer {token}"},
-            params=params or {},
-        )
-        resp.raise_for_status()
-        return resp.json()
+
+        async def _do_wazuh_api_http() -> dict:
+            client = await _get_wazuh_client()
+            resp = await client.get(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                params=params or {},
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+        return await _cb_wazuh_manager.call(_do_wazuh_api_http)
     except httpx.HTTPStatusError as e:
         return {"error": f"Wazuh API error: {e.response.status_code}", "detail": e.response.text[:500]}
+    except CircuitBreakerOpenError:
+        return {
+            "error": "Wazuh Manager API is temporarily unavailable (circuit breaker open)",
+            "detail": (
+                "The Wazuh Manager API has been unresponsive. The circuit breaker "
+                "will retry automatically after the recovery timeout. Try again in ~60 seconds."
+            ),
+        }
     except Exception as e:
         return {"error": str(e)}
 
@@ -1497,7 +1569,7 @@ class CrowdsecIpReputationInput(BaseModel):
             ipaddress.ip_address(v)
         except ValueError as exc:
             raise ValueError(f"'{v}' is not a valid IP address (IPv4/IPv6).") from exc
-        return v
+        return _validate_public_ip(v)
 
 class CrowdsecIpReputationBulkInput(BaseModel):
     """Input model for batch IP reputation lookup via CrowdSec CTI."""
@@ -1526,7 +1598,10 @@ class CrowdsecIpReputationBulkInput(BaseModel):
                 invalid.append(ip)
         if invalid:
             raise ValueError(f"Invalid IP(s): {', '.join(invalid)}")
-        return [ip.strip() for ip in v]
+        result = [ip.strip() for ip in v]
+        for ip in result:
+            _validate_public_ip(ip)
+        return result
 
 # CROWDSEC CTI TOOLS
 @mcp.tool(
@@ -1574,9 +1649,10 @@ async def crowdsec_ip_reputation(params: CrowdsecIpReputationInput) -> str:
         - "Error: Rate limit reached (429)" if API quota is exhausted
         - IP format validation is handled automatically by Pydantic before the request
     """
+    _audit_log("crowdsec_ip_reputation", {"ip": params.ip})
     try:
         raw = await _crowdsec_request(f"/v2/smoke/{params.ip}")
-    except Exception as e:  # noqa: BLE001 — converted to actionable messages below
+    except (httpx.HTTPStatusError, httpx.TimeoutException, CircuitBreakerOpenError, RuntimeError) as e:
         return _handle_api_error(e, context="crowdsec_ip_reputation")
 
     if params.response_format == ResponseFormat.JSON:
@@ -1631,6 +1707,7 @@ async def crowdsec_ip_reputation_bulk(params: CrowdsecIpReputationBulkInput) -> 
         - Failure for one IP does not abort the entire batch — per-IP errors are
           reported inline in the results rather than stopping the process.
     """
+    _audit_log("crowdsec_ip_reputation_bulk", {"count": len(params.ips)})
     results: list[dict[str, Any]] = []
     for ip in params.ips:
         try:
@@ -1643,7 +1720,7 @@ async def crowdsec_ip_reputation_bulk(params: CrowdsecIpReputationBulkInput) -> 
                     "cves": raw.get("cves", []),
                 }
             )
-        except Exception as e:  # noqa: BLE001
+        except (httpx.HTTPStatusError, httpx.TimeoutException, CircuitBreakerOpenError, RuntimeError) as e:
             results.append({"ip": ip, "error": _handle_api_error(e, context=ip)})
 
     if params.response_format == ResponseFormat.JSON:
@@ -1772,7 +1849,7 @@ class GreynoiseIpContextInput(BaseModel):
             ipaddress.ip_address(v)
         except ValueError as exc:
             raise ValueError(f"'{v}' is not a valid IP address (IPv4/IPv6).") from exc
-        return v
+        return _validate_public_ip(v)
 
 # GREYNOISE COMMUNITY TOOL
 @mcp.tool(
@@ -1823,9 +1900,10 @@ async def greynoise_ip_context(params: GreynoiseIpContextInput) -> str:
         - "Error: Rate limit reached (429)" — back off per GreyNoise fair-use policy
         - IP format validation is handled automatically by Pydantic before the request
     """
+    _audit_log("greynoise_ip_context", {"ip": params.ip})
     try:
         raw = await _greynoise_community_request(params.ip)
-    except Exception as e:  # noqa: BLE001 — converted to actionable messages below
+    except (httpx.HTTPStatusError, httpx.TimeoutException, CircuitBreakerOpenError, RuntimeError) as e:
         return _handle_api_error(e, context="greynoise_ip_context")
 
     if params.response_format == ResponseFormat.JSON:
@@ -2075,7 +2153,7 @@ class NetraIpAnalysisInput(BaseModel):
             ipaddress.ip_address(v)
         except ValueError as exc:
             raise ValueError(f"'{v}' is not a valid IP address (IPv4/IPv6).") from exc
-        return v
+        return _validate_public_ip(v)
 
 
 # NETRA THREAT INTELLIGENCE TOOL
@@ -2115,9 +2193,10 @@ async def netra_ip_analysis(params: NetraIpAnalysisInput) -> str:
         - "Error: Rate limit reached (429)" if API quota is exhausted
         - IP format validation is handled automatically by Pydantic before the request
     """
+    _audit_log("netra_ip_analysis", {"ip": params.ip})
     try:
         raw = await _netra_request(f"/analysis/{params.ip}")
-    except Exception as e:
+    except (httpx.HTTPStatusError, httpx.TimeoutException, CircuitBreakerOpenError, RuntimeError) as e:
         return _handle_api_error(e, context="netra_ip_analysis")
 
     if params.response_format == ResponseFormat.JSON:
@@ -2252,6 +2331,7 @@ async def blueteam_read_auth_log(params: LogInput) -> str:
     Returns:
         str: Matching log lines or error JSON
     """
+    _audit_log("blueteam_read_auth_log", {"lines": params.lines})
     log_path = "/var/log/auth.log"
     # Fallback for systems using journald only
     if not Path(log_path).exists():
@@ -2282,6 +2362,7 @@ async def blueteam_read_syslog(params: LogInput) -> str:
     Returns:
         str: Log content
     """
+    _audit_log("blueteam_read_syslog", {"lines": params.lines})
     for path in ["/var/log/syslog", "/var/log/messages"]:
         if Path(path).exists():
             content = _tail_file(path, params.lines)
@@ -2320,6 +2401,7 @@ async def blueteam_read_web_log(params: WebLogInput) -> str:
     Returns:
         str: Log lines
     """
+    _audit_log("blueteam_read_web_log", {"lines": params.lines})
     paths = {
         "nginx": {
             "access": "/var/log/nginx/access.log",
@@ -2368,6 +2450,7 @@ async def blueteam_journalctl(params: JournalInput) -> str:
     Returns:
         str: Journal output
     """
+    _audit_log("blueteam_journalctl", {"unit": params.unit})
     cmd = ["journalctl", "--no-pager", "-n", str(params.lines)]
     if params.unit:
         cmd += ["-u", params.unit]
@@ -2390,6 +2473,7 @@ async def blueteam_list_listening_ports() -> str:
     Returns:
         str: Port table with process names and PIDs
     """
+    _audit_log("blueteam_list_listening_ports", {})
     r = _run(["ss", "-tulpn"])
     if r["returncode"] != 0:
         r = _run(["netstat", "-tulpn"])
@@ -2407,6 +2491,7 @@ async def blueteam_list_connections() -> str:
     Returns:
         str: Active connection table
     """
+    _audit_log("blueteam_list_connections", {})
     r = _run(["ss", "-tnp", "state", "established"])
     if r["returncode"] != 0:
         r = _run(["netstat", "-tnp"])
@@ -2499,6 +2584,7 @@ async def blueteam_wazuh_agents(params: WazuhAgentsInput) -> str:
     Returns:
         str: JSON with agents, total, offset, limit, and next_cursor
     """
+    _audit_log("blueteam_wazuh_agents", {})
     offset = 0
     if params.cursor:
         decoded = _decode_cursor(params.cursor)
@@ -2545,6 +2631,7 @@ async def blueteam_wazuh_agents_summary() -> str:
     Returns:
         str: JSON with counts per status
     """
+    _audit_log("blueteam_wazuh_agents_summary", {})
     data = await _wazuh_api_get("/agents/summary/status")
     if isinstance(data.get("error"), str):
         return json.dumps(data, indent=2)
@@ -2586,6 +2673,7 @@ async def blueteam_wazuh_manager_logs(params: WazuhLogsInput) -> str:
     Returns:
         str: JSON with logs, total, offset, limit, and next_cursor
     """
+    _audit_log("blueteam_wazuh_manager_logs", {})
     valid = ("alerts", "api", "cluster", "integrations")
     if params.log_type not in valid:
         return json.dumps({"error": f"log_type must be one of: {valid}"})
@@ -2663,6 +2751,7 @@ async def blueteam_wazuh_alerts(params: WazuhAlertsInput) -> str:
     Returns:
         str: JSON with alerts, count, next_cursor, and source field ("local" or "wazuh-indexer")
     """
+    _audit_log("blueteam_wazuh_alerts", {})
     ok, err = _validate_path(_WAZUH_ALERTS_PATH, ALLOWED_PATH_PREFIXES)
     if not ok:
         return json.dumps({"error": err})
@@ -3045,6 +3134,7 @@ async def _wazuh_indexer_search_full_scan(
 
         hit_list = hits.get("hits", [])
         docs = [h.get("_source", h) for h in hit_list]
+        docs = _redact_alert_data(docs, bypass=False)
         pages += 1
 
         if not docs:
@@ -3205,6 +3295,7 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
         str: In 'json' mode (default): JSON with documents, total, size, count, next_cursor,
              and timezone. In 'markdown' mode: a compact summary table of alerts.
     """
+    _audit_log("blueteam_wazuh_indexer_search", {})
     if params.index_type not in _WAZUH_INDEX_PATTERNS:
         return json.dumps({"error": f"index_type must be one of: {list(_WAZUH_INDEX_PATTERNS)}"})
     index_pattern = _WAZUH_INDEX_PATTERNS[params.index_type]
@@ -3454,6 +3545,7 @@ async def wazuh_email_lookup(params: WazuhEmailLookupInput) -> str:
         - "Find the top 100 most compromised email addresses in the last year"
         - "Show me the most targeted mailboxes on agent mailbox-new"
     """
+    _audit_log("wazuh_email_lookup", {"since": params.since})
     since_str, until_str = _parse_time_window(params.since, params.until)
 
     rule_group_list: Optional[list[str]] = None
@@ -3491,6 +3583,7 @@ async def wazuh_email_lookup(params: WazuhEmailLookupInput) -> str:
             hits = data.get("hits", {})
             hit_list = hits.get("hits", [])
             docs = [h.get("_source", h) for h in hit_list]
+            docs = _redact_alert_data(docs, bypass=False)
             if not docs:
                 break
 
@@ -3527,7 +3620,7 @@ async def wazuh_email_lookup(params: WazuhEmailLookupInput) -> str:
             else:
                 break
 
-    except Exception as e:
+    except (httpx.HTTPStatusError, httpx.TimeoutException, CircuitBreakerOpenError, RuntimeError) as e:
         if total_scanned == 0:
             return _handle_api_error(e, context="wazuh_email_lookup")
         # Partial results on transient error during pagination
@@ -3765,7 +3858,7 @@ async def _wazuh_domain_lookup_full_scan(
                 include_full_log=False,  # full scan never includes full_log
                 keyword=params.keyword,
             )
-        except Exception as e:
+        except (httpx.HTTPStatusError, httpx.TimeoutException, CircuitBreakerOpenError, RuntimeError) as e:
             return _handle_api_error(e, context="wazuh_domain_lookup")
 
         if isinstance(data.get("error"), str):
@@ -3779,6 +3872,7 @@ async def _wazuh_domain_lookup_full_scan(
 
         hit_list = hits.get("hits", [])
         docs = [h.get("_source", h) for h in hit_list]
+        docs = _redact_alert_data(docs, bypass=False)
         pages += 1
 
         if not docs:
@@ -3960,6 +4054,7 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
         - "Get the complete picture for this domain over the past 12h — use full-scan"
         - "Show me who's hitting the mail server domain"
     """
+    _audit_log("wazuh_domain_lookup", {"domain": params.domain, "since": params.since})
     since_str, until_str = _parse_time_window(params.since, params.until)
 
     search_after: Optional[list] = None
@@ -3985,7 +4080,7 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
             include_full_log=params.include_full_log,
             keyword=params.keyword,
         )
-    except Exception as e:
+    except (httpx.HTTPStatusError, httpx.TimeoutException, CircuitBreakerOpenError, RuntimeError) as e:
         return _handle_api_error(e, context="wazuh_domain_lookup")
 
     if isinstance(data.get("error"), str):
@@ -3997,6 +4092,7 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
     total_relation = total.get("relation", "eq") if isinstance(total, dict) else "eq"
     hit_list = hits.get("hits", [])
     docs = [h.get("_source", h) for h in hit_list]
+    docs = _redact_alert_data(docs, bypass=False)
 
     # Build next cursor
     next_cursor = None
@@ -4227,6 +4323,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
         - "Take the top 5 emails from the lookup and find who's attacking them"
         - "Enrich the attacker IPs for these compromised accounts through Netra"
     """
+    _audit_log("wazuh_compromised_emails_analysis", {"top_ips": params.top_ips, "since": params.since})
     since_str, until_str = _parse_time_window(params.since, params.until)
 
     ip_counter: Counter[str] = Counter()
@@ -4262,6 +4359,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
                 hits = data.get("hits", {})
                 hit_list = hits.get("hits", [])
                 docs = [h.get("_source", h) for h in hit_list]
+                docs = _redact_alert_data(docs, bypass=False)
                 if not docs:
                     break
 
@@ -4292,7 +4390,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
                 else:
                     break
 
-    except Exception as e:
+    except (httpx.HTTPStatusError, httpx.TimeoutException, CircuitBreakerOpenError, RuntimeError) as e:
         if total_scanned == 0:
             return _handle_api_error(e, context="wazuh_compromised_emails_analysis")
         logging.getLogger(__name__).warning(
@@ -4331,7 +4429,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
                 }
                 # Rate-limit courtesy: 1s delay between Netra calls
                 await asyncio.sleep(1)
-            except Exception as e:
+            except (httpx.HTTPStatusError, httpx.TimeoutException, Exception) as e:
                 netra_results[ip] = {"error": str(e)}
 
     if params.response_format == ResponseFormat.JSON:
@@ -4637,6 +4735,7 @@ async def wazuh_alert_timeline(params: WazuhAlertTimelineInput) -> str:
         - "Break down yesterday's brute force alerts by 15-minute intervals"
         - "What's the attack volume trend over the last 7 days?"
     """
+    _audit_log("wazuh_alert_timeline", {"since": params.since, "bucket": params.bucket})
     since_str, until_str = _parse_time_window(params.since, params.until)
 
     # Determine bucket interval
@@ -4660,7 +4759,7 @@ async def wazuh_alert_timeline(params: WazuhAlertTimelineInput) -> str:
             rule_level_min=params.rule_level_min,
             keyword=params.keyword,
         )
-    except Exception as e:
+    except (httpx.HTTPStatusError, httpx.TimeoutException, CircuitBreakerOpenError, RuntimeError) as e:
         return _handle_api_error(e, context="wazuh_alert_timeline")
 
     if isinstance(data.get("error"), str):
@@ -4910,6 +5009,7 @@ async def wazuh_attack_velocity(params: WazuhAttackVelocityInput) -> str:
         - "Is the brute force attack on the mail server speeding up?"
         - "Compare the last hour's alert volume to the previous hour"
     """
+    _audit_log("wazuh_attack_velocity", {"since": params.since})
     window_str = params.window
     m = _RELATIVE_TIME_RE.match(window_str)
     n, unit = int(m.group(1)), m.group(2)
@@ -4956,7 +5056,7 @@ async def wazuh_attack_velocity(params: WazuhAttackVelocityInput) -> str:
                 keyword=params.keyword,
             ),
         )
-    except Exception as e:
+    except (httpx.HTTPStatusError, httpx.TimeoutException, CircuitBreakerOpenError, RuntimeError) as e:
         return _handle_api_error(e, context="wazuh_attack_velocity")
 
     if isinstance(current_data.get("error"), str):
@@ -5091,7 +5191,7 @@ class IPInput(BaseModel):
         if not v or len(v) > 45:
             raise ValueError("Invalid IP format or length")
         if _IPV4_RE.match(v) or _IPV6_RE.match(v):
-            return v
+            return _validate_public_ip(v)
         raise ValueError("Invalid IP format")
 
 
@@ -5111,6 +5211,7 @@ async def blueteam_lookup_ip_abuseipdb(params: IPInput) -> str:
     Returns:
         str: Markdown report (default) or JSON with abuse confidence score, report count, etc.
     """
+    _audit_log("blueteam_lookup_ip_abuseipdb", {"ip": params.ip})
     if not ABUSEIPDB_API_KEY:
         return json.dumps({
             "error": "ABUSEIPDB_API_KEY not set",
@@ -5159,6 +5260,8 @@ async def blueteam_lookup_ip_abuseipdb(params: IPInput) -> str:
         return "\n".join(lines)
     except httpx.HTTPStatusError as e:
         return json.dumps({"error": f"AbuseIPDB API error: {e.response.status_code}", "detail": e.response.text})
+    except httpx.TimeoutException:
+        return json.dumps({"error": f"AbuseIPDB API request timed out after {HTTP_TIMEOUT}s"})
     except Exception as e:
         return json.dumps({"error": str(e)})
 
@@ -5193,6 +5296,7 @@ async def blueteam_lookup_hash_virustotal(params: HashInput) -> str:
     Returns:
         str: Markdown report (default) or JSON with detection ratio, malware names
     """
+    _audit_log("blueteam_lookup_hash_virustotal", {"hash": params.hash_value[:8] + "..."})
     if not VIRUSTOTAL_API_KEY:
         return json.dumps({
             "error": "VIRUSTOTAL_API_KEY not set",
@@ -5250,6 +5354,8 @@ async def blueteam_lookup_hash_virustotal(params: HashInput) -> str:
         if e.response.status_code == 404:
             return json.dumps({"result": "Not found in VirusTotal — hash is unknown or clean"})
         return json.dumps({"error": f"VirusTotal API error: {e.response.status_code}"})
+    except httpx.TimeoutException:
+        return json.dumps({"error": f"VirusTotal API request timed out after {HTTP_TIMEOUT}s"})
     except Exception as e:
         return json.dumps({"error": str(e)})
 
@@ -5283,6 +5389,7 @@ async def blueteam_lookup_domain_virustotal(params: DomainInput) -> str:
     Returns:
         str: Markdown report (default) or JSON with reputation score and detection details
     """
+    _audit_log("blueteam_lookup_domain_virustotal", {"domain": params.domain})
     if not VIRUSTOTAL_API_KEY:
         return json.dumps({"error": "VIRUSTOTAL_API_KEY not set. See blueteam_lookup_hash_virustotal for setup."})
     try:
@@ -5324,6 +5431,10 @@ async def blueteam_lookup_domain_virustotal(params: DomainInput) -> str:
             for engine, cat in sorted(cats.items()):
                 lines.append(f"- **{engine}**: {cat}")
         return "\n".join(lines)
+    except httpx.HTTPStatusError as e:
+        return json.dumps({"error": f"VirusTotal API error: {e.response.status_code}", "detail": str(e.response.text[:200])})
+    except httpx.TimeoutException:
+        return json.dumps({"error": f"VirusTotal API request timed out after {HTTP_TIMEOUT}s"})
     except Exception as e:
         return json.dumps({"error": str(e)})
 
@@ -5340,6 +5451,7 @@ async def blueteam_fail2ban_status() -> str:
     Returns:
         str: Jail list with banned IP counts
     """
+    _audit_log("blueteam_fail2ban_status", {})
     if not shutil.which("fail2ban-client"):
         return _tool_not_found("fail2ban")
     r = _run(["fail2ban-client", "status"])
@@ -5364,6 +5476,7 @@ async def blueteam_fail2ban_jail_status(params: JailInput) -> str:
     Returns:
         str: Jail stats and list of currently banned IPs
     """
+    _audit_log("blueteam_fail2ban_jail_status", {"jail": params.jail})
     if not shutil.which("fail2ban-client"):
         return _tool_not_found("fail2ban")
     r = _run(["fail2ban-client", "status", params.jail])
@@ -5484,6 +5597,7 @@ async def blueteam_find_suid_files() -> str:
     Returns:
         str: List of SUID/SGID files with permissions and owner
     """
+    _audit_log("blueteam_find_suid_files", {})
     r = _run(["find", "/", "-type", "f", r"-perm", "/6000", "-ls"], timeout=60)
     return r["stdout"] or r["stderr"]
 
@@ -5499,6 +5613,7 @@ async def blueteam_find_world_writable() -> str:
     Returns:
         str: List of world-writable paths
     """
+    _audit_log("blueteam_find_world_writable", {})
     cmd = [
         "find", "/",
         "-not", "-path", "/proc/*",
@@ -5530,6 +5645,7 @@ async def blueteam_rootkit_scan(params: RootkitInput) -> str:
     Returns:
         str: Scan output with warnings and clean checks
     """
+    _audit_log("blueteam_rootkit_scan", {"scanner": params.scanner})
     tool = params.tool.lower()
     if tool == "rkhunter":
         if not shutil.which("rkhunter"):
@@ -5557,6 +5673,7 @@ async def blueteam_lynis_audit() -> str:
     Returns:
         str: Lynis audit output with hardening index and suggestions
     """
+    _audit_log("blueteam_lynis_audit", {})
     if not shutil.which("lynis"):
         return _tool_not_found("lynis")
     r = _run(["lynis", "audit", "system", "--quick", "--no-colors"], timeout=180)
@@ -5573,6 +5690,7 @@ async def blueteam_check_updates() -> str:
     Returns:
         str: List of packages with available updates
     """
+    _audit_log("blueteam_check_updates", {})
     if shutil.which("apt"):
         r = _run(["apt", "list", "--upgradeable"], timeout=60)
         return r["stdout"] or r["stderr"]
@@ -5596,6 +5714,7 @@ async def blueteam_check_open_firewall() -> str:
     Returns:
         str: Current firewall ruleset
     """
+    _audit_log("blueteam_check_open_firewall", {})
     if shutil.which("ufw"):
         r = _run(["ufw", "status", "verbose"])
         if r["returncode"] == 0:
@@ -5621,6 +5740,7 @@ async def blueteam_who_is_logged_in() -> str:
     Returns:
         str: Active user session table
     """
+    _audit_log("blueteam_who_is_logged_in", {})
     r = _run(["w", "-h"])
     return r["stdout"] or r["stderr"]
 
@@ -5636,6 +5756,7 @@ async def blueteam_last_logins() -> str:
     Returns:
         str: Login history (last 50 entries)
     """
+    _audit_log("blueteam_last_logins", {})
     r = _run(["last", "-n", "50", "-a", "-i"])
     return r["stdout"] or r["stderr"]
 
@@ -5651,6 +5772,7 @@ async def blueteam_failed_logins() -> str:
     Returns:
         str: Failed login history (last 100 entries)
     """
+    _audit_log("blueteam_failed_logins", {})
     r = _run(["lastb", "-n", "100", "-a", "-i"])
     if r["returncode"] != 0:
         # Try parsing auth.log directly
@@ -5671,6 +5793,7 @@ async def blueteam_sudo_history() -> str:
     Returns:
         str: Lines from auth.log containing sudo activity
     """
+    _audit_log("blueteam_sudo_history", {})
     r = _run(["grep", "sudo:", "/var/log/auth.log"])
     lines = r["stdout"].splitlines()
     return "\n".join(lines[-200:]) if lines else "No sudo activity found (or no auth.log)"
@@ -5687,6 +5810,7 @@ async def blueteam_list_users() -> str:
     Returns:
         str: JSON array of user accounts with risk flags
     """
+    _audit_log("blueteam_list_users", {})
     users = []
     try:
         with open("/etc/passwd") as f:
@@ -5731,6 +5855,7 @@ async def blueteam_check_ssh_authorized_keys() -> str:
     Returns:
         str: JSON with each user's authorized keys (fingerprints)
     """
+    _audit_log("blueteam_check_ssh_authorized_keys", {})
     result = {}
     for home in Path("/home").iterdir():
         ak = home / ".ssh" / "authorized_keys"
@@ -5764,6 +5889,7 @@ async def blueteam_list_processes() -> str:
     Returns:
         str: Process table sorted by CPU usage
     """
+    _audit_log("blueteam_list_processes", {})
     r = _run(["ps", "auxf"])
     return r["stdout"] or r["stderr"]
 
@@ -5779,6 +5905,7 @@ async def blueteam_list_cron_jobs() -> str:
     Returns:
         str: All cron jobs across system and users
     """
+    _audit_log("blueteam_list_cron_jobs", {})
     output = []
 
     # System crontabs
@@ -5817,6 +5944,7 @@ async def blueteam_system_health() -> str:
     Returns:
         str: JSON with system vitals
     """
+    _audit_log("blueteam_system_health", {})
     uptime = _run(["uptime", "-p"])
     disk = _run(["df", "-h", "--exclude-type=tmpfs", "--exclude-type=devtmpfs"])
     mem = _run(["free", "-h"])
@@ -5834,6 +5962,1057 @@ async def blueteam_system_health() -> str:
         "timestamp": datetime.utcnow().isoformat() + "Z",
     }, indent=2)
 
+
+# Shared aggregation helper — posts raw OpenSearch bodies with circuit breaker
+async def _wazuh_indexer_post(body: dict, index_pattern: Optional[str] = None) -> Dict:
+    """Post a raw OpenSearch query body to the Wazuh Indexer.
+
+    All aggregation tools (Tier 1 & Tier 2) funnel through this single helper,
+    which wraps the HTTP call with the ``_cb_wazuh_indexer`` circuit breaker.
+    """
+    if index_pattern is None:
+        index_pattern = _WAZUH_INDEX_PATTERNS["alerts"]
+    if not WAZUH_INDEXER_URL or not WAZUH_INDEXER_PASSWORD:
+        return {"error": "WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD must be set. See README for Indexer setup."}
+    url = f"{WAZUH_INDEXER_URL}/{index_pattern}/_search"
+
+    async def _do_post() -> dict[str, Any]:
+        client = await _get_indexer_client()
+        resp = await client.post(
+            url,
+            auth=(WAZUH_INDEXER_USER, WAZUH_INDEXER_PASSWORD),
+            json=body,
+            headers={"Content-Type": "application/json"},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    try:
+        return await _cb_wazuh_indexer.call(_do_post)
+    except httpx.HTTPStatusError as e:
+        return {"error": f"Indexer API error: {e.response.status_code}", "detail": e.response.text[:500]}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# Tier 1: wazuh_alert_aggregate_analysis — full-period statistics (size: 0 -> summarizes a whole period with no document limit)
+class AggregateAnalysisInput(BaseModel):
+    """Input model for wazuh_alert_aggregate_analysis — zero-doc statistical analysis."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    mode: str = Field(
+        default="summary",
+        description=(
+            "Analysis mode: 'topology' (top attack patterns by IP×rule×agent), "
+            "'anomaly' (statistical-deviation detection per time-slice), "
+            "'correlation' (significant IP↔rule co-occurrence), "
+            "'trend' (multi-resolution rate-of-change detection), "
+            "'summary' (all modes dispatched in parallel — recommended)."
+        ),
+    )
+    since: Optional[str] = Field(
+        default="24h",
+        max_length=30,
+        description="Start of time window. ISO 8601 ('2026-07-01T00:00:00Z') or "
+                    "relative ('5m', '1h', '24h', '7d', '30d'). Default '24h'.",
+    )
+    until: Optional[str] = Field(
+        default=None,
+        max_length=30,
+        description="End of time window. Defaults to now.",
+    )
+    agent_name: Optional[str] = Field(
+        default=None,
+        max_length=64,
+        description="Filter to a specific Wazuh agent.",
+    )
+    rule_groups: Optional[str] = Field(
+        default=None,
+        description="Comma-separated rule group names (e.g. 'authentication_failure,bruteforce').",
+    )
+    rule_level_min: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=16,
+        description="Minimum rule level (e.g. 8 for medium+ severity).",
+    )
+    keyword: Optional[str] = Field(
+        default=None,
+        max_length=1024,
+        description="Free-text keyword filter. Supports +term, -term, OR, *wildcard*.",
+    )
+    top_n: int = Field(
+        default=10,
+        ge=3,
+        le=50,
+        description="Top-N bucket size for terms aggregations (default 10, max 50).",
+    )
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN,
+        description="'markdown' for human-readable stats, 'json' for structured data.",
+    )
+
+    @field_validator("mode")
+    @classmethod
+    def validate_mode(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v not in ("topology", "anomaly", "correlation", "trend", "summary"):
+            raise ValueError("mode must be one of: topology, anomaly, correlation, trend, summary")
+        return v
+
+    @field_validator("agent_name")
+    @classmethod
+    def validate_agent_name(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v = v.strip()
+            if not v:
+                return None
+            if not _AGENT_NAME_SAFE_RE.match(v):
+                raise ValueError("agent_name: use only letters, numbers, hyphen, underscore, dot")
+        return v
+
+    @field_validator("keyword")
+    @classmethod
+    def validate_keyword(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v = v.strip()
+            if not v:
+                return None
+            if len(v) > 1024:
+                raise ValueError("keyword too long (max 1024)")
+            if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", v):
+                raise ValueError("keyword contains invalid control characters")
+        return v
+
+    @field_validator("rule_groups")
+    @classmethod
+    def validate_rule_groups(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v = v.strip()
+            if not v:
+                return None
+            for g in v.split(","):
+                g = g.strip()
+                if not g:
+                    raise ValueError("Empty rule group name in comma-separated list")
+                if not _AGENT_NAME_SAFE_RE.match(g):
+                    raise ValueError(f"Invalid rule group name: '{g}'")
+        return v
+
+
+def _build_filter_clauses(
+    since_str: str,
+    until_str: str,
+    agent_name: Optional[str] = None,
+    rule_groups: Optional[list[str]] = None,
+    rule_level_min: Optional[int] = None,
+    keyword: Optional[str] = None,
+) -> list[dict]:
+    """Build OpenSearch filter clauses shared across all Tier-1 modes."""
+    filters: list[dict] = [
+        {"range": {
+            "@timestamp": {
+                "gte": since_str,
+                "lt": until_str,
+                "format": "strict_date_optional_time",
+            }
+        }},
+    ]
+    if agent_name and agent_name.strip():
+        filters.append({"match": {"agent.name": agent_name.strip()}})
+    if rule_groups:
+        filters.append({"terms": {"rule.groups": list(rule_groups)}})
+    if rule_level_min is not None:
+        filters.append({"range": {"rule.level": {"gte": rule_level_min}}})
+    if keyword and keyword.strip():
+        _KW = [
+            ("full_log", 3), ("rule.description", 2), ("rule.info", 2),
+            ("data.srcip", 2), ("data.srcip2", 2), ("srcip", 2),
+            ("data.url", 0), ("data.domain", 0),
+        ]
+        k = keyword.strip()
+        parts = [f'{f}: ({k})^{b}' if b else f'{f}: ({k})' for f, b in _KW]
+        filters.append({
+            "query_string": {
+                "query": " OR ".join(parts),
+                "default_operator": "AND",
+                "lenient": True,
+            }
+        })
+    return filters
+
+
+async def _aggregate_topology(
+    filters: list[dict],
+    top_n: int,
+    since_str: str,
+    until_str: str,
+) -> dict:
+    """Topology mode: top attack sources × rules × agents."""
+    body = {
+        "size": 0,
+        "query": {"bool": {"filter": filters}},
+        "aggs": {
+            "top_srcips": {"terms": {"field": "data.srcip", "size": top_n, "missing": "0.0.0.0"}},
+            "top_rules": {"terms": {"field": "rule.id.keyword", "size": top_n, "missing": "unknown"}},
+            "top_agents": {"terms": {"field": "agent.name", "size": top_n, "missing": "unknown"}},
+            "severity_bands": {
+                "range": {
+                    "field": "rule.level",
+                    "ranges": [
+                        {"key": "low", "to": 5},
+                        {"key": "medium", "from": 5, "to": 10},
+                        {"key": "high", "from": 10},
+                    ],
+                }
+            },
+        },
+    }
+    return await _wazuh_indexer_post(body)
+
+
+async def _aggregate_anomaly(
+    filters: list[dict],
+    since_str: str,
+    until_str: str,
+) -> dict:
+    """Anomaly mode: time-slice statistics with stddev-based deviation detection."""
+    # Auto-select bucket interval based on window duration
+    dur = _duration_minutes(since_str, until_str)
+    bucket_interval = _auto_bucket_interval(dur)
+
+    body = {
+        "size": 0,
+        "query": {"bool": {"filter": filters}},
+        "aggs": {
+            "time_slices": {
+                "date_histogram": {
+                    "field": "@timestamp",
+                    "fixed_interval": bucket_interval,
+                    "min_doc_count": 0,
+                    "extended_bounds": {"min": since_str, "max": until_str},
+                },
+                "aggs": {
+                    "count_stats": {"extended_stats": {"field": "_index", "missing": 0}},
+                    "by_severity": {
+                        "range": {
+                            "field": "rule.level",
+                            "ranges": [
+                                {"key": "low", "to": 5},
+                                {"key": "medium", "from": 5, "to": 10},
+                                {"key": "high", "from": 10},
+                            ],
+                        }
+                    },
+                },
+            },
+            "global_stats": {"stats_bucket": {"buckets_path": "time_slices>_count"}},
+        },
+    }
+    return await _wazuh_indexer_post(body)
+
+
+async def _aggregate_correlation(
+    filters: list[dict],
+    top_n: int,
+) -> dict:
+    """Correlation mode: significant IP↔rule co-occurrence."""
+    body = {
+        "size": 0,
+        "query": {"bool": {"filter": filters}},
+        "aggs": {
+            "srcips": {
+                "terms": {"field": "data.srcip", "size": top_n, "missing": "0.0.0.0"},
+                "aggs": {
+                    "significant_rules": {
+                        "significant_terms": {
+                            "field": "rule.id.keyword",
+                            "size": 5,
+                        }
+                    }
+                },
+            },
+        },
+    }
+    return await _wazuh_indexer_post(body)
+
+
+async def _aggregate_trend(
+    filters: list[dict],
+    since_str: str,
+    until_str: str,
+    top_n: int,
+) -> dict:
+    """Trend mode: multi-resolution rate-of-change with derivative pipeline."""
+    dur = _duration_minutes(since_str, until_str)
+    fine = _auto_bucket_interval(dur)
+
+    # Coarse = 6× fine interval for zoomed-out view
+    unit = fine[-1]
+    num = int(fine[:-1])
+    coarse = f"{num * 6}{unit}"
+
+    body = {
+        "size": 0,
+        "query": {"bool": {"filter": filters}},
+        "aggs": {
+            "fine_grained": {
+                "date_histogram": {
+                    "field": "@timestamp",
+                    "fixed_interval": fine,
+                    "min_doc_count": 0,
+                    "extended_bounds": {"min": since_str, "max": until_str},
+                },
+                "aggs": {
+                    "top_rules": {"terms": {"field": "rule.id.keyword", "size": top_n}},
+                },
+            },
+            "coarse_grained": {
+                "date_histogram": {
+                    "field": "@timestamp",
+                    "fixed_interval": coarse,
+                    "min_doc_count": 0,
+                    "extended_bounds": {"min": since_str, "max": until_str},
+                },
+                "aggs": {
+                    "rate_of_change": {
+                        "derivative": {"buckets_path": "_count"},
+                    },
+                    "top_rules": {"terms": {"field": "rule.id.keyword", "size": top_n}},
+                },
+            },
+        },
+    }
+    return await _wazuh_indexer_post(body)
+
+
+def _format_aggregate_markdown(
+    params: AggregateAnalysisInput,
+    results_by_mode: dict,
+    since_str: str,
+    until_str: str,
+    errors: dict,
+) -> str:
+    """Render aggregate analysis results as markdown."""
+    lines = [
+        f"# Wazuh Alert Aggregate Analysis",
+        "",
+        f"**Window**: {since_str} → {until_str}",
+        f"**Mode(s)**: {params.mode}",
+        "",
+    ]
+
+    for mode_name, display in [
+        ("topology", "Attack Topology"),
+        ("anomaly", "Anomaly Detection"),
+        ("correlation", "IP↔Rule Correlation"),
+        ("trend", "Multi-Resolution Trend"),
+    ]:
+        if mode_name not in results_by_mode:
+            continue
+        data = results_by_mode[mode_name]
+        if isinstance(data.get("error"), str):
+            errors[mode_name] = data["error"]
+            continue
+        lines.append(f"## {display}")
+        lines.append("")
+
+        aggs = data.get("aggregations", {})
+        hits_total = data.get("hits", {}).get("total", {})
+
+        if mode_name == "topology":
+            total = hits_total.get("value", "?")
+            lines.append(f"**Total matching alerts**: {total}")
+            lines.append("")
+            for agg_key, label in [
+                ("top_srcips", "Top Source IPs"),
+                ("top_rules", "Top Rules"),
+                ("top_agents", "Top Agents"),
+            ]:
+                buckets = (aggs.get(agg_key, {}) or {}).get("buckets", [])
+                if buckets:
+                    lines.append(f"### {label}")
+                    for b in buckets[:params.top_n]:
+                        lines.append(f"- `{b.get('key', '?')}` — {b.get('doc_count', 0)} alerts")
+                    lines.append("")
+            sev = (aggs.get("severity_bands", {}) or {}).get("buckets", [])
+            if sev:
+                lines.append("### Severity Distribution")
+                for b in sev:
+                    lines.append(f"- **{b.get('key')}** (level {b.get('from', '')}–{b.get('to', '')}): {b.get('doc_count', 0)}")
+                lines.append("")
+
+        elif mode_name == "anomaly":
+            gs = aggs.get("global_stats", {})
+            lines.append(f"- **Mean alerts per slice**: {gs.get('avg', '?'):.1f}")
+            lines.append(f"- **StdDev**: {gs.get('std_deviation', '?'):.1f}")
+            lines.append(f"- **Min/Max per slice**: {gs.get('min', '?')} / {gs.get('max', '?')}")
+            lines.append("")
+            slices = (aggs.get("time_slices", {}) or {}).get("buckets", [])
+            threshold = gs.get("avg", 0) + 2 * gs.get("std_deviation", 0)
+            anomalies = [s for s in slices if s.get("doc_count", 0) > threshold]
+            if anomalies:
+                lines.append(f"### Anomalous Slices (>μ+2σ): {len(anomalies)}")
+                lines.append("| Time | Count | Severity (L/M/H) |")
+                lines.append("|------|-------|-------------------|")
+                for s in anomalies[:10]:
+                    ts = s.get("key_as_string", s.get("key", "?"))[:19]
+                    sev = (s.get("by_severity", {}) or {}).get("buckets", [])
+                    sev_str = " / ".join(f"{r.get('doc_count', 0)}" for r in sev)
+                    lines.append(f"| {ts} | **{s.get('doc_count', 0)}** | {sev_str} |")
+            else:
+                lines.append("_No statistically anomalous slices detected._")
+            lines.append("")
+
+        elif mode_name == "correlation":
+            srcips = (aggs.get("srcips", {}) or {}).get("buckets", [])
+            if srcips:
+                lines.append("| Source IP | Alert Count | Top Significant Rules |")
+                lines.append("|-----------|-------------|----------------------|")
+                for ip_b in srcips[:params.top_n]:
+                    ip = ip_b.get("key", "?")
+                    cnt = ip_b.get("doc_count", 0)
+                    sig = (ip_b.get("significant_rules", {}) or {}).get("buckets", [])
+                    rules_str = ", ".join(
+                        f"`{r.get('key', '?')}` (×{r.get('doc_count', 0)})"
+                        for r in sig[:3]
+                    ) or "—"
+                    lines.append(f"| `{ip}` | {cnt} | {rules_str} |")
+            else:
+                lines.append("_No significant correlations found._")
+            lines.append("")
+
+        elif mode_name == "trend":
+            coarse_agg = aggs.get("coarse_grained", {})
+            buckets = coarse_agg.get("buckets", [])
+            if buckets:
+                accelerating = [b for b in buckets if b.get("rate_of_change", {}).get("value", 0) > 0]
+                decelerating = [b for b in buckets if b.get("rate_of_change", {}).get("value", 0) < 0]
+                lines.append(f"- **Accelerating periods**: {len(accelerating)}")
+                lines.append(f"- **Decelerating periods**: {len(decelerating)}")
+                if accelerating:
+                    lines.append(f"- **Peak rate of change**: +{max(b.get('rate_of_change', {}).get('value', 0) or 0 for b in accelerating):.1f} alerts/slice")
+                lines.append("")
+                # Show fine-grained top rules from the latest bucket
+                fine = aggs.get("fine_grained", {}).get("buckets", [])
+                if fine:
+                    latest = fine[-1]
+                    top_rules = (latest.get("top_rules", {}) or {}).get("buckets", [])
+                    if top_rules:
+                        lines.append("### Latest Time-Slice Top Rules")
+                        for r in top_rules[:5]:
+                            lines.append(f"- `{r.get('key', '?')}` — {r.get('doc_count', 0)} alerts")
+                        lines.append("")
+            else:
+                lines.append("_No trend data available._")
+                lines.append("")
+
+    if errors:
+        lines.append("## Errors")
+        for mode_name, err in errors.items():
+            lines.append(f"- **{mode_name}**: {err}")
+
+    return "\n".join(lines)
+
+
+def _format_aggregate_json(
+    params: AggregateAnalysisInput,
+    results_by_mode: dict,
+    since_str: str,
+    until_str: str,
+) -> str:
+    """Render aggregate analysis results as JSON."""
+    return _truncate_if_needed(json.dumps({
+        "window": {"since": since_str, "until": until_str},
+        "mode": params.mode,
+        "results": results_by_mode,
+    }, indent=2, default=str))
+
+
+@mcp.tool(
+    name="wazuh_alert_aggregate_analysis",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def wazuh_alert_aggregate_analysis(params: AggregateAnalysisInput) -> str:
+    """Full-period statistical analysis of Wazuh alerts — NO document limits.
+
+    All matching alerts are processed server-side by the Wazuh Indexer (OpenSearch)
+    using ``size: 0`` aggregations. Only statistics and bucketed summaries are
+    returned — ZERO raw alert documents. This means 1M alerts and 10K alerts
+    consume roughly the same LLM context budget (~10–50 KB).
+
+    **Analysis modes:**
+    - ``topology`` — Top-N (src_ip × rule_id × agent) attack patterns + severity bands
+    - ``anomaly`` — Statistical-deviation detection: which time slices are >2σ above mean?
+    - ``correlation`` — Significant IP↔rule co-occurrence via significant_terms
+    - ``trend`` — Multi-resolution rate-of-change (acceleration/deceleration) detection
+    - ``summary`` — All four modes dispatched in parallel (recommended)
+
+    **Typical workflow:**
+    1. Call with ``mode="summary"`` to get the full statistical picture
+    2. Identify hot spots from the results (specific IPs, rules, time windows)
+    3. Use ``wazuh_alert_focused_crawl`` to drill into those specific slices
+
+    Args:
+        params.mode: Analysis mode (default 'summary').
+        params.since: Start of time window (default '24h').
+        params.until: End of time window (default: now).
+        params.agent_name: Optional agent filter.
+        params.rule_groups: Optional comma-separated rule groups (e.g. 'authentication_failure').
+        params.rule_level_min: Minimum rule level (e.g. 8).
+        params.keyword: Optional free-text keyword filter.
+        params.top_n: Top-N bucket size for terms aggregations (default 10).
+        params.response_format: 'markdown' (default) or 'json'.
+
+    Returns:
+        str: Structured statistical report — no raw documents.
+
+    Example usage:
+        - "Give me a statistical summary of the last 24 hours of Wazuh alerts"
+        - "Which source IPs are showing anomalous activity patterns this week?"
+        - "Analyze attack correlation for agent HYDRA-DC across the past 48h"
+        - "Is the attack velocity accelerating or decelerating over the last 6 hours?"
+
+    Error Handling:
+        - Returns partial results if individual modes fail (errors listed at end)
+        - All modes go through the Wazuh Indexer circuit breaker
+        - Timeout/connection failures surface actionable error messages per mode
+    """
+    _audit_log("wazuh_alert_aggregate_analysis", {"mode": params.mode, "since": params.since})
+    since_str, until_str = _parse_time_window(params.since, params.until)
+
+    rule_group_list: Optional[list[str]] = None
+    if params.rule_groups:
+        rule_group_list = [g.strip() for g in params.rule_groups.split(",") if g.strip()]
+
+    filters = _build_filter_clauses(
+        since_str=since_str,
+        until_str=until_str,
+        agent_name=params.agent_name,
+        rule_groups=rule_group_list,
+        rule_level_min=params.rule_level_min,
+        keyword=params.keyword,
+    )
+
+    modes_to_run: dict[str, Any] = {}
+    if params.mode == "summary":
+        modes_to_run = {
+            "topology": _aggregate_topology(filters, params.top_n, since_str, until_str),
+            "anomaly": _aggregate_anomaly(filters, since_str, until_str),
+            "correlation": _aggregate_correlation(filters, params.top_n),
+            "trend": _aggregate_trend(filters, since_str, until_str, params.top_n),
+        }
+    elif params.mode == "topology":
+        modes_to_run = {
+            "topology": _aggregate_topology(filters, params.top_n, since_str, until_str),
+        }
+    elif params.mode == "anomaly":
+        modes_to_run = {
+            "anomaly": _aggregate_anomaly(filters, since_str, until_str),
+        }
+    elif params.mode == "correlation":
+        modes_to_run = {
+            "correlation": _aggregate_correlation(filters, params.top_n),
+        }
+    elif params.mode == "trend":
+        modes_to_run = {
+            "trend": _aggregate_trend(filters, since_str, until_str, params.top_n),
+        }
+
+    # Dispatch all modes concurrently
+    tasks = dict(modes_to_run)
+    gathered = await asyncio.gather(*tasks.values(), return_exceptions=True)
+    results_by_mode: dict = {}
+    errors: dict = {}
+    for mode_name, result in zip(tasks.keys(), gathered):
+        if isinstance(result, BaseException):
+            errors[mode_name] = str(result)
+        else:
+            results_by_mode[mode_name] = result
+
+    if params.response_format == ResponseFormat.JSON:
+        return _format_aggregate_json(params, results_by_mode, since_str, until_str)
+    return _format_aggregate_markdown(params, results_by_mode, since_str, until_str, errors)
+
+
+# Tier 2: wazuh_alert_dsl_query - power user escape hatch (size: 0 enforced)
+class DslQueryInput(BaseModel):
+    """Input model for wazuh_alert_dsl_query — raw OpenSearch DSL, aggregation-only."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    query_json: str = Field(
+        ...,
+        min_length=5,
+        max_length=10240,
+        description=(
+            "Raw OpenSearch DSL JSON payload. MUST use 'size': 0 (aggregation-only). "
+            "Any query requesting document hits (size > 0) will be rejected. "
+            "Docs: https://opensearch.org/docs/latest/aggregations/"
+        ),
+    )
+    index_pattern: str = Field(
+        default="wazuh-alerts-*",
+        max_length=128,
+        description="OpenSearch index pattern (default 'wazuh-alerts-*'). "
+                    "Also accepts 'wazuh-events-*', 'wazuh-states-vulnerabilities-*'.",
+    )
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.JSON,
+        description="'json' (default, machine-readable) or 'markdown'.",
+    )
+
+    @field_validator("query_json")
+    @classmethod
+    def validate_dsl(cls, v: str) -> str:
+        """Parse the JSON and enforce size: 0 — no document hits allowed."""
+        try:
+            parsed = json.loads(v)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in query_json: {e}") from e
+
+        # Enforce aggregation-only: size must be 0
+        size_val = parsed.get("size", 10)  # OpenSearch defaults size to 10
+        if size_val != 0:
+            raise ValueError(
+                f"query_json has 'size': {size_val}. This tool only accepts size: 0 "
+                "(aggregation-only queries). To retrieve raw alert documents, use "
+                "wazuh_alert_focused_crawl instead."
+            )
+
+        # Must contain 'aggs' or 'aggregations'
+        if "aggs" not in parsed and "aggregations" not in parsed:
+            raise ValueError(
+                "query_json must contain 'aggs' or 'aggregations' key. "
+                "This tool is for aggregation queries only."
+            )
+
+        # Reject scripted aggregations that could be expensive
+        def _check_no_scripts(obj: Any, path: str = "") -> None:
+            if isinstance(obj, dict):
+                if "script" in obj and path:
+                    raise ValueError(
+                        f"Script found at '{path}' — scripted aggregations are not "
+                        "supported in this tool for security and performance reasons."
+                    )
+                for k, val in obj.items():
+                    _check_no_scripts(val, f"{path}.{k}" if path else k)
+            elif isinstance(obj, list):
+                for i, item in enumerate(obj):
+                    _check_no_scripts(item, f"{path}[{i}]")
+
+        _check_no_scripts(parsed)
+        return v
+
+    @field_validator("index_pattern")
+    @classmethod
+    def validate_index_pattern(cls, v: str) -> str:
+        v = v.strip()
+        # Allow only safe index patterns: alphanumeric, *, -, _
+        if not re.match(r"^[a-zA-Z0-9*_\-.,]+$", v):
+            raise ValueError(
+                "index_pattern must be a valid OpenSearch index pattern "
+                "(e.g. 'wazuh-alerts-*', 'wazuh-events-*')"
+            )
+        return v
+
+
+@mcp.tool(
+    name="wazuh_alert_dsl_query",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def wazuh_alert_dsl_query(params: DslQueryInput) -> str:
+    """Execute a raw OpenSearch DSL aggregation query against the Wazuh Indexer.
+
+    This is an **aggregation-only** escape hatch for analytical questions that
+    don't fit the pre-built ``wazuh_alert_aggregate_analysis`` modes. The input
+    DSL must use ``"size": 0`` — raw document retrieval is rejected at validation
+    time. Scripted aggregations are also blocked for security.
+
+    Use this when you need a specific OpenSearch aggregation (percentiles,
+    geo_distance, nested, reverse_nested, etc.) that the built-in tools
+    do not expose.
+
+    Args:
+        params.query_json: Raw OpenSearch DSL JSON. MUST include ``"size": 0``
+                          and an ``"aggs"`` (or ``"aggregations"``) block.
+        params.index_pattern: Index pattern (default 'wazuh-alerts-*').
+        params.response_format: 'json' (default) or 'markdown'.
+
+    Returns:
+        str: OpenSearch aggregation response (JSON by default, markdown on request).
+
+    Example usage:
+        - "Compute percentile latency distribution across all alert documents"
+        - "Group alerts by geo_point and return top regions"
+        - "Nested aggregation: alerts per agent, then per rule within each agent"
+
+    Error Handling:
+        - Invalid JSON → rejected at Pydantic validation
+        - ``size`` > 0 → rejected with guidance to use wazuh_alert_focused_crawl
+        - Scripted aggs → rejected for security
+        - HTTP errors → surfaced through the circuit breaker
+
+    Docs: https://opensearch.org/docs/latest/aggregations/
+    """
+    _audit_log("wazuh_alert_dsl_query", {"index": params.index_pattern})
+    try:
+        data = await _wazuh_indexer_post(
+            json.loads(params.query_json),
+            index_pattern=params.index_pattern,
+        )
+    except (httpx.HTTPStatusError, httpx.TimeoutException, CircuitBreakerOpenError, RuntimeError) as e:
+        return _handle_api_error(e, context="wazuh_alert_dsl_query")
+
+    if params.response_format == ResponseFormat.MARKDOWN:
+        if isinstance(data.get("error"), str):
+            return f"# DSL Query Error\n\n**Error**: {data['error']}\n\n**Detail**: {data.get('detail', 'N/A')}"
+        aggs = data.get("aggregations", data.get("aggs", {}))
+        return f"# DSL Query Result\n\n**Index**: {params.index_pattern}\n\n```json\n{json.dumps(aggs, indent=2, default=str)[:CHARACTER_LIMIT]}\n```"
+
+    return _truncate_if_needed(json.dumps(data, indent=2, default=str))
+
+
+# Tier 3: wazuh_alert_focused_crawl deep dive into hot spots
+class FocusedCrawlInput(BaseModel):
+    """Input model for wazuh_alert_focused_crawl — surgical deep-dive into specific alert clusters."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    src_ip: Optional[str] = Field(
+        default=None,
+        max_length=45,
+        description="Specific source IP to drill into (e.g. the top abuser from aggregate analysis).",
+    )
+    rule_id: Optional[str] = Field(
+        default=None,
+        max_length=32,
+        description="Specific rule ID to drill into (e.g. '5763' for authentication failure).",
+    )
+    agent_name: Optional[str] = Field(
+        default=None,
+        max_length=64,
+        description="Filter to a specific Wazuh agent.",
+    )
+    since: Optional[str] = Field(
+        default="24h",
+        max_length=30,
+        description="Start of time window (ISO 8601 or relative expression). Default '24h'.",
+    )
+    until: Optional[str] = Field(
+        default=None,
+        max_length=30,
+        description="End of time window. Defaults to now.",
+    )
+    sample_size: int = Field(
+        default=50,
+        ge=1,
+        le=200,
+        description="Number of representative alert documents to retrieve (default 50, max 200).",
+    )
+    include_full_log: bool = Field(
+        default=True,
+        description="Include the full_log field in returned documents (PII-redacted per BLUETEAM_REDACT_PII).",
+    )
+    bypass_redaction: bool = Field(
+        default=False,
+        description="Bypass PII redaction for audit investigations (requires BLUETEAM_REDACT_PII disabled).",
+    )
+    fields: Optional[str] = Field(
+        default=None,
+        description="Comma-separated additional _source fields to retrieve beyond defaults. "
+                    "Example: 'data.url,data.domain,data.user_agent'.",
+    )
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN,
+        description="'markdown' (default) for human-readable alert summaries, 'json' for structured data.",
+    )
+
+    @field_validator("src_ip")
+    @classmethod
+    def validate_src_ip(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v = v.strip()
+            if not v:
+                return None
+            try:
+                ipaddress.ip_address(v)
+            except ValueError as exc:
+                raise ValueError(f"Invalid IP address: '{v}'") from exc
+        return v
+
+    @field_validator("rule_id")
+    @classmethod
+    def validate_rule_id(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v = v.strip()
+            if not v:
+                return None
+            if not re.match(r"^\d{1,10}$", v):
+                raise ValueError("rule_id must be numeric (e.g. '5763')")
+        return v
+
+    @field_validator("agent_name")
+    @classmethod
+    def validate_agent_name(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v = v.strip()
+            if not v:
+                return None
+            if not _AGENT_NAME_SAFE_RE.match(v):
+                raise ValueError("agent_name: use only letters, numbers, hyphen, underscore, dot")
+        return v
+
+    @field_validator("fields")
+    @classmethod
+    def validate_fields(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v = v.strip()
+            if not v:
+                return None
+            parts = [p.strip() for p in v.split(",") if p.strip()]
+            for p in parts:
+                if not re.match(r"^[a-zA-Z0-9_.]+$", p):
+                    raise ValueError(f"Invalid field name: '{p}'. Use only alphanumeric, dots, underscores.")
+        return v
+
+
+@mcp.tool(
+    name="wazuh_alert_focused_crawl",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def wazuh_alert_focused_crawl(params: FocusedCrawlInput) -> str:
+    """Surgical deep-dive into specific Wazuh alert clusters.
+
+    After ``wazuh_alert_aggregate_analysis`` identifies hot spots (top source IPs,
+    most-triggered rules, anomalous time windows), use this tool to retrieve
+    representative alert samples from those specific slices with full context.
+
+    This is the **drill-through** tool — it returns actual alert documents
+    (PII-redacted per ``BLUETEAM_REDACT_PII``). Call it once per identified
+    hot spot, not for the entire dataset.
+
+    Args:
+        params.src_ip: Specific source IP identified as a hot spot.
+        params.rule_id: Specific rule ID (e.g. '5763') identified as a top offender.
+        params.agent_name: Filter to a specific agent.
+        params.since: Start of time window (default '24h').
+        params.until: End of time window (default: now).
+        params.sample_size: Alert documents to retrieve (default 50, max 200).
+        params.include_full_log: Include raw log lines (PII-redacted).
+        params.bypass_redaction: Skip PII masking for audit (if BLUETEAM_REDACT_PII allows).
+        params.fields: Comma-separated extra _source fields to include.
+        params.response_format: 'markdown' (default) or 'json'.
+
+    Returns:
+        str: Representative alert documents with full context, PII-redacted.
+             Includes next_cursor for further pagination into same slice.
+
+    Example usage:
+        - "Drill into the top abuser IP from the aggregate analysis"
+        - "Show me 50 alerts for rule 5763 on agent HYDRA-DC from the past hour"
+        - "Get full alert details for the anomalous 5-minute window at 03:15 UTC"
+
+    Error Handling:
+        - "No data found for this target" if the slice has no matching alerts
+        - Circuit breaker open → actionable retry message
+        - PII redaction applied automatically (bypass with bypass_redaction=True)
+    """
+    _audit_log("wazuh_alert_focused_crawl", {"src_ip": params.src_ip, "rule_id": params.rule_id, "sample_size": params.sample_size})
+    since_str, until_str = _parse_time_window(params.since, params.until)
+
+    # Build _source fields: defaults + user-specified extras
+    source_fields = [
+        "@timestamp",
+        "agent.name",
+        "rule.id",
+        "rule.level",
+        "rule.description",
+        "data.srcip",
+        "data.url",
+        "predecoder.hostname",
+        "location",
+        "id",
+    ]
+    if params.include_full_log:
+        source_fields.append("full_log")
+    if params.fields:
+        extras = [f.strip() for f in params.fields.split(",") if f.strip()]
+        for f in extras:
+            if f not in source_fields:
+                source_fields.append(f)
+
+    try:
+        data = await _wazuh_indexer_search(
+            index_pattern=_WAZUH_INDEX_PATTERNS["alerts"],
+            agent_name=params.agent_name,
+            size=params.sample_size,
+            srcip=params.src_ip,
+            since=since_str,
+            until=until_str,
+            fields=source_fields,
+        )
+    except (httpx.HTTPStatusError, httpx.TimeoutException, CircuitBreakerOpenError, RuntimeError) as e:
+        return _handle_api_error(e, context="wazuh_alert_focused_crawl")
+
+    if isinstance(data.get("error"), str):
+        return json.dumps(data, indent=2)
+
+    hits = data.get("hits", {})
+    total = hits.get("total", {})
+    hit_list = hits.get("hits", [])
+
+    # Apply PII redaction to all document bodies
+    docs = [_redact_alert_data(h.get("_source", h), bypass=params.bypass_redaction) for h in hit_list]
+
+    # Build next_cursor for further pagination within the same slice
+    next_cursor = None
+    if hit_list and len(docs) >= params.sample_size:
+        last_sort = hit_list[-1].get("sort")
+        if last_sort:
+            next_cursor = _encode_cursor({"search_after": last_sort})
+
+    # Count unique source IPs and rules in the sample
+    unique_ips = set()
+    unique_rules = set()
+    level_counts: dict[str, int] = {}
+    for d in docs:
+        src = d.get("data", {}).get("srcip") if isinstance(d.get("data"), dict) else d.get("data.srcip")
+        if src:
+            unique_ips.add(str(src))
+        rid = d.get("rule", {}).get("id") if isinstance(d.get("rule"), dict) else d.get("rule.id")
+        if rid:
+            unique_rules.add(str(rid))
+        lvl = d.get("rule", {}).get("level") if isinstance(d.get("rule"), dict) else d.get("rule.level")
+        if lvl is not None:
+            band = "high" if lvl >= 10 else ("medium" if lvl >= 5 else "low")
+            level_counts[band] = level_counts.get(band, 0) + 1
+
+    if params.response_format == ResponseFormat.JSON:
+        return _truncate_if_needed(json.dumps({
+            "window": {"since": since_str, "until": until_str},
+            "filter": {
+                "src_ip": params.src_ip,
+                "rule_id": params.rule_id,
+                "agent_name": params.agent_name,
+            },
+            "total": {"value": total.get("value", 0), "relation": total.get("relation", "eq")},
+            "count": len(docs),
+            "sample_unique_ips": len(unique_ips),
+            "sample_unique_rules": len(unique_rules),
+            "severity_bands": level_counts,
+            "next_cursor": next_cursor,
+            "alerts": docs,
+        }, indent=2, default=str))
+
+    # Markdown format
+    total_val = total.get("value", 0)
+    lines = [
+        "# Wazuh Alert Focused Crawl",
+        "",
+        f"**Window**: {since_str} → {until_str}",
+        "",
+        "| Filter | Value |",
+        "|--------|-------|",
+    ]
+    if params.src_ip:
+        lines.append(f"| Source IP | `{params.src_ip}` |")
+    if params.rule_id:
+        lines.append(f"| Rule ID | `{params.rule_id}` |")
+    if params.agent_name:
+        lines.append(f"| Agent | `{params.agent_name}` |")
+    lines.extend([
+        f"| Total matching | {total_val} ({total.get('relation', 'eq')}) |",
+        f"| Retrieved | {len(docs)} |",
+        f"| Unique IPs in sample | {len(unique_ips)} |",
+        f"| Unique rules in sample | {len(unique_rules)} |",
+        "",
+    ])
+    if level_counts:
+        lines.append(f"**Severity**: L:{level_counts.get('low', 0)} M:{level_counts.get('medium', 0)} H:{level_counts.get('high', 0)}")
+        lines.append("")
+
+    if not docs:
+        lines.append("_No alerts matched the filter criteria in this time window._")
+    else:
+        lines.append(f"## Alert Samples ({len(docs)} of {total_val} total)")
+        lines.append("")
+        for i, d in enumerate(docs[:20], 1):
+            ts = d.get("@timestamp", "?")
+            rule = d.get("rule", {}) if isinstance(d.get("rule"), dict) else {}
+            rid = rule.get("id", d.get("rule.id", "?"))
+            desc = rule.get("description", d.get("rule.description", "?"))
+            lvl = rule.get("level", d.get("rule.level", "?"))
+            src = d.get("data", {}).get("srcip") if isinstance(d.get("data"), dict) else d.get("data.srcip", "?")
+            agent = d.get("agent", {}).get("name") if isinstance(d.get("agent"), dict) else d.get("agent.name", "?")
+            lines.append(f"**{i}.** `{ts}` | Level {lvl} | Rule {rid} — {desc}")
+            lines.append(f"   - Source: `{src}` | Agent: `{agent}`")
+            full = d.get("full_log", "")
+            if full:
+                lines.append(f"   - Log: `{str(full)[:200]}{'...' if len(str(full)) > 200 else ''}`")
+            lines.append("")
+        if len(docs) > 20:
+            lines.append(f"_... and {len(docs) - 20} more alerts (use next_cursor for next page)_")
+
+    if next_cursor:
+        lines.append("")
+        lines.append(f"**next_cursor**: `{next_cursor}` — pass this to the `cursor` parameter of `blueteam_wazuh_indexer_search` to continue paginating this slice.")
+
+    return _truncate_if_needed("\n".join(lines))
+
+
+# Case-insensitive tool lookup — transparently handles LLM casing variations.
+# When an LLM generates a tool call like "CrowdSec_IP_Reputation" instead of
+# "crowdsec_ip_reputation", this layer normalizes the name before the FastMCP
+# dispatcher sees it — no user configuration required. The fast path (exact
+# match via dict.get) adds zero overhead for correctly-cased calls.
+_original_get_tool = mcp._tool_manager.get_tool
+
+_tool_name_index: dict[str, str] = {
+    name.casefold(): name
+    for name in mcp._tool_manager._tools
+}
+
+
+def _case_insensitive_get_tool(name: str):
+    """Case-insensitive tool lookup via casefold normalization.
+
+    **Fast path** (exact match): ``dict.get(name)`` — O(1), no allocation.
+    Used for every correct call; handles 99.9% of traffic with zero overhead.
+
+    **Slow path** (case-insensitive fallback): walks the ``_tool_name_index``
+    on first mismatch per session, then caches the canonical name.  Handles
+    LLM casing drift (e.g. ``CrowdSecIpReputation`` → ``crowdsec_ip_reputation``).
+    """
+    tool = mcp._tool_manager._tools.get(name)
+    if tool is not None:
+        return tool
+    canonical = _tool_name_index.get(name.casefold())
+    if canonical is not None:
+        return mcp._tool_manager._tools[canonical]
+    return None
+
+
+mcp._tool_manager.get_tool = _case_insensitive_get_tool
+
+logger.info(
+    "Tool router: case-insensitive matching active (%d tools indexed). "
+    "LLM casing variations in tool names will be normalized automatically.",
+    len(_tool_name_index),
+)
 
 
 # ENTRY POINT / TRANSPORT SELECTION
@@ -5871,24 +7050,20 @@ def _validate_configuration() -> None:
     time), but we emit clear WARNINGs so operators know which tools will be
     unavailable before a request fails.
     """
-    _check = lambda var, name, doc_url: (
-        logger.warning(
-            "%s is not set — %s tools will be unavailable. "
-            "Set the environment variable and restart. Docs: %s",
-            name, name.split("_")[0], doc_url
-        )
-        if not os.environ.get(var, "").strip()
-        else None
-    )
-
-    _check("CROWDSEC_API_KEY", "CROWDSEC_API_KEY",
-           "https://docs.crowdsec.net/docs/cti_api/getting_started")
-    _check("ABUSEIPDB_API_KEY", "ABUSEIPDB_API_KEY",
-           "https://docs.abuseipdb.com/")
-    _check("VIRUSTOTAL_API_KEY", "VIRUSTOTAL_API_KEY",
-           "https://docs.virustotal.com/reference/overview")
-    _check("NETRA_API_KEY", "NETRA_API_KEY",
-           "https://netra.tangerangkota.go.id/docs")
+    _check_key = [
+        ("CROWDSEC_API_KEY", "https://docs.crowdsec.net/docs/cti_api/getting_started"),
+        ("ABUSEIPDB_API_KEY", "https://docs.abuseipdb.com/"),
+        ("VIRUSTOTAL_API_KEY", "https://docs.virustotal.com/reference/overview"),
+        ("NETRA_API_KEY", "https://netra.tangerangkota.go.id/docs"),
+    ]
+    for env_var, doc_url in _check_key:
+        if not os.environ.get(env_var, "").strip():
+            label = env_var.removesuffix("_API_KEY")
+            logger.warning(
+                "%s is not set — %s tools will be unavailable. "
+                "Set the environment variable and restart. Docs: %s",
+                env_var, label, doc_url
+            )
 
     if not os.environ.get("WAZUH_API_URL", "").strip():
         logger.warning(
@@ -5903,6 +7078,16 @@ def _validate_configuration() -> None:
             "will be unavailable."
         )
 
+    # WAZUH_INDEXER_MAX_SIZE guard — warn if it exceeds OpenSearch's default max_result_window
+    if _WAZUH_INDEXER_MAX_SIZE > 10000:
+        logger.warning(
+            "WAZUH_INDEXER_MAX_SIZE is %d — this exceeds OpenSearch's default "
+            "index.max_result_window of 10,000. Indexer queries using size > 10000 "
+            "will fail unless the cluster limit has been raised. "
+            "Set WAZUH_INDEXER_MAX_SIZE=10000 (or lower) to stay within defaults.",
+            _WAZUH_INDEXER_MAX_SIZE,
+        )
+
 
 def main() -> None:
     """Start the MCP server on the selected transport."""
@@ -5910,7 +7095,13 @@ def main() -> None:
     args = _build_arg_parser().parse_args()
 
     if args.transport == "stdio":
-        logger.info("Starting blue_team_mcp via stdio transport")
+        logger.info("Starting %s via stdio transport", _MCP_SERVER_NAME)
+        logger.info(
+            "MCP server name: '%s'. Ensure your MCP client config uses "
+            "an all-lowercase server name to prevent LLM casing mismatches "
+            "(e.g. 'blue-team-mcp' not 'BlueTeamMCP').",
+            _MCP_SERVER_NAME,
+        )
         mcp.run(transport="stdio")
         return
 
@@ -5941,7 +7132,8 @@ def main() -> None:
 
     if args.transport in ("streamable_http", "http"):
         logger.info(
-            "Starting blue_team_mcp via Streamable HTTP transport on %s:%s",
+            "Starting %s via Streamable HTTP transport on %s:%s",
+            _MCP_SERVER_NAME,
             args.host,
             args.port,
         )

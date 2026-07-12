@@ -36,9 +36,12 @@ apt-get install -y --no-install-recommends \
 
 echo "[2/7] Creating install directory at $INSTALL_DIR..."
 mkdir -p "$INSTALL_DIR"
+
+# Clean stale bytecode before copying (prevents Python version mismatch issues)
+find . -type d -name "__pycache__" -not -path "./.venv/*" -exec rm -rf {} + 2>/dev/null || true
+find . -type f -name "*.pyc" -not -path "./.venv/*" -delete 2>/dev/null || true
+
 cp blue_team_server.py "$INSTALL_DIR/"
-cp blue_team_server_crowdsec.py "$INSTALL_DIR/"
-cp blue_team_server_greynoise.py "$INSTALL_DIR/"
 cp requirements.txt "$INSTALL_DIR/"
 cp README.md "$INSTALL_DIR/"
 
@@ -97,8 +100,27 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 # CrowdSec CTI cache TTL (seconds, default 900 = 15 min)
 # export CROWDSEC_CACHE_TTL="900"
 
-# PII redaction (enabled by default — set to false to return raw alert data)
+# Data masking (see SECURITY.md §4 for the three-layer model)
+#
+# Layer 1 — CREDENTIAL STRIPPING: ALWAYS active, never configurable.
+#   Bearer tokens, API keys, JWTs, passwords etc. are stripped before
+#   any data reaches the LLM.  There is no legitimate use case for
+#   sending credentials to an AI model.
+#
+# Layer 2 — Email redaction (BLUETEAM_REDACT_EMAILS, default: true):
+#   Masks the local part of email addresses (preserving first/last char
+#   + forensic hash), keeps the FULL domain visible for threat intel.
+#   Set to "false" when SOC analysts need to identify specific
+#   compromised accounts during incident investigation.
+# export BLUETEAM_REDACT_EMAILS="true"
+#
+# Layer 3 — Internal IP masking (BLUETEAM_REDACT_PII, default: true):
+#   Masks RFC1918 addresses (10.x, 172.16-31.x, 192.168.x).
+#   PUBLIC ATTACKER IPs AND DOMAINS ARE NEVER MASKED — they are IoCs.
 # export BLUETEAM_REDACT_PII="true"
+
+# Server identity (optional — use lowercase to avoid LLM casing mismatches)
+# export BLUE_TEAM_MCP_SERVER_NAME="blue_team_mcp"
 
 # Audit and limits (optional)
 # export BLUETEAM_AUDIT_LOG="/var/log/blue-team-mcp-audit.jsonl"
@@ -137,6 +159,8 @@ export BLUETEAM_CHARACTER_LIMIT="${BLUETEAM_CHARACTER_LIMIT:-100000}"
 export BLUETEAM_VERIFY_SSL="${BLUETEAM_VERIFY_SSL:-true}"
 export CROWDSEC_CACHE_TTL="${CROWDSEC_CACHE_TTL:-900}"
 export BLUETEAM_REDACT_PII="${BLUETEAM_REDACT_PII:-true}"
+export BLUETEAM_REDACT_EMAILS="${BLUETEAM_REDACT_EMAILS:-true}"
+export BLUE_TEAM_MCP_SERVER_NAME="${BLUE_TEAM_MCP_SERVER_NAME:-blue_team_mcp}"
 export WAZUH_INDEXER_MAX_SIZE="${WAZUH_INDEXER_MAX_SIZE:-10000}"
 export WAZUH_API_URL="${WAZUH_API_URL:-}"
 export WAZUH_API_USER="${WAZUH_API_USER:-wazuh-wui}"
@@ -153,41 +177,17 @@ exec /opt/blue-team-mcp/venv/bin/python3 /opt/blue-team-mcp/blue_team_server.py 
 EOF
 chmod +x /usr/local/bin/mcp-server-blueteam
 
-# DEPRECATED standalone wrapper: mcp-server-crowdsec
-# CrowdSec CTI tools are now integrated into the unified server (mcp-server-blueteam).
-# This wrapper is kept for backward compatibility only.
-cat > /usr/local/bin/mcp-server-crowdsec << 'EOF'
+# DEPRECATED standalone wrappers — redirect to the unified server.
+# The standalone CrowdSec and GreyNoise files have been removed;
+# all 43 tools (including CrowdSec + GreyNoise) live in blue_team_server.py.
+for legacy in mcp-server-crowdsec mcp-server-greynoise; do
+  cat > "/usr/local/bin/$legacy" << 'EOF'
 #!/usr/bin/env bash
-# Wrapper - CrowdSec-only MCP server with parallel bulk lookups
-[[ -f /opt/blue-team-mcp/config.env ]] && source /opt/blue-team-mcp/config.env
-export CROWDSEC_API_KEY="${CROWDSEC_API_KEY:-}"
-export BLUETEAM_HTTP_TIMEOUT="${BLUETEAM_HTTP_TIMEOUT:-30.0}"
-export BLUETEAM_CHARACTER_LIMIT="${BLUETEAM_CHARACTER_LIMIT:-100000}"
-export BLUETEAM_VERIFY_SSL="${BLUETEAM_VERIFY_SSL:-true}"
-export BLUETEAM_BULK_CONCURRENCY="${BLUETEAM_BULK_CONCURRENCY:-5}"
-export MCP_TRANSPORT="${MCP_TRANSPORT:-stdio}"
-export MCP_HOST="${MCP_HOST:-127.0.0.1}"
-export MCP_PORT="${MCP_PORT:-8000}"
-exec /opt/blue-team-mcp/venv/bin/python3 /opt/blue-team-mcp/blue_team_server_crowdsec.py "$@"
+echo "[$0] DEPRECATED — redirecting to mcp-server-blueteam (unified server)" >&2
+exec /usr/local/bin/mcp-server-blueteam "$@"
 EOF
-chmod +x /usr/local/bin/mcp-server-crowdsec
-
-# DEPRECATED standalone wrapper: mcp-server-greynoise
-# GreyNoise Community tools are now integrated into the unified server (mcp-server-blueteam).
-# This wrapper is kept for backward compatibility only.
-cat > /usr/local/bin/mcp-server-greynoise << 'EOF'
-#!/usr/bin/env bash
-# Wrapper - GreyNoise-only MCP server (free, no API key required)
-[[ -f /opt/blue-team-mcp/config.env ]] && source /opt/blue-team-mcp/config.env
-export BLUETEAM_HTTP_TIMEOUT="${BLUETEAM_HTTP_TIMEOUT:-30.0}"
-export BLUETEAM_CHARACTER_LIMIT="${BLUETEAM_CHARACTER_LIMIT:-100000}"
-export BLUETEAM_VERIFY_SSL="${BLUETEAM_VERIFY_SSL:-true}"
-export MCP_TRANSPORT="${MCP_TRANSPORT:-stdio}"
-export MCP_HOST="${MCP_HOST:-127.0.0.1}"
-export MCP_PORT="${MCP_PORT:-8000}"
-exec /opt/blue-team-mcp/venv/bin/python3 /opt/blue-team-mcp/blue_team_server_greynoise.py "$@"
-EOF
-chmod +x /usr/local/bin/mcp-server-greynoise
+  chmod +x "/usr/local/bin/$legacy"
+done
 
 # SSH hardening reminder
 echo "[6/7] Ensuring SSH is running..."
@@ -224,8 +224,8 @@ echo ""
 echo "Wrapper entry points installed:"
 echo ""
 echo "  mcp-server-blueteam    — All 43 tools (Wazuh, threat intel, host forensics)"
-echo "  mcp-server-crowdsec    — DEPRECATED — CrowdSec CTI is in the unified server"
-echo "  mcp-server-greynoise   — DEPRECATED — GreyNoise is in the unified server"
+echo "  mcp-server-crowdsec    — DEPRECATED — redirects to mcp-server-blueteam"
+echo "  mcp-server-greynoise   — DEPRECATED — redirects to mcp-server-blueteam"
 echo ""
 echo "Run as a remote HTTP service (no SSH needed):"
 echo ""
