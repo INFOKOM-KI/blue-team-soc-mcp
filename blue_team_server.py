@@ -54,7 +54,7 @@ from collections import Counter
 from typing import Any, Dict, List, Optional
 import httpx
 from mcp.server.fastmcp import FastMCP
-from pydantic import BaseModel, ConfigDict, Field, AliasChoices, field_validator
+from pydantic import BaseModel, ConfigDict, Field, AliasChoices, field_validator, model_validator
 
 # Logging - Must go to stderr. stdout is used by the MCP stdio protocol.
 logging.basicConfig(
@@ -2933,6 +2933,43 @@ _EMAIL_RE = re.compile(
 
 class WazuhIndexerSearchInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid", populate_by_name=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def resolve_alias_collisions(cls, data: Any) -> Any:
+        """Remove alias keys when the canonical field name is also present.
+
+        ``WazuhIndexerSearchInput`` uses ``validation_alias=AliasChoices(...)``
+        to accept both legacy short-form keys (``format``, ``from``, ``to``)
+        and canonical names (``response_format``, ``since``, ``until``).
+
+        When an LLM passes BOTH forms in the same call, Pydantic v2 with
+        ``extra="forbid"`` sees the canonical name as an extra key after the
+        alias populates the field.  This validator removes the alias, keeping
+        the canonical name, so the call succeeds regardless of which form(s)
+        the LLM sends.
+        """
+        if not isinstance(data, dict):
+            return data
+        alias_map: dict[str, str] = {
+            "agent": "agent_name", "host": "agent_name", "hostname": "agent_name",
+            "index": "index_type", "type": "index_type",
+            "size": "limit", "count": "limit", "max": "limit",
+            "format": "response_format", "output": "response_format",
+            "ip": "srcip", "src_ip": "srcip", "source_ip": "srcip",
+            "from": "since", "start": "since", "after": "since",
+            "to": "until", "end": "until", "before": "until",
+            "query": "keyword", "search": "keyword",
+            "src_ips": "srcips", "ips": "srcips", "source_ips": "srcips",
+            "rule_group": "rule_groups", "rule": "rule_groups", "groups": "rule_groups",
+            "page": "cursor", "token": "cursor",
+            "field": "fields", "columns": "fields",
+        }
+        for alias, canonical in alias_map.items():
+            if alias in data and canonical in data:
+                del data[alias]
+        return data
+
     agent_name: Optional[str] = Field(
         default=None,
         validation_alias=AliasChoices("agent", "host", "hostname"),
