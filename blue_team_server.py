@@ -5178,7 +5178,7 @@ async def wazuh_attack_velocity(params: WazuhAttackVelocityInput = WazuhAttackVe
         - "Is the brute force attack on the mail server speeding up?"
         - "Compare the last hour's alert volume to the previous hour"
     """
-    _audit_log("wazuh_attack_velocity", {"since": params.since})
+    _audit_log("wazuh_attack_velocity", {"window": params.window})
     window_str = params.window
     m = _RELATIVE_TIME_RE.match(window_str)
     n, unit = int(m.group(1)), m.group(2)
