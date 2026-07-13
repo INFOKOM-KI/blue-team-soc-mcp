@@ -1417,14 +1417,14 @@ async def _wazuh_indexer_aggregate(
         },
         "top_srcips": {
             "terms": {
-                "field": "data.srcip",
+                "field": "data.srcip.keyword",
                 "size": top_n_srcips,
                 "missing": "0.0.0.0",
             }
         },
         "top_agents": {
             "terms": {
-                "field": "agent.name",
+                "field": "agent.name.keyword",
                 "size": top_n_agents,
                 "missing": "unknown",
             }
@@ -6321,9 +6321,9 @@ async def _aggregate_topology(
         "size": 0,
         "query": {"bool": {"filter": filters}},
         "aggs": {
-            "top_srcips": {"terms": {"field": "data.srcip", "size": top_n, "missing": "0.0.0.0"}},
+            "top_srcips": {"terms": {"field": "data.srcip.keyword", "size": top_n, "missing": "0.0.0.0"}},
             "top_rules": {"terms": {"field": "rule.id.keyword", "size": top_n, "missing": "unknown"}},
-            "top_agents": {"terms": {"field": "agent.name", "size": top_n, "missing": "unknown"}},
+            "top_agents": {"terms": {"field": "agent.name.keyword", "size": top_n, "missing": "unknown"}},
             "severity_bands": {
                 "range": {
                     "field": "rule.level",
@@ -6361,7 +6361,6 @@ async def _aggregate_anomaly(
                     "extended_bounds": {"min": since_str, "max": until_str},
                 },
                 "aggs": {
-                    "count_stats": {"extended_stats": {"field": "_index", "missing": 0}},
                     "by_severity": {
                         "range": {
                             "field": "rule.level",
@@ -6390,7 +6389,7 @@ async def _aggregate_correlation(
         "query": {"bool": {"filter": filters}},
         "aggs": {
             "srcips": {
-                "terms": {"field": "data.srcip", "size": top_n, "missing": "0.0.0.0"},
+                "terms": {"field": "data.srcip.keyword", "size": top_n, "missing": "0.0.0.0"},
                 "aggs": {
                     "significant_rules": {
                         "significant_terms": {
