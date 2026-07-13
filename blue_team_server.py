@@ -40,6 +40,7 @@ import hashlib
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -6453,6 +6454,24 @@ async def _aggregate_trend(
     return await _wazuh_indexer_post(body)
 
 
+def _safe_float(val, default: float = 0.0) -> float:
+    """Coerce a value to float, returning *default* on TypeError/ValueError.
+
+    OpenSearch pipeline aggregations (stats_bucket, derivative) occasionally
+    serialize numeric results as strings (e.g. ``"12345.0"``, ``"NaN"``).
+    This helper prevents ``.1f`` format-string crashes in the markdown renderer
+    by returning *default* for any non-finite result (NaN, Inf, -Inf) as well
+    as for unparseable strings.
+    """
+    try:
+        result = float(val)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(result):
+        return default
+    return result
+
+
 def _format_aggregate_markdown(
     params: AggregateAnalysisInput,
     results_by_mode: dict,
@@ -6511,12 +6530,14 @@ def _format_aggregate_markdown(
 
         elif mode_name == "anomaly":
             gs = aggs.get("global_stats", {})
-            lines.append(f"- **Mean alerts per slice**: {gs.get('avg', '?'):.1f}")
-            lines.append(f"- **StdDev**: {gs.get('std_deviation', '?'):.1f}")
+            avg_val = _safe_float(gs.get("avg", 0))
+            std_val = _safe_float(gs.get("std_deviation", 0))
+            lines.append(f"- **Mean alerts per slice**: {avg_val:.1f}")
+            lines.append(f"- **StdDev**: {std_val:.1f}")
             lines.append(f"- **Min/Max per slice**: {gs.get('min', '?')} / {gs.get('max', '?')}")
             lines.append("")
             slices = (aggs.get("time_slices", {}) or {}).get("buckets", [])
-            threshold = gs.get("avg", 0) + 2 * gs.get("std_deviation", 0)
+            threshold = avg_val + 2 * std_val
             anomalies = [s for s in slices if s.get("doc_count", 0) > threshold]
             if anomalies:
                 lines.append(f"### Anomalous Slices (>μ+2σ): {len(anomalies)}")
@@ -6558,7 +6579,8 @@ def _format_aggregate_markdown(
                 lines.append(f"- **Accelerating periods**: {len(accelerating)}")
                 lines.append(f"- **Decelerating periods**: {len(decelerating)}")
                 if accelerating:
-                    lines.append(f"- **Peak rate of change**: +{max(b.get('rate_of_change', {}).get('value', 0) or 0 for b in accelerating):.1f} alerts/slice")
+                    peak = max(_safe_float(b.get('rate_of_change', {}).get('value', 0)) for b in accelerating)
+                    lines.append(f"- **Peak rate of change**: +{peak:.1f} alerts/slice")
                 lines.append("")
                 # Show fine-grained top rules from the latest bucket
                 fine = aggs.get("fine_grained", {}).get("buckets", [])
