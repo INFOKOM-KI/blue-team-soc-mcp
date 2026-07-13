@@ -11,7 +11,7 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
 
 ## Architecture
 
-`blue_team_server.py` is a **single, unified MCP server** with 46 tools spanning host forensics, Wazuh SIEM, and multi-source threat intelligence. It supports two transports:
+`blue_team_server.py` is a **single, unified MCP server** with 47 tools spanning host forensics, Wazuh SIEM, and multi-source threat intelligence. It supports two transports:
 
 | Transport | Use case | MCP client connection |
 |---|---|---|
@@ -21,7 +21,7 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
 ```
                           ┌──────────────────────────────────┐
                           │     blue_team_server.py          │
-                          │     46 tools · 1 file · 2 transports  │
+                          │     47 tools · 1 file · 2 transports  │
                           │                                  │
                           │  ┌────────────────────────────┐  │
                           │  │ Host Forensics (26 tools)  │  │
@@ -87,7 +87,7 @@ The CrowdSec and GreyNoise standalone servers (`blue_team_server_crowdsec.py`, `
 
 | File | Tools | When to use |
 |---|---|---|
-| `blue_team_server.py` | **All 46 tools** | **Recommended** — full capabilities, circuit breaker, credential stripping, PII redaction |
+| `blue_team_server.py` | **All 47 tools** | **Recommended** — full capabilities, circuit breaker, credential stripping, PII redaction |
 
 ---
 
@@ -106,7 +106,8 @@ All Wazuh tools support iterative cursor pagination via base64-encoded JSON toke
 | `wazuh_alert_aggregate_analysis` | OpenSearch `size:0` aggregations (server-side) — covers ALL matching docs, **no document limit** | ∞ (covers all matching docs) | n/a — no cursor needed |
 | `wazuh_alert_dsl_query` | OpenSearch `size:0` aggregations (user-supplied DSL) — covers ALL matching docs | ∞ (covers all matching docs) | n/a — no cursor needed |
 | `wazuh_alert_focused_crawl` | OpenSearch `search_after` (sort-key traversal) | 200 | `{"search_after": [<sort_values>]}` |
-| `blueteam_wazuh_indexer_search` | OpenSearch `search_after` (sort-key traversal) — also supports **auto-pagination** via `max_scanned` | 10,000 | `{"search_after": [<sort_values>]}` |
+| `blueteam_wazuh_indexer_search` | OpenSearch `search_after` (sort-key traversal) — also supports **auto-pagination** (aggregate or forensic via `max_scanned`) | 10,000 | `{"search_after": [<sort_values>]}` |
+| `wazuh_wazuh_indexer_search` | Alias for `blueteam_wazuh_indexer_search` — identical behaviour | 10,000 | `{"search_after": [<sort_values>]}` |
 | `blueteam_wazuh_agents` | Wazuh API `offset`/`limit` | 10,000 | `{"offset": N}` |
 | `blueteam_wazuh_manager_logs` | Wazuh API `offset`/`limit` | **500** (auto capped) | `{"offset": N}` |
 | `blueteam_wazuh_alerts` | Line-offset in local `alerts.json` | 2,000 | `{"scanned": N}` |
@@ -282,14 +283,14 @@ All environment variables accepted by the suite. Variables marked **[unified]** 
 | Variable | Default | Description |
 |---|---|---|
 | `BLUETEAM_CHARACTER_LIMIT` | `100000` | Maximum characters per tool response before truncation |
-| `BLUETEAM_HTTP_TIMEOUT` | `30.0` | HTTP request timeout in seconds (applies to `_get_http_client()`) |
-| `BLUETEAM_VERIFY_SSL` | `true` | SSL certificate verification for the shared HTTP client (set `false` for proxies or mirror endpoints with self-signed certs) |
+| `WAZUH_INDEXER_MAX_SIZE` | `10000` | Max documents per page in Wazuh Indexer search queries |
+| `BLUETEAM_ALLOW_UNTRUNCATED` | `false` | ADMIN GATE — enables `bypass_character_limit` and `include_all_docs` for forensic deep-dives |
 
-### CrowdSec Bulk Lookups
+### CrowdSec CTI Cache
 
 | Variable | Default | Description |
 |---|---|---|
-| `BLUETEAM_BULK_CONCURRENCY` | `5` | Max parallel IP lookups in `crowdsec_ip_reputation_bulk` |
+| `CROWDSEC_CACHE_TTL` | `900` | In-memory cache TTL in seconds for CrowdSec CTI responses |
 
 ### Wazuh API
 
@@ -298,7 +299,7 @@ All environment variables accepted by the suite. Variables marked **[unified]** 
 | `WAZUH_API_URL` | (empty) | Wazuh Manager API base URL (`https://<host>:55000`) |
 | `WAZUH_API_USER` | `wazuh-wui` | Wazuh API username |
 | `WAZUH_API_PASSWORD` | (empty) | Wazuh API password |
-| `WAZUH_API_VERIFY_SSL` | `false` | TLS certificate verification for Wazuh API |
+| `WAZUH_API_VERIFY_SSL` | `true` | TLS certificate verification for Wazuh API |
 
 ### Wazuh Indexer (OpenSearch)
 
@@ -307,7 +308,7 @@ All environment variables accepted by the suite. Variables marked **[unified]** 
 | `WAZUH_INDEXER_URL` | (empty) | OpenSearch base URL (`https://<host>:9200`) |
 | `WAZUH_INDEXER_USER` | `admin` | OpenSearch username |
 | `WAZUH_INDEXER_PASSWORD` | (empty) | OpenSearch password |
-| `WAZUH_INDEXER_VERIFY_SSL` | `false` | TLS certificate verification for indexer |
+| `WAZUH_INDEXER_VERIFY_SSL` | `true` | TLS certificate verification for indexer |
 | `WAZUH_INDEXER_MAX_SIZE` | `10000` | Max documents per page in `_wazuh_indexer_search` |
 
 ### Threat Intelligence APIs
@@ -334,10 +335,13 @@ All environment variables accepted by the suite. Variables marked **[unified]** 
 
 | Variable | Default | Description |
 |---|---|---|
-| `BLUETEAM_AUDIT_LOG` | (empty) | Path to JSONL audit log file |
+| `BLUETEAM_AUDIT_LOG` | (empty) | Path to audit log file |
 | `BLUETEAM_RATE_LIMIT` | `0` (disabled) | Max tool calls per minute |
 | `BLUETEAM_ALLOWED_PATHS` | `/var:/etc:/home:/opt:/usr` | Colon-separated path allowlist for file tools |
 | `BLUETEAM_CAPTURE_DIR` | `/tmp` | Output directory for `blueteam_capture_traffic` pcap files |
+| `BLUETEAM_REDACT_PII` | `true` | Strip credentials and mask internal IPs from alert payloads |
+| `BLUETEAM_REDACT_EMAILS` | `true` | Hash email local-parts in alert payloads (domain preserved) |
+| `BLUETEAM_REDACT_SALT` | (hostname-derived) | Salt for deterministic forensic email hashing |
 
 ---
 
@@ -427,7 +431,7 @@ Then point Claude Desktop at it:
 
 Replace `192.168.153.5` with the IP reachable from your workstation (`192.168.153.5` for NAT, `172.16.101.5` for LAB).
 
-Restart Claude Desktop. You should see all 46 blue-team-mcp tools available.
+Restart Claude Desktop. You should see all 47 blue-team-mcp tools available.
 
 ### 4. Remote Service Deployment (systemd)
 
@@ -443,6 +447,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/opt/blue-team-mcp
+EnvironmentFile=/opt/blue-team-mcp/config.env
 Environment="MCP_TRANSPORT=streamable_http"
 Environment="MCP_HOST=0.0.0.0"
 Environment="MCP_PORT=8000"
@@ -490,7 +495,7 @@ All tools below are registered on `blue_team_server.py`. Tools not requiring a s
 | `blueteam_capture_traffic` | Live packet capture via tcpdump |
 
 ### Wazuh SIEM
-*All thirteen tools support cursor-based pagination — see [Cursor-Based Pagination](#cursor-based-pagination-bulk-data-without-hard-caps). `blueteam_wazuh_indexer_search`, `wazuh_domain_lookup`, and `wazuh_alert_focused_crawl` also support **auto-pagination** via the `max_scanned` or `next_cursor` parameter for full-period coverage in a single call.*
+*All thirteen tools support cursor-based pagination — see [Cursor-Based Pagination](#cursor-based-pagination-bulk-data-without-hard-caps). `blueteam_wazuh_indexer_search`, `wazuh_domain_lookup`, and `wazuh_alert_focused_crawl` also support **auto-pagination** via the `max_scanned` parameter. `blueteam_wazuh_indexer_search` additionally supports **forensic mode** (`include_all_docs=True`) when `BLUETEAM_ALLOW_UNTRUNCATED=true`.*
 
 | Tool | Description |
 |------|-------------|
@@ -633,7 +638,7 @@ This server aligns with the [CSA MAESTRO](https://cloudsecurityalliance.org/blog
 Enable audit logging to record tool invocations:
 
 ```bash
-export BLUETEAM_AUDIT_LOG=/var/log/blue-team-mcp-audit.jsonl
+export BLUETEAM_AUDIT_LOG=/var/log/blue-team-mcp/audit.log
 ```
 
 Ensure log rotation (e.g., logrotate) to prevent unbounded growth.
@@ -682,7 +687,7 @@ export BLUETEAM_RATE_LIMIT=60
 
 | File | Role |
 |---|---|
-| `blue_team_server.py` | **Primary** — all 46 tools, both transports (stdio / Streamable HTTP) |
+| `blue_team_server.py` | **Primary** — all 47 tools, both transports (stdio / Streamable HTTP) |
 
 ### Legacy Naming Debt
 
@@ -696,6 +701,7 @@ qualifier, while the other Wazuh tools use `blueteam_wazuh_`:
 | `wazuh_compromised_emails_analysis` | `blueteam_wazuh_compromised_emails_analysis` | Active — do not rename (backward compat) |
 | `wazuh_alert_timeline` | `blueteam_wazuh_alert_timeline` | Active — do not rename (backward compat) |
 | `wazuh_attack_velocity` | `blueteam_wazuh_attack_velocity` | Active — do not rename (backward compat) |
+| `wazuh_wazuh_indexer_search` | `blueteam_wazuh_indexer_search` | **Alias** — delegates to `blueteam_wazuh_indexer_search` (both names valid) |
 
 Per CLAUDE.md Hard Rule 1, these names are frozen to avoid breaking active
 client workflows. A future major version may introduce the `blueteam_wazuh_`

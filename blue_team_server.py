@@ -4,7 +4,7 @@ Blue Team MCP Server
 A defensive security MCP server for Claude Desktop and Compatible with any MCP Host. 
 Mirroring the Kali mcp-kali-server setup but for blue team / defenders / SOC.
 
-MAESTRO Framework (Currently under Development): Aligned with CSA MAESTRO (Layer 3 Agent Frameworks, Layer 5 Observability, Layer 6 Security & Compliance).
+MAESTRO Framework (currently under development): Aligned with CSA MAESTRO (Layer 3 Agent Frameworks, Layer 5 Observability, Layer 6 Security & Compliance).
 
 Tools included:
   - Log analysis (auth, syslog, journald, nginx/apache)
@@ -129,6 +129,14 @@ NETRA_VERIFY_SSL = os.environ.get("NETRA_VERIFY_SSL", "false").lower() in ("1", 
 HTTP_TIMEOUT = 30.0
 CHARACTER_LIMIT = int(os.environ.get("BLUETEAM_CHARACTER_LIMIT", "100000"))
 _WAZUH_INDEXER_MAX_SIZE = int(os.environ.get("WAZUH_INDEXER_MAX_SIZE", "10000"))
+BLUETEAM_ALLOW_UNTRUNCATED = os.environ.get("BLUETEAM_ALLOW_UNTRUNCATED", "false").lower() in ("1", "true", "yes")
+if BLUETEAM_ALLOW_UNTRUNCATED:
+    logger.warning(
+        "BLUETEAM_ALLOW_UNTRUNCATED=true — character-limit bypass and include_all_docs are ENABLED. "
+        "Unbounded response payloads may exhaust LLM context windows or MCP transport buffers. "
+        "Use only for forensic deep-dives with explicit scope constraints (small time windows, "
+        "specific agents/IPs, conservative max_scanned values)."
+    )
 _WAZUH_TOKEN_TTL = 300  # seconds — cache Wazuh JWT for 5 min
 
 # Private / reserved IP ranges — threat-intel tools are for public IPs only
@@ -342,8 +350,18 @@ def _handle_api_error(e: Exception, context: str = "") -> str:
     logger.exception("Unexpected error in %s", context)
     return f"{prefix}Error: Unexpected error ({type(e).__name__})."
 
-def _truncate_if_needed(text: str) -> str:
-    """Cap response at CHARACTER_LIMIT to keep MCP messages manageable."""
+def _truncate_if_needed(text: str, *, bypass: bool = False) -> str:
+    """Cap response at CHARACTER_LIMIT to keep MCP messages manageable.
+
+    Args:
+        text: The response text to potentially truncate.
+        bypass: When True AND BLUETEAM_ALLOW_UNTRUNCATED is enabled, return the
+                text without truncation. Ignored (treated as False) unless the
+                environment guard is active — this prevents callers from
+                accidentally bypassing the safety cap without admin approval.
+    """
+    if bypass and BLUETEAM_ALLOW_UNTRUNCATED:
+        return text
     if len(text) <= CHARACTER_LIMIT:
         return text
     truncated = text[:CHARACTER_LIMIT]
@@ -970,7 +988,14 @@ async def _wazuh_indexer_search(
         return resp.json()
 
     try:
-        return await _cb_wazuh_indexer.call(_do_indexer_http)
+        result = await _cb_wazuh_indexer.call(_do_indexer_http)
+        # Report clamping when _WAZUH_INDEXER_MAX_SIZE caps the requested size,
+        # so callers can programmatically detect incomplete pages.
+        applied = body["size"]
+        if size > applied:
+            result["applied_size"] = applied
+            result["requested_size"] = size
+        return result
     except httpx.HTTPStatusError as e:
         return {"error": f"Indexer API error: {e.response.status_code}", "detail": e.response.text[:500]}
     except Exception as e:
@@ -1591,6 +1616,7 @@ class CrowdsecIpReputationBulkInput(BaseModel):
     @classmethod
     def validate_ips(cls, v: list[str]) -> list[str]:
         invalid = []
+        private_ips = []
         for ip in v:
             try:
                 ipaddress.ip_address(ip.strip())
@@ -1598,9 +1624,20 @@ class CrowdsecIpReputationBulkInput(BaseModel):
                 invalid.append(ip)
         if invalid:
             raise ValueError(f"Invalid IP(s): {', '.join(invalid)}")
-        result = [ip.strip() for ip in v]
-        for ip in result:
-            _validate_public_ip(ip)
+        result: list[str] = []
+        for ip in v:
+            ip = ip.strip()
+            if _is_private_or_reserved(ip):
+                private_ips.append(ip)
+                logger.warning("crowdsec_ip_reputation_bulk: skipping private/reserved IP %s", ip)
+                continue
+            result.append(ip)
+        if not result:
+            raise ValueError(
+                f"All IPs are private/reserved ({', '.join(private_ips)}). "
+                "This tool only accepts public IPs for threat intelligence lookup. "
+                "Use Wazuh Indexer search tools for internal IP investigation."
+            )
         return result
 
 # CROWDSEC CTI TOOLS
@@ -2983,12 +3020,52 @@ class WazuhIndexerSearchInput(BaseModel):
     max_scanned: Optional[int] = Field(
         default=None,
         ge=1000,
-        le=500000,
+        le=1000000,
         description="When set, auto-paginate through all matching alerts up to this limit. "
                     "Returns an aggregated summary (total counts, top IPs, top rules) "
-                    "across ALL scanned pages. When None (default), returns a single "
+                    "across ALL scanned pages. Combine with include_all_docs=True for "
+                    "forensic deep-dives (requires BLUETEAM_ALLOW_UNTRUNCATED=true). "
+                    "When None (default), returns a single "
                     "page with next_cursor for manual pagination.",
     )
+    bypass_character_limit: bool = Field(
+        default=False,
+        description="When True AND BLUETEAM_ALLOW_UNTRUNCATED=true, skip the 100K-character "
+                    "response truncation for this call. Required for retrieving large "
+                    "result sets in forensic investigations. Ignored (treated as False) "
+                    "if the environment guard is not active — set BLUETEAM_ALLOW_UNTRUNCATED=true "
+                    "on the server to unlock this capability.",
+    )
+    include_all_docs: bool = Field(
+        default=False,
+        description="When True AND BLUETEAM_ALLOW_UNTRUNCATED=true AND max_scanned is set, "
+                    "return ALL scanned documents in the response instead of aggregating "
+                    "into counts and samples. Dangerous for large time windows — always "
+                    "pair with a conservative max_scanned. Ignored if the environment guard "
+                    "is not active.",
+    )
+
+    @field_validator("bypass_character_limit")
+    @classmethod
+    def guard_bypass_character_limit(cls, v: bool) -> bool:
+        if v and not BLUETEAM_ALLOW_UNTRUNCATED:
+            raise ValueError(
+                "bypass_character_limit=True requires BLUETEAM_ALLOW_UNTRUNCATED=true "
+                "on the server. Set this environment variable on the MCP host to "
+                "unlock untruncated forensic responses."
+            )
+        return v
+
+    @field_validator("include_all_docs")
+    @classmethod
+    def guard_include_all_docs(cls, v: bool, info: Any) -> bool:
+        if v and not BLUETEAM_ALLOW_UNTRUNCATED:
+            raise ValueError(
+                "include_all_docs=True requires BLUETEAM_ALLOW_UNTRUNCATED=true "
+                "on the server. Set this environment variable on the MCP host to "
+                "unlock full-document forensic retrieval."
+            )
+        return v
 
     @field_validator("fields")
     @classmethod
@@ -3039,6 +3116,31 @@ class WazuhIndexerSearchInput(BaseModel):
                     raise ValueError(f"srcips: '{ip}' is not a valid IP address (IPv4/IPv6)") from exc
                 valid.append(ip)
             return valid if valid else None
+        return v
+
+    @field_validator("rule_groups", mode="before")
+    @classmethod
+    def coerce_rule_groups(cls, v: Any) -> Any:
+        """Coerce rule_groups from dict-wrapped or string forms into a plain list.
+
+        Handles three LLM serialization patterns:
+          - {'item': ['a', 'b']} → ['a', 'b']  (dict with 'item' key)
+          - 'a, b, c' → ['a', 'b', 'c']         (comma-separated string)
+          - 'a' → ['a']                           (single string)
+        """
+        if isinstance(v, dict):
+            # Unwrap {"item": [...]} or {"items": [...]} patterns
+            for key in ("item", "items", "values"):
+                if key in v and isinstance(v[key], list):
+                    return v[key]
+            # Fallback: collect all list values
+            for val in v.values():
+                if isinstance(val, list):
+                    return val
+            # Last resort: treat dict values as items
+            return list(v.values())
+        if isinstance(v, str):
+            return [item.strip() for item in v.split(",") if item.strip()]
         return v
 
     @field_validator("rule_groups")
@@ -3094,8 +3196,19 @@ async def _wazuh_indexer_search_full_scan(
 
     Loops internally with ``search_after``, scanning up to ``params.max_scanned``
     documents across all pages.  Accumulates global counters for source IPs and
-    rule descriptions.  Returns a summary with coverage metadata.
+    rule descriptions.
+
+    Two output modes controlled by ``params.include_all_docs`` (gated by
+    ``BLUETEAM_ALLOW_UNTRUNCATED``):
+
+    - **Aggregate mode** (default, ``include_all_docs=False``): Returns
+      aggregated counts + 50 sample documents. Memory-efficient.
+    - **Forensic mode** (``include_all_docs=True``): Returns ALL scanned
+      documents alongside aggregations. Requires env guard. Pair with
+      conservative ``max_scanned``.
     """
+    # Determine whether to collect all documents (forensic mode) or just samples
+    forensic_mode = params.include_all_docs and BLUETEAM_ALLOW_UNTRUNCATED
     internal_page_size = 1000
     total_scanned = 0
     global_total_val: Optional[int] = None
@@ -3103,6 +3216,7 @@ async def _wazuh_indexer_search_full_scan(
     global_srcip_counter: Counter[str] = Counter()
     global_rule_counter: Counter[str] = Counter()
     sample_docs: list[dict] = []
+    all_docs: list[dict] = [] if forensic_mode else []  # only populated in forensic mode
     search_after = initial_search_after
     exhausted = False
     pages = 0
@@ -3141,7 +3255,11 @@ async def _wazuh_indexer_search_full_scan(
             exhausted = True
             break
 
-        # Keep first 50 docs from page 1 as a sample
+        if forensic_mode:
+            # Forensic mode: collect ALL documents (memory-intensive — gated by env guard)
+            all_docs.extend(docs)
+
+        # Keep first 50 docs from page 1 as a sample (aggregate mode)
         if not sample_docs and pages == 1:
             sample_docs = docs[:50]
 
@@ -3170,8 +3288,10 @@ async def _wazuh_indexer_search_full_scan(
         + ("+" if global_total_relation == "gte" else "")
     )
 
-    # Apply redaction to sample docs
+    # Apply redaction to documents that will be surfaced
     sample_docs = _redact_alert_data(sample_docs, bypass=params.bypass_redaction)
+    if forensic_mode:
+        all_docs = _redact_alert_data(all_docs, bypass=params.bypass_redaction)
 
     if params.response_format == ResponseFormat.JSON:
         output: dict = {
@@ -3192,13 +3312,20 @@ async def _wazuh_indexer_search_full_scan(
                     for r, c in global_rule_counter.most_common(20)
                 ],
             },
-            "sample_documents": sample_docs,
         }
+        if forensic_mode:
+            output["all_documents"] = all_docs
+            output["document_count"] = len(all_docs)
+        else:
+            output["sample_documents"] = sample_docs
         if params.since:
             output["since"] = params.since
         if params.until:
             output["until"] = params.until
-        return _truncate_if_needed(json.dumps(output, indent=2, ensure_ascii=False))
+        return _truncate_if_needed(
+            json.dumps(output, indent=2, ensure_ascii=False),
+            bypass=params.bypass_character_limit,
+        )
 
     #Markdown output
     lines: list[str] = [
@@ -3209,8 +3336,10 @@ async def _wazuh_indexer_search_full_scan(
         f"**Coverage**: {coverage} "
         + ("(all matching alerts retrieved)" if coverage == "complete"
            else f"(hit max_scanned={params.max_scanned:,} limit)"),
-        f"**Index**: {params.index_type} | **Timezone**: UTC",
     ]
+    if forensic_mode:
+        lines.append(f"**Mode**: FORENSIC (all {len(all_docs):,} documents returned)")
+    lines.append(f"**Index**: {params.index_type} | **Timezone**: UTC")
     if params.since or params.until:
         window_str = f"{params.since or '...'} → {params.until or '...'}"
         lines.append(f"**Window**: {window_str}")
@@ -3232,12 +3361,15 @@ async def _wazuh_indexer_search_full_scan(
             lines.append(f"| {_escape_md_table(r)} | {c:,} |")
         lines.append("")
 
-    if sample_docs:
-        lines.append("## Sample Alerts (first 20 from page 1)")
+    display_docs = all_docs if forensic_mode else sample_docs
+    if display_docs:
+        heading = "## All Documents" if forensic_mode else "## Sample Alerts (first 20 from page 1)"
+        lines.append(heading)
         lines.append("")
         lines.append("| # | Timestamp (UTC) | Agent | Rule | Level | Src IP | Description |")
         lines.append("|---|-----------------|-------|------|-------|--------|-------------|")
-        for i, d in enumerate(sample_docs[:20], 1):
+        doc_limit = len(display_docs) if forensic_mode else min(20, len(display_docs))
+        for i, d in enumerate(display_docs[:doc_limit], 1):
             ts = str(d.get("@timestamp", ""))[:19]
             agent = str((d.get("agent") or {}).get("name", ""))[:25]
             rule_id = str((d.get("rule") or {}).get("id", ""))
@@ -3248,35 +3380,42 @@ async def _wazuh_indexer_search_full_scan(
             )[:18]
             desc = str((d.get("rule") or {}).get("description", ""))[:60]
             lines.append(f"| {i} | {_escape_md_table(ts)} | {_escape_md_table(agent)} | {_escape_md_table(rule_id)} | {_escape_md_table(level)} | {_escape_md_table(srcip)} | {_escape_md_table(desc)} |")
+        if forensic_mode and len(display_docs) > 50:
+            lines.append(f"")
+            lines.append(f"_(showing first 50 of {len(display_docs):,} documents in markdown — use response_format=json for full output)_")
         lines.append("")
 
     if coverage != "complete":
         lines.append(
             f"\n**Note:** Results are partial - scan hit the "
             f"`max_scanned={params.max_scanned:,}` limit. "
-            f"Increase `max_scanned` (up to 500,000) for full coverage."
+            f"Increase `max_scanned` (up to 1,000,000) for full coverage."
         )
 
-    return _truncate_if_needed("\n".join(lines))
+    return _truncate_if_needed("\n".join(lines), bypass=params.bypass_character_limit)
 
 
 @mcp.tool(
     name="blueteam_wazuh_indexer_search",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
-async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
+async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhIndexerSearchInput()) -> str:
     """Query Wazuh Indexer (OpenSearch) for alerts/events with cursor pagination.
     Supports filtering by agent_name, srcip/s (source IP), keyword, or all simultaneously.
     Requires WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD (port 9200).
 
-    **Two modes**:
+    **Three modes**:
 
     - **Single-page** (default, ``max_scanned`` not set): Returns one page per call.
       Pass the returned ``next_cursor`` back as the ``cursor`` parameter to fetch
       the next page. ``next_cursor`` is null when all results are exhausted.
-    - **Full-scan** (set ``max_scanned`` to an integer ≥1000): Auto-paginates
-      internally across ALL matching pages and returns an aggregated summary
-      (global top IPs, top rules) with a sample of documents.
+    - **Full-scan aggregate** (set ``max_scanned``): Auto-paginates across ALL
+      matching pages and returns aggregated summary (top IPs, top rules) with 50
+      sample documents.
+    - **Full-scan forensic** (``max_scanned`` + ``include_all_docs=True``): Returns
+      ALL scanned documents alongside aggregations. Requires
+      ``BLUETEAM_ALLOW_UNTRUNCATED=true`` on the server. Pair with
+      ``bypass_character_limit=True`` to avoid the 100K-character response cap.
 
     Args:
         params.agent_name: Optional agent name filter (e.g. HYDRA-DC)
@@ -3287,13 +3426,16 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
         params.since: Optional ISO 8601 start time in UTC (e.g. '2026-07-05T18:30:00Z')
         params.until: Optional ISO 8601 end time in UTC (e.g. '2026-07-05T19:00:00Z')
         params.index_type: alerts (default), events, or vulnerabilities
-        params.limit: Max documents per page in single-page mode (default 100, max 10000)
+        params.limit: Max documents per page in single-page mode (default 500, max 10000)
         params.cursor: next_cursor from previous response (omit for first page)
-        params.max_scanned: When set, run full-scan auto-pagination (see above)
+        params.max_scanned: When set, run full-scan auto-pagination (max 1,000,000)
+        params.include_all_docs: When True, return all documents in full-scan mode
+        params.bypass_character_limit: When True, skip 100K-char response cap
 
     Returns:
         str: In 'json' mode (default): JSON with documents, total, size, count, next_cursor,
-             and timezone. In 'markdown' mode: a compact summary table of alerts.
+             and timezone. Metadata includes ``applied_size`` when ``_WAZUH_INDEXER_MAX_SIZE``
+             clamped the per-page document count.
     """
     _audit_log("blueteam_wazuh_indexer_search", {})
     if params.index_type not in _WAZUH_INDEX_PATTERNS:
@@ -3350,6 +3492,11 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
         "timezone": "UTC",
         "documents": docs,
     }
+    # Surface applied_size when _WAZUH_INDEXER_MAX_SIZE clamped the request.
+    # This lets callers programmatically detect capped pages and adjust.
+    if data.get("applied_size") is not None:
+        meta["applied_size"] = data["applied_size"]
+        meta["requested_size"] = data["requested_size"]
     if params.since:
         meta["since"] = params.since
     if params.until:
@@ -3357,7 +3504,10 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
 
     if params.response_format == ResponseFormat.JSON:
         meta["documents"] = _redact_alert_data(meta["documents"], bypass=params.bypass_redaction)
-        return _truncate_if_needed(json.dumps(meta, indent=2))
+        return _truncate_if_needed(
+            json.dumps(meta, indent=2),
+            bypass=params.bypass_character_limit,
+        )
 
     # Markdown: compact summary table
     lines = [
@@ -3388,7 +3538,25 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput) -> str:
     if len(docs) > 100:
         lines.append(f"")
         lines.append(f"_(showing first 100 of {len(docs)} documents — set response_format=json for full output)_")
-    return _truncate_if_needed("\n".join(lines))
+    # Surface applied_size in markdown output when cap was enforced
+    if data.get("applied_size") is not None:
+        lines.append(f"")
+        lines.append(
+            f"**Note:** Requested page size {data['requested_size']} was clamped to "
+            f"{data['applied_size']} by `WAZUH_INDEXER_MAX_SIZE`. "
+            f"Raise this env var on the server for larger pages."
+        )
+    return _truncate_if_needed("\n".join(lines), bypass=params.bypass_character_limit)
+
+
+# Alias: wazuh_wazuh_indexer_search → same as blueteam_wazuh_indexer_search
+@mcp.tool(
+    name="wazuh_wazuh_indexer_search",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def wazuh_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhIndexerSearchInput()) -> str:
+    """Alias for blueteam_wazuh_indexer_search. Same functionality, same parameters."""
+    return await blueteam_wazuh_indexer_search(params)
 
 
 # Wazuh Email & Domain Lookup
@@ -4983,7 +5151,7 @@ class WazuhAttackVelocityInput(BaseModel):
         "openWorldHint": True,
     },
 )
-async def wazuh_attack_velocity(params: WazuhAttackVelocityInput) -> str:
+async def wazuh_attack_velocity(params: WazuhAttackVelocityInput = WazuhAttackVelocityInput()) -> str:
     """Compare two adjacent time windows to detect attack acceleration or deceleration.
 
     Queries the Wazuh Indexer for two adjacent windows of equal duration (current
@@ -6794,7 +6962,7 @@ class FocusedCrawlInput(BaseModel):
         "openWorldHint": True,
     },
 )
-async def wazuh_alert_focused_crawl(params: FocusedCrawlInput) -> str:
+async def wazuh_alert_focused_crawl(params: FocusedCrawlInput = FocusedCrawlInput()) -> str:
     """Surgical deep-dive into specific Wazuh alert clusters.
 
     After ``wazuh_alert_aggregate_analysis`` identifies hot spots (top source IPs,

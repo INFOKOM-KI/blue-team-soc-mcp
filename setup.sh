@@ -78,6 +78,9 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 # export MCP_HOST="0.0.0.0"
 # export MCP_PORT="8000"
 
+# Logging level: DEBUG, INFO (default), WARNING, ERROR
+# export LOG_LEVEL="INFO"
+
 # Wazuh SIEM (optional)
 # export WAZUH_API_URL="https://192.168.1.180:55000"
 # export WAZUH_API_USER="wazuh-wui"
@@ -90,15 +93,15 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 # export WAZUH_INDEXER_PASSWORD="your_indexer_password"
 # export WAZUH_INDEXER_VERIFY_SSL="true"  # TLS verification ON by default — disable only for self-signed labs
 
-# Performance & Tuning Limits
+# Performance & Response Limits
 # export BLUETEAM_CHARACTER_LIMIT="100000"       # max chars per tool response before truncation
-# export BLUETEAM_HTTP_TIMEOUT="30.0"           # HTTP request timeout in seconds
-# export BLUETEAM_VERIFY_SSL="true"             # SSL cert verification for external API calls
-# export BLUETEAM_BULK_CONCURRENCY="5"          # max parallel IP lookups (CrowdSec bulk)
 # export WAZUH_INDEXER_MAX_SIZE="10000"         # max documents per page in Wazuh Indexer search
+# export CROWDSEC_CACHE_TTL="900"              # CrowdSec CTI in-memory cache TTL in seconds (default 15 min)
 
-# CrowdSec CTI cache TTL (seconds, default 900 = 15 min)
-# export CROWDSEC_CACHE_TTL="900"
+# Forensic Mode (ADMIN GATE — off by default)
+# Set to "true" to unlock bypass_character_limit and include_all_docs.
+# WARNING: enables unbounded response payloads. Pair with conservative max_scanned.
+# export BLUETEAM_ALLOW_UNTRUNCATED="false"
 
 # Data masking (see SECURITY.md §4 for the three-layer model)
 #
@@ -119,12 +122,17 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 #   PUBLIC ATTACKER IPs AND DOMAINS ARE NEVER MASKED — they are IoCs.
 # export BLUETEAM_REDACT_PII="true"
 
+# Forensic email hashing salt (only used when BLUETEAM_REDACT_EMAILS=true)
+# Change between deployments to prevent cross-deployment correlation.
+# Defaults to hostname-derived if unset.
+# export BLUETEAM_REDACT_SALT="change-me-per-deployment"
+
 # Server identity (optional — use lowercase to avoid LLM casing mismatches)
 # export BLUE_TEAM_MCP_SERVER_NAME="blue_team_mcp"
 
 # Audit and limits (optional)
-# export BLUETEAM_AUDIT_LOG="/var/log/blue-team-mcp-audit.jsonl"
-# export BLUETEAM_RATE_LIMIT="60"
+# export BLUETEAM_AUDIT_LOG="/var/log/blue-team-mcp/audit.log"
+# export BLUETEAM_RATE_LIMIT="0"
 
 # Path restrictions (defaults shown)
 # export BLUETEAM_ALLOWED_PATHS="/var:/etc:/home:/opt:/usr"
@@ -139,7 +147,7 @@ fi
 # Wrapper scripts
 echo "[5/7] Creating MCP server wrapper scripts..."
 
-# Main wrapper: mcp-server-blueteam (all 43 tools)
+# Main wrapper: mcp-server-blueteam (all 47 tools)
 cat > /usr/local/bin/mcp-server-blueteam << 'EOF'
 #!/usr/bin/env bash
 # Wrapper - Claude Desktop calls this via SSH (MAESTRO-compliant)
@@ -152,15 +160,16 @@ export NETRA_API_KEY="${NETRA_API_KEY:-}"
 export NETRA_VERIFY_SSL="${NETRA_VERIFY_SSL:-false}"
 export BLUETEAM_AUDIT_LOG="${BLUETEAM_AUDIT_LOG:-}"
 export BLUETEAM_RATE_LIMIT="${BLUETEAM_RATE_LIMIT:-0}"
-export BLUETEAM_ALLOWED_PATHS="${BLUETEAM_ALLOWED_PATHS:-/var:/etc:/home:/opt:/usr}"
-export BLUETEAM_CAPTURE_DIR="${BLUETEAM_CAPTURE_DIR:-/tmp}"
-export BLUETEAM_HTTP_TIMEOUT="${BLUETEAM_HTTP_TIMEOUT:-30.0}"
-export BLUETEAM_CHARACTER_LIMIT="${BLUETEAM_CHARACTER_LIMIT:-100000}"
-export BLUETEAM_VERIFY_SSL="${BLUETEAM_VERIFY_SSL:-true}"
-export CROWDSEC_CACHE_TTL="${CROWDSEC_CACHE_TTL:-900}"
 export BLUETEAM_REDACT_PII="${BLUETEAM_REDACT_PII:-true}"
 export BLUETEAM_REDACT_EMAILS="${BLUETEAM_REDACT_EMAILS:-true}"
+export BLUETEAM_ALLOW_UNTRUNCATED="${BLUETEAM_ALLOW_UNTRUNCATED:-false}"
+export BLUETEAM_ALLOWED_PATHS="${BLUETEAM_ALLOWED_PATHS:-/var:/etc:/home:/opt:/usr}"
+export BLUETEAM_CAPTURE_DIR="${BLUETEAM_CAPTURE_DIR:-/tmp}"
+export BLUETEAM_CHARACTER_LIMIT="${BLUETEAM_CHARACTER_LIMIT:-100000}"
+export CROWDSEC_CACHE_TTL="${CROWDSEC_CACHE_TTL:-900}"
+export BLUETEAM_REDACT_SALT="${BLUETEAM_REDACT_SALT:-}"
 export BLUE_TEAM_MCP_SERVER_NAME="${BLUE_TEAM_MCP_SERVER_NAME:-blue_team_mcp}"
+export LOG_LEVEL="${LOG_LEVEL:-INFO}"
 export WAZUH_INDEXER_MAX_SIZE="${WAZUH_INDEXER_MAX_SIZE:-10000}"
 export WAZUH_API_URL="${WAZUH_API_URL:-}"
 export WAZUH_API_USER="${WAZUH_API_USER:-wazuh-wui}"
@@ -179,7 +188,7 @@ chmod +x /usr/local/bin/mcp-server-blueteam
 
 # DEPRECATED standalone wrappers — redirect to the unified server.
 # The standalone CrowdSec and GreyNoise files have been removed;
-# all 43 tools (including CrowdSec + GreyNoise) live in blue_team_server.py.
+# all 47 tools (including CrowdSec + GreyNoise) live in blue_team_server.py.
 for legacy in mcp-server-crowdsec mcp-server-greynoise; do
   cat > "/usr/local/bin/$legacy" << 'EOF'
 #!/usr/bin/env bash
@@ -215,15 +224,14 @@ echo "  WAZUH_INDEXER_URL, WAZUH_INDEXER_PASSWORD."
 echo ""
 echo "  Performance tuning (all optional, defaults shown):"
 echo "    BLUETEAM_CHARACTER_LIMIT=100000"
-echo "    BLUETEAM_HTTP_TIMEOUT=30.0"
-echo "    BLUETEAM_BULK_CONCURRENCY=5       (CrowdSec parallel lookups)"
 echo "    WAZUH_INDEXER_MAX_SIZE=10000      (docs per page in indexer search)"
+echo "    BLUETEAM_ALLOW_UNTRUNCATED=false  (set true for forensic mode)"
 echo ""
 echo "  GreyNoise Community needs no key — greynoise_ip_context works immediately."
 echo ""
 echo "Wrapper entry points installed:"
 echo ""
-echo "  mcp-server-blueteam    — All 43 tools (Wazuh, threat intel, host forensics)"
+echo "  mcp-server-blueteam    — All 47 tools (Wazuh, threat intel, host forensics)"
 echo "  mcp-server-crowdsec    — DEPRECATED — redirects to mcp-server-blueteam"
 echo "  mcp-server-greynoise   — DEPRECATED — redirects to mcp-server-blueteam"
 echo ""
