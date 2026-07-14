@@ -11,7 +11,7 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
 
 ## Architecture
 
-`blue_team_server.py` is a **single, unified MCP server** with 47 tools spanning host forensics, Wazuh SIEM, and multi-source threat intelligence. It supports two transports:
+`blue_team_server.py` is a **single, unified MCP server** with 46 tools spanning host forensics, Wazuh SIEM, and multi-source threat intelligence. It supports two transports:
 
 | Transport | Use case | MCP client connection |
 |---|---|---|
@@ -21,7 +21,7 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
 ```
                           ┌──────────────────────────────────┐
                           │     blue_team_server.py          │
-                          │     47 tools · 1 file · 2 transports  │
+                          │     46 tools · 1 file · 2 transports  │
                           │                                  │
                           │  ┌────────────────────────────┐  │
                           │  │ Host Forensics (26 tools)  │  │
@@ -81,13 +81,9 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
                                                └─────────────────────────┘
 ```
 
-### Standalone files (archived)
-
-The CrowdSec and GreyNoise standalone servers (`blue_team_server_crowdsec.py`, `blue_team_server_greynoise.py`) have been moved to `archive/`. Both tools are fully integrated into the unified server.
-
 | File | Tools | When to use |
 |---|---|---|
-| `blue_team_server.py` | **All 47 tools** | **Recommended** — full capabilities, circuit breaker, credential stripping, PII redaction |
+| `blue_team_server.py` | **All 46 tools** | **Recommended** — full capabilities, circuit breaker, credential stripping, PII redaction |
 
 ---
 
@@ -198,7 +194,7 @@ Cached for **300 seconds (5 minutes)** with automatic cache clearance on authent
 
 ### CrowdSec CTI — In-Memory TTL Cache + Bulk Lookups
 
-CrowdSec IP reputation is integrated directly into the unified server (`blue_team_server.py`). The standalone `blue_team_server_crowdsec.py` and `blue_team_server_greynoise.py` files have been archived — all functionality is available through the main server.
+CrowdSec IP reputation and GreyNoise context lookups are integrated directly into the unified server (`blue_team_server.py`). All functionality is available through the main server — no standalone files needed.
 
 #### In-Memory Cache (CrowdSec CTI Only)
 
@@ -431,7 +427,7 @@ Then point Claude Desktop at it:
 
 Replace `192.168.153.5` with the IP reachable from your workstation (`192.168.153.5` for NAT, `172.16.101.5` for LAB).
 
-Restart Claude Desktop. You should see all 47 blue-team-mcp tools available.
+Restart Claude Desktop. You should see all 46 blue-team-mcp tools available.
 
 ### 4. Remote Service Deployment (systemd)
 
@@ -687,7 +683,7 @@ export BLUETEAM_RATE_LIMIT=60
 
 | File | Role |
 |---|---|
-| `blue_team_server.py` | **Primary** — all 47 tools, both transports (stdio / Streamable HTTP) |
+| `blue_team_server.py` | **Primary** — all 46 tools, both transports (stdio / Streamable HTTP) |
 
 ### Legacy Naming Debt
 

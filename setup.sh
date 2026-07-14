@@ -147,7 +147,7 @@ fi
 # Wrapper scripts
 echo "[5/7] Creating MCP server wrapper scripts..."
 
-# Main wrapper: mcp-server-blueteam (all 47 tools)
+# Main wrapper: mcp-server-blueteam (all 46 tools)
 cat > /usr/local/bin/mcp-server-blueteam << 'EOF'
 #!/usr/bin/env bash
 # Wrapper - Claude Desktop calls this via SSH (MAESTRO-compliant)
@@ -188,7 +188,7 @@ chmod +x /usr/local/bin/mcp-server-blueteam
 
 # DEPRECATED standalone wrappers — redirect to the unified server.
 # The standalone CrowdSec and GreyNoise files have been removed;
-# all 47 tools (including CrowdSec + GreyNoise) live in blue_team_server.py.
+# all 46 tools (including CrowdSec + GreyNoise) live in blue_team_server.py.
 for legacy in mcp-server-crowdsec mcp-server-greynoise; do
   cat > "/usr/local/bin/$legacy" << 'EOF'
 #!/usr/bin/env bash
@@ -231,7 +231,7 @@ echo "  GreyNoise Community needs no key — greynoise_ip_context works immediat
 echo ""
 echo "Wrapper entry points installed:"
 echo ""
-echo "  mcp-server-blueteam    — All 47 tools (Wazuh, threat intel, host forensics)"
+echo "  mcp-server-blueteam    — All 46 tools (Wazuh, threat intel, host forensics)"
 echo "  mcp-server-crowdsec    — DEPRECATED — redirects to mcp-server-blueteam"
 echo "  mcp-server-greynoise   — DEPRECATED — redirects to mcp-server-blueteam"
 echo ""
