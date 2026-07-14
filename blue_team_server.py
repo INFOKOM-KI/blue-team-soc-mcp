@@ -155,46 +155,24 @@ _PRIVATE_NETWORKS = [
     )
 ]
 
-# Shared HTTP clients with connection pooling — one per SSL trust domain
-_shared_http_client: Optional[httpx.AsyncClient] = None
-_shared_wazuh_client: Optional[httpx.AsyncClient] = None
-_shared_indexer_client: Optional[httpx.AsyncClient] = None
-_shared_netra_client: Optional[httpx.AsyncClient] = None
+# Shared HTTP clients by name — lazy-init, pooled per SSL trust domain
+_clients: dict[str, httpx.AsyncClient] = {}
 
 
-async def _get_http_client() -> httpx.AsyncClient:
-    """Return a shared httpx.AsyncClient for public APIs (strict SSL verification)."""
-    global _shared_http_client
-    if _shared_http_client is None or _shared_http_client.is_closed:
-        _shared_http_client = httpx.AsyncClient(
+async def _get_client(
+    name: str,
+    verify: bool = True,
+    max_keepalive: int = 20,
+    max_connections: int = 100,
+) -> httpx.AsyncClient:
+    """Return a pooled httpx.AsyncClient by name, creating lazily if needed."""
+    if name not in _clients or _clients[name].is_closed:
+        _clients[name] = httpx.AsyncClient(
             timeout=httpx.Timeout(HTTP_TIMEOUT),
-            limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
+            limits=httpx.Limits(max_keepalive_connections=max_keepalive, max_connections=max_connections),
+            verify=verify,
         )
-    return _shared_http_client
-
-
-async def _get_wazuh_client() -> httpx.AsyncClient:
-    """Return a shared httpx.AsyncClient for the Wazuh Manager API (often self-signed)."""
-    global _shared_wazuh_client
-    if _shared_wazuh_client is None or _shared_wazuh_client.is_closed:
-        _shared_wazuh_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(HTTP_TIMEOUT),
-            limits=httpx.Limits(max_keepalive_connections=10, max_connections=50),
-            verify=WAZUH_API_VERIFY_SSL,
-        )
-    return _shared_wazuh_client
-
-
-async def _get_indexer_client() -> httpx.AsyncClient:
-    """Return a shared httpx.AsyncClient for the Wazuh Indexer/OpenSearch (often self-signed)."""
-    global _shared_indexer_client
-    if _shared_indexer_client is None or _shared_indexer_client.is_closed:
-        _shared_indexer_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(HTTP_TIMEOUT),
-            limits=httpx.Limits(max_keepalive_connections=10, max_connections=50),
-            verify=WAZUH_INDEXER_VERIFY_SSL,
-        )
-    return _shared_indexer_client
+    return _clients[name]
 
 
 # Cursor utilities for pagination
@@ -752,7 +730,7 @@ def _tail_file(path: str, lines: int) -> str:
 
 
 async def _http_get(url: str, headers: Dict[str, str], params: Dict[str, str] = None) -> Dict:
-    client = await _get_http_client()
+    client = await _get_client("http")
     resp = await client.get(url, headers=headers, params=params or {})
     resp.raise_for_status()
     return resp.json()
@@ -770,7 +748,7 @@ async def _wazuh_get_token() -> Optional[str]:
         url = f"{WAZUH_API_URL}/security/user/authenticate?raw=true"
 
         async def _do_wazuh_auth_http() -> str:
-            client = await _get_wazuh_client()
+            client = await _get_client("wazuh", verify=WAZUH_API_VERIFY_SSL, max_keepalive=10, max_connections=50)
             resp = await client.post(
                 url,
                 auth=(WAZUH_API_USER, WAZUH_API_PASSWORD),
@@ -815,7 +793,7 @@ async def _wazuh_api_get(path: str, params: Dict[str, str] = None) -> Dict:
     try:
 
         async def _do_wazuh_api_http() -> dict:
-            client = await _get_wazuh_client()
+            client = await _get_client("wazuh", verify=WAZUH_API_VERIFY_SSL, max_keepalive=10, max_connections=50)
             resp = await client.get(
                 url,
                 headers={"Authorization": f"Bearer {token}"},
@@ -921,21 +899,10 @@ async def _wazuh_indexer_search(
     # _wazuh_indexer_domain_search and _wazuh_indexer_email_search.
     # lenient=True prevents parse errors from crashing the entire query.
     if keyword and keyword.strip():
-        _KEYWORD_FIELDS = [
-            ("full_log", 3),
-            ("rule.description", 2),
-            ("rule.info", 2),
-            ("data.srcip", 2),
-            ("data.srcip2", 2),
-            ("srcip", 2),
-            ("data.url", 0),
-            ("data.domain", 0),
-            ("data.user_agent", 0),
-            ("data.referrer", 0),
-        ]
+
         k = keyword.strip()
         field_parts = []
-        for fname, boost in _KEYWORD_FIELDS:
+        for fname, boost in _KEYWORD_SEARCH_FIELDS:
             if boost:
                 field_parts.append(f'{fname}: ({k})^{boost}')
             else:
@@ -978,7 +945,7 @@ async def _wazuh_indexer_search(
         body["search_after"] = search_after
 
     async def _do_indexer_http() -> dict[str, Any]:
-        client = await _get_indexer_client()
+        client = await _get_client("indexer", verify=WAZUH_INDEXER_VERIFY_SSL, max_keepalive=10, max_connections=50)
         resp = await client.post(
             url,
             auth=(WAZUH_INDEXER_USER, WAZUH_INDEXER_PASSWORD),
@@ -1020,11 +987,7 @@ async def _wazuh_indexer_email_search(
     Optional filters: agent_name, time range, and a list of rule groups
     (matched against the ``rule.groups`` keyword field).
     """
-    if not WAZUH_INDEXER_URL or not WAZUH_INDEXER_PASSWORD:
-        return {"error": "WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD must be set."}
-
     index_pattern = _WAZUH_INDEX_PATTERNS["alerts"]
-    url = f"{WAZUH_INDEXER_URL}/{index_pattern}/_search"
 
     # Build bool query — should clauses for the two email sources
     should_clauses: list[dict] = [
@@ -1049,14 +1012,9 @@ async def _wazuh_indexer_email_search(
         must_clauses.append({"range": {"@timestamp": time_range}})
 
     if keyword and keyword.strip():
-        _KW_FIELDS = [
-            ("full_log", 3), ("rule.description", 2), ("rule.info", 2),
-            ("data.srcip", 2), ("data.srcip2", 2), ("srcip", 2),
-            ("data.url", 0), ("data.domain", 0), ("data.user_agent", 0), ("data.referrer", 0),
-        ]
         k = keyword.strip()
         field_parts = []
-        for fname, boost in _KW_FIELDS:
+        for fname, boost in _KEYWORD_SEARCH_FIELDS:
             if boost:
                 field_parts.append(f'{fname}: ({k})^{boost}')
             else:
@@ -1097,20 +1055,7 @@ async def _wazuh_indexer_email_search(
     if search_after is not None:
         body["search_after"] = search_after
 
-    try:
-        client = await _get_indexer_client()
-        resp = await client.post(
-            url,
-            auth=(WAZUH_INDEXER_USER, WAZUH_INDEXER_PASSWORD),
-            json=body,
-            headers={"Content-Type": "application/json"},
-        )
-        resp.raise_for_status()
-        return resp.json()
-    except httpx.HTTPStatusError as e:
-        return {"error": f"Indexer API error: {e.response.status_code}", "detail": e.response.text[:500]}
-    except Exception as e:
-        return {"error": str(e)}
+    return await _wazuh_indexer_post(body, index_pattern)
 
 
 async def _wazuh_indexer_domain_search(
@@ -1129,11 +1074,7 @@ async def _wazuh_indexer_domain_search(
     so structured matches sort higher) and falls back to a ``query_string``
     phrase match on ``full_log``.
     """
-    if not WAZUH_INDEXER_URL or not WAZUH_INDEXER_PASSWORD:
-        return {"error": "WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD must be set."}
-
     index_pattern = _WAZUH_INDEX_PATTERNS["alerts"]
-    url = f"{WAZUH_INDEXER_URL}/{index_pattern}/_search"
 
     should_clauses: list[dict] = [
         {"match": {"data.domain": {"query": domain, "boost": 2.0}}},
@@ -1154,14 +1095,9 @@ async def _wazuh_indexer_domain_search(
         must_clauses.append({"range": {"@timestamp": time_range}})
 
     if keyword and keyword.strip():
-        _KW_FIELDS = [
-            ("full_log", 3), ("rule.description", 2), ("rule.info", 2),
-            ("data.srcip", 2), ("data.srcip2", 2), ("srcip", 2),
-            ("data.url", 0), ("data.domain", 0), ("data.user_agent", 0), ("data.referrer", 0),
-        ]
         k = keyword.strip()
         field_parts = []
-        for fname, boost in _KW_FIELDS:
+        for fname, boost in _KEYWORD_SEARCH_FIELDS:
             if boost:
                 field_parts.append(f'{fname}: ({k})^{boost}')
             else:
@@ -1205,20 +1141,7 @@ async def _wazuh_indexer_domain_search(
     if search_after is not None:
         body["search_after"] = search_after
 
-    try:
-        client = await _get_indexer_client()
-        resp = await client.post(
-            url,
-            auth=(WAZUH_INDEXER_USER, WAZUH_INDEXER_PASSWORD),
-            json=body,
-            headers={"Content-Type": "application/json"},
-        )
-        resp.raise_for_status()
-        return resp.json()
-    except httpx.HTTPStatusError as e:
-        return {"error": f"Indexer API error: {e.response.status_code}", "detail": e.response.text[:500]}
-    except Exception as e:
-        return {"error": str(e)}
+    return await _wazuh_indexer_post(body, index_pattern)
 
 
 async def _wazuh_indexer_multi_email_search(
@@ -1237,14 +1160,11 @@ async def _wazuh_indexer_multi_email_search(
     within OpenSearch clause-count limits; callers with larger lists should
     fan out across multiple calls and merge the results client-side.
     """
-    if not WAZUH_INDEXER_URL or not WAZUH_INDEXER_PASSWORD:
-        return {"error": "WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD must be set."}
 
     if len(emails) > 25:
         emails = emails[:25]
 
     index_pattern = _WAZUH_INDEX_PATTERNS["alerts"]
-    url = f"{WAZUH_INDEXER_URL}/{index_pattern}/_search"
 
     # Build query_string: full_log: ("e1@x.com" OR "e2@y.com" ...)
     quoted = [f'"{e}"' for e in emails]
@@ -1268,14 +1188,9 @@ async def _wazuh_indexer_multi_email_search(
         must_clauses.append({"range": {"@timestamp": time_range}})
 
     if keyword and keyword.strip():
-        _KW_FIELDS = [
-            ("full_log", 3), ("rule.description", 2), ("rule.info", 2),
-            ("data.srcip", 2), ("data.srcip2", 2), ("srcip", 2),
-            ("data.url", 0), ("data.domain", 0), ("data.user_agent", 0), ("data.referrer", 0),
-        ]
         k = keyword.strip()
         field_parts = []
-        for fname, boost in _KW_FIELDS:
+        for fname, boost in _KEYWORD_SEARCH_FIELDS:
             if boost:
                 field_parts.append(f'{fname}: ({k})^{boost}')
             else:
@@ -1314,20 +1229,7 @@ async def _wazuh_indexer_multi_email_search(
     if search_after is not None:
         body["search_after"] = search_after
 
-    try:
-        client = await _get_indexer_client()
-        resp = await client.post(
-            url,
-            auth=(WAZUH_INDEXER_USER, WAZUH_INDEXER_PASSWORD),
-            json=body,
-            headers={"Content-Type": "application/json"},
-        )
-        resp.raise_for_status()
-        return resp.json()
-    except httpx.HTTPStatusError as e:
-        return {"error": f"Indexer API error: {e.response.status_code}", "detail": e.response.text[:500]}
-    except Exception as e:
-        return {"error": str(e)}
+    return await _wazuh_indexer_post(body, index_pattern)
 
 
 async def _wazuh_indexer_aggregate(
@@ -1353,11 +1255,7 @@ async def _wazuh_indexer_aggregate(
     - ``top_srcips`` — terms aggregation on ``data.srcip``
     - ``top_agents`` — terms aggregation on ``agent.name``
     """
-    if not WAZUH_INDEXER_URL or not WAZUH_INDEXER_PASSWORD:
-        return {"error": "WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD must be set."}
-
     index_pattern = _WAZUH_INDEX_PATTERNS["alerts"]
-    url = f"{WAZUH_INDEXER_URL}/{index_pattern}/_search"
 
     # Filter context (no scoring needed — filter is faster than query)
     filter_clauses: list[dict] = [
@@ -1377,14 +1275,9 @@ async def _wazuh_indexer_aggregate(
         filter_clauses.append({"range": {"rule.level": {"gte": rule_level_min}}})
     # Free-text keyword filter — same query_string pattern as _wazuh_indexer_search
     if keyword and keyword.strip():
-        _KW_FIELDS = [
-            ("full_log", 3), ("rule.description", 2), ("rule.info", 2),
-            ("data.srcip", 2), ("data.srcip2", 2), ("srcip", 2),
-            ("data.url", 0), ("data.domain", 0), ("data.user_agent", 0), ("data.referrer", 0),
-        ]
         k = keyword.strip()
         field_parts = []
-        for fname, boost in _KW_FIELDS:
+        for fname, boost in _KEYWORD_SEARCH_FIELDS:
             if boost:
                 field_parts.append(f'{fname}: ({k})^{boost}')
             else:
@@ -1448,20 +1341,7 @@ async def _wazuh_indexer_aggregate(
         },
     }
 
-    try:
-        client = await _get_indexer_client()
-        resp = await client.post(
-            url,
-            auth=(WAZUH_INDEXER_USER, WAZUH_INDEXER_PASSWORD),
-            json=body,
-            headers={"Content-Type": "application/json"},
-        )
-        resp.raise_for_status()
-        return resp.json()
-    except httpx.HTTPStatusError as e:
-        return {"error": f"Indexer API error: {e.response.status_code}", "detail": e.response.text[:500]}
-    except Exception as e:
-        return {"error": str(e)}
+    return await _wazuh_indexer_post(body, index_pattern)
 
 
 # CrowdSec CTI helpers
@@ -1504,7 +1384,7 @@ async def _crowdsec_request(path: str) -> dict[str, Any]:
 
     # circuit-breaker-wrapped HTTP call — cache hits skip this entirely
     async def _do_crowdsec_http() -> dict[str, Any]:
-        client = await _get_http_client()
+        client = await _get_client("http")
         response = await client.get(url, headers=headers)
         response.raise_for_status()
         return response.json()
@@ -1785,7 +1665,7 @@ async def _greynoise_community_request(ip: str) -> dict[str, Any]:
         "User-Agent": "blue-team-mcp/1.0.0 (TangerangKota-CSIRT)",
     }
     url = f"{GREYNOISE_COMMUNITY_BASE_URL}/{ip}"
-    client = await _get_http_client()
+    client = await _get_client("http")
     response = await client.get(url, headers=headers)
     response.raise_for_status()
     return response.json()
@@ -1964,20 +1844,6 @@ async def greynoise_ip_context(params: GreynoiseIpContextInput) -> str:
 
 # NETRA THREAT INTELLIGENCE
 # Optional: set NETRA_API_KEY to enable the netra_ip_analysis tool.
-# The staging server may use a self-signed certificate — configure
-# NETRA_VERIFY_SSL=true if your deployment uses a trusted CA.
-async def _get_netra_http_client() -> httpx.AsyncClient:
-    """Return a shared httpx.AsyncClient for the Netra Threat Intelligence API (staging, often self-signed)."""
-    global _shared_netra_client
-    if _shared_netra_client is None or _shared_netra_client.is_closed:
-        _shared_netra_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(HTTP_TIMEOUT),
-            limits=httpx.Limits(max_keepalive_connections=5, max_connections=20),
-            verify=NETRA_VERIFY_SSL,
-        )
-    return _shared_netra_client
-
-
 def _get_netra_api_key() -> str:
     """Read Netra Threat Intelligence API key from environment."""
     key = os.environ.get(NETRA_API_KEY_ENV)
@@ -1998,7 +1864,7 @@ async def _netra_request(path: str) -> dict[str, Any]:
         "User-Agent": "blue-team-mcp/1.0.0 (TangerangKota-CSIRT)",
     }
     url = f"{NETRA_BASE_URL}{path}"
-    client = await _get_netra_http_client()
+    client = await _get_client("netra", verify=NETRA_VERIFY_SSL, max_keepalive=5, max_connections=20)
     response = await client.get(url, headers=headers)
     response.raise_for_status()
     return response.json()
@@ -2931,6 +2797,64 @@ _EMAIL_RE = re.compile(
     r'(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}'
 )
 
+# Shared keyword search fields — used across all Wazuh Indexer query helpers.
+# Each tuple is (field_name, boost). boost=0 means the field is searched
+# but does not influence score ranking.
+_KEYWORD_SEARCH_FIELDS: list[tuple[str, int]] = [
+    ("full_log", 3),
+    ("rule.description", 2),
+    ("rule.info", 2),
+    ("data.srcip", 2),
+    ("data.srcip2", 2),
+    ("srcip", 2),
+    ("data.url", 0),
+    ("data.domain", 0),
+    ("data.user_agent", 0),
+    ("data.referrer", 0),
+]
+
+
+def _validate_keyword_field(v: Optional[str]) -> Optional[str]:
+    """Shared keyword validator — strip, reject null bytes / control chars."""
+    if v is not None:
+        v = v.strip()
+        if not v:
+            return None
+        if len(v) > 1024:
+            raise ValueError("keyword too long (max 1024)")
+        if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", v):
+            raise ValueError("keyword contains invalid control characters")
+    return v
+
+
+def _validate_agent_name_field(v: Optional[str]) -> Optional[str]:
+    """Shared agent_name validator — strip, length-check, safe-chars-only."""
+    if v is not None:
+        v = v.strip()
+        if not v:
+            return None
+        if len(v) > 64:
+            raise ValueError("agent_name too long (max 64)")
+        if not _AGENT_NAME_SAFE_RE.match(v):
+            raise ValueError("agent_name: use only letters, numbers, hyphen, underscore, dot")
+    return v
+
+
+def _validate_rule_groups_field(v: Optional[str]) -> Optional[str]:
+    """Shared rule_groups validator — comma-split, strip, safe-chars-only."""
+    if v is not None:
+        v = v.strip()
+        if not v:
+            return None
+        for g in v.split(","):
+            g = g.strip()
+            if not g:
+                raise ValueError("Empty rule group name in comma-separated list")
+            if not _AGENT_NAME_SAFE_RE.match(g):
+                raise ValueError(f"Invalid rule group name: '{g}'")
+    return v
+
+
 class WazuhIndexerSearchInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid", populate_by_name=True)
 
@@ -3124,17 +3048,7 @@ class WazuhIndexerSearchInput(BaseModel):
     @field_validator("keyword")
     @classmethod
     def validate_keyword(cls, v: Optional[str]) -> Optional[str]:
-        """Sanitize keyword: strip whitespace, reject null bytes / control chars."""
-        if v is not None:
-            v = v.strip()
-            if not v:
-                return None
-            if len(v) > 1024:
-                raise ValueError("keyword too long (max 1024)")
-            # Reject null bytes and ASCII control chars below 0x20 (except tab)
-            if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", v):
-                raise ValueError("keyword contains invalid control characters")
-        return v
+        return _validate_keyword_field(v)
 
     @field_validator("srcips")
     @classmethod
@@ -3200,15 +3114,7 @@ class WazuhIndexerSearchInput(BaseModel):
     @field_validator("agent_name")
     @classmethod
     def validate_agent_name(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None:
-            v = v.strip()
-            if not v:
-                return None
-            if len(v) > 64:
-                raise ValueError("agent_name too long (max 64)")
-            if not _AGENT_NAME_SAFE_RE.match(v):
-                raise ValueError("agent_name: use only letters, numbers, hyphen, underscore, dot")
-        return v
+        return _validate_agent_name_field(v)
 
     @field_validator("srcip")
     @classmethod
@@ -3225,58 +3131,42 @@ class WazuhIndexerSearchInput(BaseModel):
                 raise ValueError("srcip must be a valid IP address or CIDR range")
         return v
 
-async def _wazuh_indexer_search_full_scan(
-    params: "WazuhIndexerSearchInput",
-    index_pattern: str,
+async def _full_scan_paginate(
+    max_scanned: int,
+    fetch_page,
     initial_search_after: Optional[list],
-) -> str:
-    """Auto-paginate through all matching indexer documents and return a summary.
+    *,
+    redact: bool = False,
+) -> dict:
+    """Shared search_after pagination loop for full-scan analysis.
 
-    Loops internally with ``search_after``, scanning up to ``params.max_scanned``
-    documents across all pages.  Accumulates global counters for source IPs and
-    rule descriptions.
+    Returns a dict with keys: ``total_val``, ``total_relation``, ``total_scanned``,
+    ``pages``, ``exhausted``, ``sample_docs``, ``all_docs``.
 
-    Two output modes controlled by ``params.include_all_docs`` (gated by
-    ``BLUETEAM_ALLOW_UNTRUNCATED``):
-
-    - **Aggregate mode** (default, ``include_all_docs=False``): Returns
-      aggregated counts + 50 sample documents. Memory-efficient.
-    - **Forensic mode** (``include_all_docs=True``): Returns ALL scanned
-      documents alongside aggregations. Requires env guard. Pair with
-      conservative ``max_scanned``.
+    ``fetch_page`` must be an async callable ``(page_size, search_after) -> dict``
+    returning an OpenSearch response.
     """
-    # Determine whether to collect all documents (forensic mode) or just samples
-    forensic_mode = params.include_all_docs and BLUETEAM_ALLOW_UNTRUNCATED
     internal_page_size = 1000
     total_scanned = 0
+    pages = 0
+    exhausted = False
     global_total_val: Optional[int] = None
     global_total_relation = "eq"
-    global_srcip_counter: Counter[str] = Counter()
-    global_rule_counter: Counter[str] = Counter()
+    all_docs: list[dict] = []
     sample_docs: list[dict] = []
-    all_docs: list[dict] = [] if forensic_mode else []  # only populated in forensic mode
     search_after = initial_search_after
-    exhausted = False
-    pages = 0
 
-    while total_scanned < params.max_scanned:
-        remaining = params.max_scanned - total_scanned
+    while total_scanned < max_scanned:
+        remaining = max_scanned - total_scanned
         page_size = min(internal_page_size, remaining)
-        data = await _wazuh_indexer_search(
-            index_pattern=index_pattern,
-            agent_name=params.agent_name,
-            size=page_size,
-            search_after=search_after,
-            srcip=params.srcip,
-            since=params.since,
-            until=params.until,
-            keyword=params.keyword,
-            srcips=params.srcips,
-            fields=params.fields,
-            rule_groups=params.rule_groups,
-        )
+        data = await fetch_page(page_size, search_after)
         if isinstance(data.get("error"), str):
-            return json.dumps(data, indent=2)
+            return {
+                "total_val": global_total_val, "total_relation": global_total_relation,
+                "total_scanned": total_scanned, "pages": pages,
+                "exhausted": False, "sample_docs": sample_docs,
+                "all_docs": all_docs, "_error": data["error"],
+            }
 
         hits = data.get("hits", {})
         total = hits.get("total", {})
@@ -3286,51 +3176,97 @@ async def _wazuh_indexer_search_full_scan(
 
         hit_list = hits.get("hits", [])
         docs = [h.get("_source", h) for h in hit_list]
-        docs = _redact_alert_data(docs, bypass=False)
+        if redact:
+            docs = _redact_alert_data(docs, bypass=False)
         pages += 1
 
         if not docs:
             exhausted = True
             break
 
-        if forensic_mode:
-            # Forensic mode: collect ALL documents (memory-intensive — gated by env guard)
-            all_docs.extend(docs)
-
-        # Keep first 50 docs from page 1 as a sample (aggregate mode)
-        if not sample_docs and pages == 1:
+        all_docs.extend(docs)
+        if pages == 1:
             sample_docs = docs[:50]
 
-        # Aggregate counters across all docs
-        for doc in docs:
-            ip = (doc.get("data") or {}).get("srcip") or doc.get("srcip", "")
-            if ip:
-                global_srcip_counter[ip] += 1
-            rule = doc.get("rule") or {}
-            rule_id = rule.get("id", "")
-            rule_desc = rule.get("description", "")
-            if rule_id:
-                global_rule_counter[f"{rule_id}: {rule_desc}"] += 1
-
         total_scanned += len(docs)
-
         last_sort = hit_list[-1].get("sort")
         if not last_sort or len(docs) < page_size:
             exhausted = True
             break
         search_after = last_sort
 
+    return {
+        "total_val": global_total_val, "total_relation": global_total_relation,
+        "total_scanned": total_scanned, "pages": pages,
+        "exhausted": exhausted, "sample_docs": sample_docs,
+        "all_docs": all_docs,
+    }
+
+
+async def _wazuh_indexer_search_full_scan(
+    params: "WazuhIndexerSearchInput",
+    index_pattern: str,
+    initial_search_after: Optional[list],
+) -> str:
+    """Auto-paginate through all matching indexer documents and return a summary.
+
+    Loops internally with ``search_after``, scanning up to ``params.max_scanned``
+    documents across all pages.  Uses the shared ``_full_scan_paginate`` loop.
+    """
+    forensic_mode = params.include_all_docs and BLUETEAM_ALLOW_UNTRUNCATED
+
+    async def _fetch_page(ps: int, sa):
+        return await _wazuh_indexer_search(
+            index_pattern=index_pattern,
+            agent_name=params.agent_name,
+            size=ps,
+            search_after=sa,
+            srcip=params.srcip,
+            since=params.since,
+            until=params.until,
+            keyword=params.keyword,
+            srcips=params.srcips,
+            fields=params.fields,
+            rule_groups=params.rule_groups,
+        )
+
+    result = await _full_scan_paginate(
+        params.max_scanned, _fetch_page, initial_search_after, redact=True,
+    )
+    if result.get("_error"):
+        return json.dumps({"error": result["_error"]}, indent=2)
+
+    total_scanned = result["total_scanned"]
+    pages = result["pages"]
+    exhausted = result["exhausted"]
+    global_total_val = result["total_val"]
+    global_total_relation = result["total_relation"]
     coverage = "complete" if exhausted else "partial"
+    all_docs = result["all_docs"]
+    sample_docs = result["sample_docs"]
+
+    # Accumulate counters from all scanned docs
+    global_srcip_counter: Counter[str] = Counter()
+    global_rule_counter: Counter[str] = Counter()
+    for doc in all_docs:
+        ip = (doc.get("data") or {}).get("srcip") or doc.get("srcip", "")
+        if ip:
+            global_srcip_counter[ip] += 1
+        rule = doc.get("rule") or {}
+        rule_id = rule.get("id", "")
+        rule_desc = rule.get("description", "")
+        if rule_id:
+            global_rule_counter[f"{rule_id}: {rule_desc}"] += 1
+
     total_display = (
         f"{global_total_val or 0:,}"
         + ("+" if global_total_relation == "gte" else "")
     )
 
-    # Apply redaction to documents that will be surfaced
-    sample_docs = _redact_alert_data(sample_docs, bypass=params.bypass_redaction)
+    # Forensic mode: collect all docs from paginator output
     if forensic_mode:
         all_docs = _redact_alert_data(all_docs, bypass=params.bypass_redaction)
-
+    sample_docs = _redact_alert_data(sample_docs, bypass=params.bypass_redaction)
     if params.response_format == ResponseFormat.JSON:
         output: dict = {
             "mode": "full_scan",
@@ -3587,16 +3523,6 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhI
     return _truncate_if_needed("\n".join(lines), bypass=params.bypass_character_limit)
 
 
-# Alias: wazuh_wazuh_indexer_search → same as blueteam_wazuh_indexer_search
-@mcp.tool(
-    name="wazuh_wazuh_indexer_search",
-    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
-)
-async def wazuh_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhIndexerSearchInput()) -> str:
-    """Alias for blueteam_wazuh_indexer_search. Same functionality, same parameters."""
-    return await blueteam_wazuh_indexer_search(params)
-
-
 # Wazuh Email & Domain Lookup
 def _extract_emails_from_doc(doc: dict) -> set[str]:
     """Extract email addresses from a single Wazuh alert document.
@@ -3671,46 +3597,17 @@ class WazuhEmailLookupInput(BaseModel):
     @field_validator("agent_name")
     @classmethod
     def validate_agent_name(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None:
-            v = v.strip()
-            if not v:
-                return None
-            if len(v) > 64:
-                raise ValueError("agent_name too long (max 64)")
-            if not _AGENT_NAME_SAFE_RE.match(v):
-                raise ValueError("agent_name: use only letters, numbers, hyphen, underscore, dot")
-        return v
+        return _validate_agent_name_field(v)
 
     @field_validator("rule_groups")
     @classmethod
     def validate_rule_groups(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None:
-            v = v.strip()
-            if not v:
-                return None
-            for g in v.split(","):
-                g = g.strip()
-                if not g:
-                    raise ValueError("Empty rule group name in comma-separated list")
-                if not _AGENT_NAME_SAFE_RE.match(g):
-                    raise ValueError(
-                        f"Invalid rule group name: '{g}'. "
-                        "Use only letters, numbers, hyphen, underscore, dot."
-                    )
-        return v
+        return _validate_rule_groups_field(v)
 
     @field_validator("keyword")
     @classmethod
     def validate_keyword(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None:
-            v = v.strip()
-            if not v:
-                return None
-            if len(v) > 1024:
-                raise ValueError("keyword too long (max 1024)")
-            if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", v):
-                raise ValueError("keyword contains invalid control characters")
-        return v
+        return _validate_keyword_field(v)
 
 
 @mcp.tool(
@@ -4000,28 +3897,12 @@ class WazuhDomainLookupInput(BaseModel):
     @field_validator("agent_name")
     @classmethod
     def validate_agent_name(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None:
-            v = v.strip()
-            if not v:
-                return None
-            if len(v) > 64:
-                raise ValueError("agent_name too long (max 64)")
-            if not _AGENT_NAME_SAFE_RE.match(v):
-                raise ValueError("agent_name: use only letters, numbers, hyphen, underscore, dot")
-        return v
+        return _validate_agent_name_field(v)
 
     @field_validator("keyword")
     @classmethod
     def validate_keyword(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None:
-            v = v.strip()
-            if not v:
-                return None
-            if len(v) > 1024:
-                raise ValueError("keyword too long (max 1024)")
-            if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", v):
-                raise ValueError("keyword contains invalid control characters")
-        return v
+        return _validate_keyword_field(v)
 
 
 async def _wazuh_domain_lookup_full_scan(
@@ -4032,84 +3913,50 @@ async def _wazuh_domain_lookup_full_scan(
 ) -> str:
     """Auto-paginate through all matching alerts and return an aggregated summary.
 
-    Loops internally with ``search_after`` cursors, scanning up to
-    ``params.max_scanned`` documents across all pages.  Accumulates global
-    counters for source IPs, rule groups, and rule IDs.  Returns a summary
-    with coverage metadata so the caller knows whether the scan was complete
-    or hit the ``max_scanned`` ceiling.
+    Uses the shared ``_full_scan_paginate`` loop internally.
     """
-    internal_page_size = 1000
-    total_scanned = 0
-    global_total_val: Optional[int] = None
-    global_total_relation = "eq"
+
+    async def _fetch_page(ps: int, sa):
+        return await _wazuh_indexer_domain_search(
+            domain=params.domain,
+            agent_name=params.agent_name,
+            size=ps,
+            search_after=sa,
+            since=since_str,
+            until=until_str,
+            include_full_log=False,
+            keyword=params.keyword,
+        )
+
+    result = await _full_scan_paginate(
+        params.max_scanned, _fetch_page, initial_search_after, redact=True,
+    )
+    if result.get("_error"):
+        return json.dumps({"error": result["_error"]}, indent=2)
+
+    total_scanned = result["total_scanned"]
+    pages = result["pages"]
+    exhausted = result["exhausted"]
+    global_total_val = result["total_val"]
+    global_total_relation = result["total_relation"]
+    all_docs = result["all_docs"]
+    sample_docs = result["sample_docs"]
+
+    # Accumulate counters from all scanned docs
     global_srcip_counter: Counter[str] = Counter()
     global_rule_group_counter: Counter[str] = Counter()
     global_rule_counter: Counter[str] = Counter()
-    sample_docs: list[dict] = []
-    search_after = initial_search_after
-    exhausted = False
-    pages = 0
-
-    while total_scanned < params.max_scanned:
-        remaining = params.max_scanned - total_scanned
-        page_size = min(internal_page_size, remaining)
-        try:
-            data = await _wazuh_indexer_domain_search(
-                domain=params.domain,
-                agent_name=params.agent_name,
-                size=page_size,
-                search_after=search_after,
-                since=since_str,
-                until=until_str,
-                include_full_log=False,  # full scan never includes full_log
-                keyword=params.keyword,
-            )
-        except (httpx.HTTPStatusError, httpx.TimeoutException, CircuitBreakerOpenError, RuntimeError) as e:
-            return _handle_api_error(e, context="wazuh_domain_lookup")
-
-        if isinstance(data.get("error"), str):
-            return json.dumps(data, indent=2)
-
-        hits = data.get("hits", {})
-        total = hits.get("total", {})
-        if global_total_val is None:
-            global_total_val = total.get("value", 0) if isinstance(total, dict) else total
-            global_total_relation = total.get("relation", "eq") if isinstance(total, dict) else "eq"
-
-        hit_list = hits.get("hits", [])
-        docs = [h.get("_source", h) for h in hit_list]
-        docs = _redact_alert_data(docs, bypass=False)
-        pages += 1
-
-        if not docs:
-            exhausted = True
-            break
-
-        # Keep first 50 docs from page 1 as a sample
-        if not sample_docs and pages == 1:
-            sample_docs = docs[:50]
-
-        # Aggregate counters across all docs
-        for doc in docs:
-            ip = (doc.get("data") or {}).get("srcip", "")
-            if ip:
-                global_srcip_counter[ip] += 1
-            rule = doc.get("rule") or {}
-            for g in rule.get("groups", []):
-                global_rule_group_counter[g] += 1
-            rule_id = rule.get("id", "")
-            rule_desc = rule.get("description", "")
-            if rule_id:
-                global_rule_counter[f"{rule_id}: {rule_desc}"] += 1
-
-        total_scanned += len(docs)
-
-        # Advance cursor for next page
-        last_sort = hit_list[-1].get("sort")
-        if not last_sort or len(docs) < page_size:
-            exhausted = True
-            break
-        search_after = last_sort
+    for doc in all_docs:
+        ip = (doc.get("data") or {}).get("srcip", "")
+        if ip:
+            global_srcip_counter[ip] += 1
+        rule = doc.get("rule") or {}
+        for g in rule.get("groups", []):
+            global_rule_group_counter[g] += 1
+        rule_id = rule.get("id", "")
+        rule_desc = rule.get("description", "")
+        if rule_id:
+            global_rule_counter[f"{rule_id}: {rule_desc}"] += 1
 
     coverage = "complete" if exhausted else "partial"
     total_display = (
@@ -4466,28 +4313,12 @@ class WazuhCompromisedEmailsAnalysisInput(BaseModel):
     @field_validator("agent_name")
     @classmethod
     def validate_agent_name(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None:
-            v = v.strip()
-            if not v:
-                return None
-            if len(v) > 64:
-                raise ValueError("agent_name too long (max 64)")
-            if not _AGENT_NAME_SAFE_RE.match(v):
-                raise ValueError("agent_name: use only letters, numbers, hyphen, underscore, dot")
-        return v
+        return _validate_agent_name_field(v)
 
     @field_validator("keyword")
     @classmethod
     def validate_keyword(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None:
-            v = v.strip()
-            if not v:
-                return None
-            if len(v) > 1024:
-                raise ValueError("keyword too long (max 1024)")
-            if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", v):
-                raise ValueError("keyword contains invalid control characters")
-        return v
+        return _validate_keyword_field(v)
 
 
 @mcp.tool(
@@ -4851,29 +4682,12 @@ class WazuhAlertTimelineInput(BaseModel):
     @field_validator("agent_name")
     @classmethod
     def validate_agent_name(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None:
-            v = v.strip()
-            if not v:
-                return None
-            if len(v) > 64:
-                raise ValueError("agent_name too long (max 64)")
-            if not _AGENT_NAME_SAFE_RE.match(v):
-                raise ValueError("agent_name: use only letters, numbers, hyphen, underscore, dot")
-        return v
+        return _validate_agent_name_field(v)
 
     @field_validator("keyword")
     @classmethod
     def validate_keyword(cls, v: Optional[str]) -> Optional[str]:
-        """Sanitize keyword: strip whitespace, reject null bytes / control chars."""
-        if v is not None:
-            v = v.strip()
-            if not v:
-                return None
-            if len(v) > 1024:
-                raise ValueError("keyword too long (max 1024)")
-            if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", v):
-                raise ValueError("keyword contains invalid control characters")
-        return v
+        return _validate_keyword_field(v)
 
     @field_validator("bucket")
     @classmethod
@@ -4888,17 +4702,7 @@ class WazuhAlertTimelineInput(BaseModel):
     @field_validator("rule_groups")
     @classmethod
     def validate_rule_groups(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None:
-            v = v.strip()
-            if not v:
-                return None
-            for g in v.split(","):
-                g = g.strip()
-                if not g:
-                    raise ValueError("Empty rule group name in comma-separated list")
-                if not _AGENT_NAME_SAFE_RE.match(g):
-                    raise ValueError(f"Invalid rule group name: '{g}'")
-        return v
+        return _validate_rule_groups_field(v)
 
 
 @mcp.tool(
@@ -5132,15 +4936,7 @@ class WazuhAttackVelocityInput(BaseModel):
     @field_validator("agent_name")
     @classmethod
     def validate_agent_name(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None:
-            v = v.strip()
-            if not v:
-                return None
-            if len(v) > 64:
-                raise ValueError("agent_name too long (max 64)")
-            if not _AGENT_NAME_SAFE_RE.match(v):
-                raise ValueError("agent_name: use only letters, numbers, hyphen, underscore, dot")
-        return v
+        return _validate_agent_name_field(v)
 
     @field_validator("window")
     @classmethod
@@ -5154,30 +4950,12 @@ class WazuhAttackVelocityInput(BaseModel):
     @field_validator("rule_groups")
     @classmethod
     def validate_rule_groups(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None:
-            v = v.strip()
-            if not v:
-                return None
-            for g in v.split(","):
-                g = g.strip()
-                if not g:
-                    raise ValueError("Empty rule group name")
-                if not _AGENT_NAME_SAFE_RE.match(g):
-                    raise ValueError(f"Invalid rule group name: '{g}'")
-        return v
+        return _validate_rule_groups_field(v)
 
     @field_validator("keyword")
     @classmethod
     def validate_keyword(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None:
-            v = v.strip()
-            if not v:
-                return None
-            if len(v) > 1024:
-                raise ValueError("keyword too long (max 1024)")
-            if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", v):
-                raise ValueError("keyword contains invalid control characters")
-        return v
+        return _validate_keyword_field(v)
 
 
 @mcp.tool(
@@ -5464,12 +5242,8 @@ async def blueteam_lookup_ip_abuseipdb(params: IPInput) -> str:
             f"| **VPN/Public** | {result['is_vpn']} |",
         ]
         return "\n".join(lines)
-    except httpx.HTTPStatusError as e:
-        return json.dumps({"error": f"AbuseIPDB API error: {e.response.status_code}", "detail": e.response.text})
-    except httpx.TimeoutException:
-        return json.dumps({"error": f"AbuseIPDB API request timed out after {HTTP_TIMEOUT}s"})
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+    except (httpx.HTTPStatusError, httpx.TimeoutException, Exception) as e:
+        return _handle_api_error(e, context="blueteam_lookup_ip_abuseipdb")
 
 
 _HASH_RE = re.compile(r"^[a-fA-F0-9]{32,64}$")
@@ -5559,11 +5333,9 @@ async def blueteam_lookup_hash_virustotal(params: HashInput) -> str:
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             return json.dumps({"result": "Not found in VirusTotal — hash is unknown or clean"})
-        return json.dumps({"error": f"VirusTotal API error: {e.response.status_code}"})
-    except httpx.TimeoutException:
-        return json.dumps({"error": f"VirusTotal API request timed out after {HTTP_TIMEOUT}s"})
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+        return _handle_api_error(e, context="blueteam_lookup_hash_virustotal")
+    except (httpx.TimeoutException, Exception) as e:
+        return _handle_api_error(e, context="blueteam_lookup_hash_virustotal")
 
 
 class DomainInput(BaseModel):
@@ -5637,12 +5409,8 @@ async def blueteam_lookup_domain_virustotal(params: DomainInput) -> str:
             for engine, cat in sorted(cats.items()):
                 lines.append(f"- **{engine}**: {cat}")
         return "\n".join(lines)
-    except httpx.HTTPStatusError as e:
-        return json.dumps({"error": f"VirusTotal API error: {e.response.status_code}", "detail": str(e.response.text[:200])})
-    except httpx.TimeoutException:
-        return json.dumps({"error": f"VirusTotal API request timed out after {HTTP_TIMEOUT}s"})
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+    except (httpx.HTTPStatusError, httpx.TimeoutException, Exception) as e:
+        return _handle_api_error(e, context="blueteam_lookup_domain_virustotal")
 
 
 
@@ -6183,7 +5951,7 @@ async def _wazuh_indexer_post(body: dict, index_pattern: Optional[str] = None) -
     url = f"{WAZUH_INDEXER_URL}/{index_pattern}/_search"
 
     async def _do_post() -> dict[str, Any]:
-        client = await _get_indexer_client()
+        client = await _get_client("indexer", verify=WAZUH_INDEXER_VERIFY_SSL, max_keepalive=10, max_connections=50)
         resp = await client.post(
             url,
             auth=(WAZUH_INDEXER_USER, WAZUH_INDEXER_PASSWORD),
@@ -6269,41 +6037,17 @@ class AggregateAnalysisInput(BaseModel):
     @field_validator("agent_name")
     @classmethod
     def validate_agent_name(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None:
-            v = v.strip()
-            if not v:
-                return None
-            if not _AGENT_NAME_SAFE_RE.match(v):
-                raise ValueError("agent_name: use only letters, numbers, hyphen, underscore, dot")
-        return v
+        return _validate_agent_name_field(v)
 
     @field_validator("keyword")
     @classmethod
     def validate_keyword(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None:
-            v = v.strip()
-            if not v:
-                return None
-            if len(v) > 1024:
-                raise ValueError("keyword too long (max 1024)")
-            if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", v):
-                raise ValueError("keyword contains invalid control characters")
-        return v
+        return _validate_keyword_field(v)
 
     @field_validator("rule_groups")
     @classmethod
     def validate_rule_groups(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None:
-            v = v.strip()
-            if not v:
-                return None
-            for g in v.split(","):
-                g = g.strip()
-                if not g:
-                    raise ValueError("Empty rule group name in comma-separated list")
-                if not _AGENT_NAME_SAFE_RE.match(g):
-                    raise ValueError(f"Invalid rule group name: '{g}'")
-        return v
+        return _validate_rule_groups_field(v)
 
 
 def _build_filter_clauses(
@@ -6331,11 +6075,7 @@ def _build_filter_clauses(
     if rule_level_min is not None:
         filters.append({"range": {"rule.level": {"gte": rule_level_min}}})
     if keyword and keyword.strip():
-        _KW = [
-            ("full_log", 3), ("rule.description", 2), ("rule.info", 2),
-            ("data.srcip", 2), ("data.srcip2", 2), ("srcip", 2),
-            ("data.url", 0), ("data.domain", 0),
-        ]
+        _KW = _KEYWORD_SEARCH_FIELDS[:8]
         k = keyword.strip()
         parts = [f'{f}: ({k})^{b}' if b else f'{f}: ({k})' for f, b in _KW]
         filters.append({
@@ -6989,13 +6729,7 @@ class FocusedCrawlInput(BaseModel):
     @field_validator("agent_name")
     @classmethod
     def validate_agent_name(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None:
-            v = v.strip()
-            if not v:
-                return None
-            if not _AGENT_NAME_SAFE_RE.match(v):
-                raise ValueError("agent_name: use only letters, numbers, hyphen, underscore, dot")
-        return v
+        return _validate_agent_name_field(v)
 
     @field_validator("fields")
     @classmethod
