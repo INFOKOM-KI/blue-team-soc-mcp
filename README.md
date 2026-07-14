@@ -1,4 +1,4 @@
-# Blue Team MCP Server
+# Blue Team MCP Server (Wazuh SIEM)
 
 A defensive security MCP server for Claude Desktop or any MCP Client - the defender's counterpart to [mcp-kali-server](https://www.kali.org/blog/kali-llm-claude-desktop/).
 
@@ -11,7 +11,7 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
 
 ## Architecture
 
-`blue_team_server.py` is a **single, unified MCP server** with 46 tools spanning host forensics, Wazuh SIEM, and multi-source threat intelligence. It supports two transports:
+`blue_team_server.py` is a **single, unified MCP server** with 47 tools spanning host forensics, Wazuh SIEM, and multi-source threat intelligence. It supports two transports:
 
 | Transport | Use case | MCP client connection |
 |---|---|---|
@@ -21,7 +21,7 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
 ```
                           ┌──────────────────────────────────┐
                           │     blue_team_server.py          │
-                          │     46 tools · 1 file · 2 transports  │
+                          │     47 tools · 1 file · 2 transports  │
                           │                                  │
                           │  ┌────────────────────────────┐  │
                           │  │ Host Forensics (26 tools)  │  │
@@ -83,7 +83,7 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
 
 | File | Tools | When to use |
 |---|---|---|
-| `blue_team_server.py` | **All 46 tools** | **Recommended** — full capabilities, circuit breaker, credential stripping, PII redaction |
+| `blue_team_server.py` | **All 47 tools** | **Recommended** — full capabilities, circuit breaker, credential stripping, PII redaction |
 
 ---
 
@@ -245,7 +245,7 @@ CLOSED ──5 consecutive failures──▶ OPEN ──60s timeout──▶ HAL
 
 Ported from the Wazuh-MCP-Server output sanitization pattern. Before any Wazuh alert or traffic capture data reaches the LLM context, `_redact_alert_data()` strips credentials, API keys, and secret material from `full_log` and other text fields.
 
-**Applied automatically** to all output from `blueteam_wazuh_alerts`, `blueteam_wazuh_indexer_search`, and `blueteam_capture_traffic`. Controlled by `BLUETEAM_REDACT_PII` (default: `true`) with a per-call `bypass_redaction` parameter for audit investigations.
+**Applied automatically** to ALL tool outputs that may contain sensitive data — Wazuh alerts, log readers, user lists, SSH keys, cron jobs, process lists, system health, and network captures. Controlled by `BLUETEAM_REDACT_PII` (default: `true`) and `BLUETEAM_REDACT_EMAILS` (default: `true`) with a per-call `bypass_redaction` parameter on every tool for audit investigations.
 
 **Stripping rules (15 regex patterns, applied before PII masking):**
 
@@ -315,6 +315,8 @@ All environment variables accepted by the suite. Variables marked **[unified]** 
 | `ABUSEIPDB_API_KEY` | (empty) | AbuseIPDB API key |
 | `VIRUSTOTAL_API_KEY` | (empty) | VirusTotal API key |
 | `NETRA_API_KEY` | (empty) | Netra Threat Intelligence API key |
+| `ARGUS_API_KEY` | (empty) | Argus Threat Intelligence API key (TangerangKota-CSIRT) |
+| `ARGUS_BASE_URL` | (empty) | Argus Threat Intelligence API base URL |
 | `NETRA_VERIFY_SSL` | `false` | TLS certificate verification for Netra API (set `true` for production) |
 
 ### Transport & Deployment
@@ -427,7 +429,7 @@ Then point Claude Desktop at it:
 
 Replace `192.168.153.5` with the IP reachable from your workstation (`192.168.153.5` for NAT, `172.16.101.5` for LAB).
 
-Restart Claude Desktop. You should see all 46 blue-team-mcp tools available.
+Restart Claude Desktop. You should see all 47 blue-team-mcp tools available.
 
 ### 4. Remote Service Deployment (systemd)
 
@@ -515,6 +517,14 @@ All tools below are registered on `blue_team_server.py`. Tools not requiring a s
 | `blueteam_lookup_ip_abuseipdb` | IP reputation via AbuseIPDB |
 | `blueteam_lookup_hash_virustotal` | File hash lookup via VirusTotal |
 | `blueteam_lookup_domain_virustotal` | Domain reputation via VirusTotal |
+
+### Netra Threat Intelligence
+### Argus Threat Intelligence
+*Requires `ARGUS_API_KEY` and `ARGUS_BASE_URL`*
+
+| Tool | Description |
+|------|-------------|
+| `argus_ip_lookup` | Multi-source IP lookup via Argus TI — aggregates VirusTotal, AbuseIPDB, CyberProtect, CrowdSec, ThreatBook, IPAPI, and local Argus reports in a single call |
 
 ### Netra Threat Intelligence
 *Requires `NETRA_API_KEY`*
@@ -683,7 +693,7 @@ export BLUETEAM_RATE_LIMIT=60
 
 | File | Role |
 |---|---|
-| `blue_team_server.py` | **Primary** — all 46 tools, both transports (stdio / Streamable HTTP) |
+| `blue_team_server.py` | **Primary** — all 47 tools, both transports (stdio / Streamable HTTP) |
 
 ### Legacy Naming Debt
 

@@ -126,6 +126,11 @@ NETRA_BASE_URL = "https://yourdreams.gov:8013/api/v1"
 NETRA_API_KEY_ENV = "NETRA_API_KEY"
 NETRA_VERIFY_SSL = os.environ.get("NETRA_VERIFY_SSL", "false").lower() in ("1", "true", "yes")
 
+# Argus Threat Intelligence (optional — set ARGUS_API_KEY to enable the argus_ip_lookup tool)
+ARGUS_BASE_URL = os.environ.get("ARGUS_BASE_URL", "").rstrip("/")
+ARGUS_API_KEY_ENV = "ARGUS_API_KEY"
+ARGUS_VERIFY_SSL = os.environ.get("ARGUS_VERIFY_SSL", "false").lower() in ("1", "true", "yes")
+
 # Shared HTTP / response config
 HTTP_TIMEOUT = 30.0
 CHARACTER_LIMIT = int(os.environ.get("BLUETEAM_CHARACTER_LIMIT", "100000"))
@@ -456,6 +461,7 @@ class CircuitBreaker:
 _cb_crowdsec = CircuitBreaker("crowdsec_cti", failure_threshold=5, recovery_timeout=60)
 _cb_wazuh_manager = CircuitBreaker("wazuh_manager", failure_threshold=5, recovery_timeout=60)
 _cb_wazuh_indexer = CircuitBreaker("wazuh_indexer", failure_threshold=5, recovery_timeout=60)
+_cb_argus = CircuitBreaker("argus_ti", failure_threshold=5, recovery_timeout=60)
 
 
 # PII redaction patterns - applied to alert payloads when BLUETEAM_REDACT_PII is enabled
@@ -2215,11 +2221,329 @@ async def netra_ip_analysis(params: NetraIpAnalysisInput) -> str:
 
     return _truncate_if_needed(result)
 
+
+# ARGUS THREAT INTELLIGENCE
+# Optional: set ARGUS_API_KEY and ARGUS_BASE_URL to enable the argus_ip_lookup tool.
+def _get_argus_api_key() -> str:
+    """Read Argus Threat Intelligence API key from environment."""
+    key = os.environ.get(ARGUS_API_KEY_ENV)
+    if not key:
+        raise RuntimeError(
+            f"Environment variable {ARGUS_API_KEY_ENV} is not set. "
+            "Set your Argus Threat Intelligence API key before using argus_ip_lookup. "
+            "Request a key from your Argus administrator."
+        )
+    return key
+
+
+async def _argus_request(path: str, payload: dict) -> dict[str, Any]:
+    """Reusable async POST request to the Argus Threat Intelligence API."""
+    if not ARGUS_BASE_URL:
+        raise RuntimeError(
+            "ARGUS_BASE_URL is not set. "
+            "Set the Argus Threat Intelligence base URL before using argus_ip_lookup."
+        )
+    headers = {
+        "Authorization": f"Bearer {_get_argus_api_key()}",
+        "Content-Type": "application/json",
+        "accept": "application/json",
+        "User-Agent": "blue-team-mcp/1.0.0 (TangerangKota-CSIRT)",
+    }
+    url = f"{ARGUS_BASE_URL}{path}"
+
+    async def _do_argus_http() -> dict[str, Any]:
+        client = await _get_client("argus", verify=ARGUS_VERIFY_SSL, max_keepalive=5, max_connections=20)
+        resp = await client.post(url, headers=headers, json=payload)
+        resp.raise_for_status()
+        return resp.json()
+
+    return await _cb_argus.call(_do_argus_http)
+
+
+def _format_argus_markdown(ip: str, raw: dict[str, Any]) -> str:
+    """Render Argus Threat Intelligence API response as a human-readable markdown report."""
+    results = raw.get("results", {})
+    ipapi = results.get("ipapi", {})
+    vt = results.get("virustotal", {})
+    ab = results.get("abuseipdb", {})
+    cp = results.get("cyberprotect", {})
+    cs = results.get("crowdsec", {})
+    tb = results.get("threatbook", {})
+    argus_r = results.get("argus_reports", {})
+
+    created_at = raw.get("created_at", "unknown")
+
+    lines: list[str] = [
+        f"# Argus Threat Intelligence — {ip}",
+        "",
+        f"**Analyzed**: {created_at}",
+        "",
+        "## Threat Summary",
+        "",
+        "| Source | Status | Key Finding |",
+        "|--------|--------|-------------|",
+    ]
+
+    # VirusTotal summary
+    if vt.get("success") and vt.get("results"):
+        vt_attrs = vt["results"].get("data", {}).get("attributes", {})
+        vt_stats = vt_attrs.get("last_analysis_stats", {})
+        vt_mal = vt_stats.get("malicious", 0)
+        vt_total = sum(vt_stats.values())
+        lines.append(f"| VirusTotal | ✓ | {vt_mal}/{vt_total} malicious |")
+    else:
+        vt_err = vt.get("error", "") if isinstance(vt, dict) else ""
+        lines.append(f"| VirusTotal | ⚠️ | {vt_err[:50] or 'No data'} |")
+
+    # AbuseIPDB summary
+    if ab.get("success") and ab.get("results"):
+        ab_data = ab["results"].get("data", {})
+        ab_score = ab_data.get("abuseConfidenceScore", 0)
+        ab_reports = ab_data.get("totalReports", 0)
+        lines.append(f"| AbuseIPDB | ✓ | {ab_score}% confidence, {ab_reports} reports |")
+    else:
+        ab_err = ab.get("error", "") if isinstance(ab, dict) else ""
+        lines.append(f"| AbuseIPDB | ⚠️ | {ab_err[:50] or 'No data'} |")
+
+    # CyberProtect summary
+    if cp.get("success") and cp.get("results"):
+        cp_ts = cp["results"].get("threatscore", {})
+        cp_score = cp_ts.get("value", "?")
+        cp_level = cp_ts.get("level", "unknown")
+        lines.append(f"| CyberProtect | ✓ | {cp_level} ({cp_score}) |")
+    else:
+        cp_err = cp.get("error", "") if isinstance(cp, dict) else ""
+        lines.append(f"| CyberProtect | ⚠️ | {cp_err[:50] or 'No data'} |")
+
+    # CrowdSec summary
+    if cs.get("success") and cs.get("results"):
+        cs_rep = cs["results"].get("reputation", "?")
+        lines.append(f"| CrowdSec | ✓ | Reputation: {cs_rep} |")
+    else:
+        cs_err = cs.get("error", "") if isinstance(cs, dict) else ""
+        lines.append(f"| CrowdSec | ⚠️ | {cs_err[:50] or 'No data'} |")
+
+    # ThreatBook summary
+    if tb.get("success") and tb.get("results"):
+        lines.append(f"| ThreatBook | ✓ | Data available |")
+    else:
+        tb_err = tb.get("error", "") if isinstance(tb, dict) else ""
+        lines.append(f"| ThreatBook | ⚠️ | {tb_err[:50] or 'No data'} |")
+
+    lines.append("")
+
+    # Geo (IPAPI)
+    if ipapi.get("success") and ipapi.get("results"):
+        geo = ipapi["results"]
+        lines.extend([
+            "## Geo (IPAPI)",
+            "",
+            f"- **Country**: {geo.get('country', '?')} ({geo.get('countryCode', '?')})",
+            f"- **Region**: {geo.get('regionName', '?')}, {geo.get('city', '?')}",
+            f"- **ISP**: {geo.get('isp', '?')} | **AS**: {geo.get('as', '?')}",
+            "",
+        ])
+
+    # VirusTotal details
+    if vt.get("success") and vt.get("results"):
+        vt_attrs = vt["results"].get("data", {}).get("attributes", {})
+        vt_stats = vt_attrs.get("last_analysis_stats", {})
+        vt_mal = vt_stats.get("malicious", 0)
+        vt_sus = vt_stats.get("suspicious", 0)
+        vt_harm = vt_stats.get("harmless", 0)
+        vt_und = vt_stats.get("undetected", 0)
+        vt_tags = vt_attrs.get("tags", [])
+        vt_as_owner = vt_attrs.get("as_owner", "?")
+        vt_asn = vt_attrs.get("asn", "?")
+        lines.extend([
+            "## VirusTotal",
+            "",
+            f"- {vt_mal} malicious / {vt_sus} suspicious / {vt_harm} harmless / {vt_und} undetected",
+            f"- Reputation: {vt_attrs.get('reputation', '?')}",
+            f"- ASN: {vt_asn} ({vt_as_owner})",
+        ])
+        if vt_tags:
+            lines.append(f"- Tags: {', '.join(vt_tags)}")
+        lines.append("")
+
+    # AbuseIPDB details
+    if ab.get("success") and ab.get("results"):
+        ab_data = ab["results"].get("data", {})
+        ab_score = ab_data.get("abuseConfidenceScore", 0)
+        ab_reports = ab_data.get("totalReports", 0)
+        ab_users = ab_data.get("numDistinctUsers", 0)
+        ab_last = ab_data.get("lastReportedAt", "?")
+        ab_isp = ab_data.get("isp", "?")
+        ab_usage = ab_data.get("usageType", "?")
+        lines.extend([
+            "## AbuseIPDB",
+            "",
+            f"- **Confidence**: {ab_score}% | **Reports**: {ab_reports} from {ab_users} reporters",
+            f"- **ISP**: {ab_isp}",
+            f"- **Usage**: {ab_usage} | **Last reported**: {ab_last}",
+        ])
+        # Top 3 recent report comments
+        ab_reports_list = ab_data.get("reports", [])
+        if ab_reports_list:
+            lines.append("- **Recent reports**:")
+            for r in ab_reports_list[:3]:
+                comment = (r.get("comment", "") or "")[:120]
+                if comment:
+                    lines.append(f"  - {comment}")
+        lines.append("")
+
+    # CyberProtect details
+    if cp.get("success") and cp.get("results"):
+        cp_data = cp["results"]
+        cp_ts = cp_data.get("threatscore", {})
+        cp_score = cp_ts.get("value", "?")
+        cp_level = cp_ts.get("level", "unknown")
+        cp_cats = cp_ts.get("categories", [])
+        cp_tags = cp_data.get("tags", [])
+        cp_sources = cp_data.get("sources", [])
+        cp_obs = cp_data.get("observable", {})
+        cp_first = cp_obs.get("first_seen", "?")
+        cp_last = cp_obs.get("last_seen", "?")
+        bl_count = sum(1 for s in cp_sources if s.get("type") == "blocklist")
+        rep_count = sum(1 for s in cp_sources if s.get("type") == "reputation")
+        lines.extend([
+            "## CyberProtect",
+            "",
+            f"- **Score**: {cp_score} ({cp_level})",
+            f"- **Categories**: {', '.join(cp_cats) if cp_cats else 'none'}",
+            f"- **Tags**: {', '.join(cp_tags) if cp_tags else 'none'}",
+            f"- **Sources**: {bl_count} blocklist, {rep_count} reputation",
+            f"- **First seen**: {cp_first} | **Last seen**: {cp_last}",
+            "",
+        ])
+
+    # Argus Reports
+    if argus_r.get("success") and argus_r.get("results"):
+        ar = argus_r["results"]
+        ar_total = ar.get("total_reports", 0)
+        ar_unique = ar.get("unique_reporters", 0)
+        ar_score = ar.get("scores", 0)
+        lines.extend([
+            "## Argus Reports",
+            "",
+            f"- {ar_total} reports from {ar_unique} reporter(s) | Score: {ar_score}",
+        ])
+        ar_reports = ar.get("reports", [])
+        for r in ar_reports[:5]:
+            desc = (r.get("description", "") or "")[:120]
+            reporter = r.get("reporter", "?")
+            created = r.get("created_at", "?")
+            lines.append(f"- **{reporter}** ({created}): {desc}")
+        lines.append("")
+
+    # Source Errors
+    error_sources = {}
+    for name, src in [
+        ("VirusTotal", vt), ("AbuseIPDB", ab), ("CyberProtect", cp),
+        ("CrowdSec", cs), ("ThreatBook", tb), ("IPAPI", ipapi),
+        ("Argus Reports", argus_r),
+    ]:
+        if isinstance(src, dict) and src.get("success") is False:
+            error_sources[name] = (src.get("error") or "")[:200]
+    if error_sources:
+        lines.append("## Source Errors")
+        for name, err in error_sources.items():
+            lines.append(f"- **{name}**: {err}")
+        lines.append("")
+
+    lines.append("---")
+    lines.append(f"*Analyzed at: {created_at}*")
+
+    return "\n".join(lines)
+
+
+class ArgusIpLookupInput(BaseModel):
+    """Input model for Argus Threat Intelligence IP lookup."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    ip: str = Field(
+        ...,
+        description="Public IPv4 or IPv6 address to analyze through Argus Threat Intelligence.",
+        min_length=3,
+        max_length=45,
+    )
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN,
+        description="'markdown' for a human-readable report, 'json' for structured data.",
+    )
+
+    @field_validator("ip")
+    @classmethod
+    def validate_ip(cls, v: str) -> str:
+        try:
+            ipaddress.ip_address(v)
+        except ValueError as exc:
+            raise ValueError(f"'{v}' is not a valid IP address (IPv4/IPv6).") from exc
+        return _validate_public_ip(v)
+
+
+@mcp.tool(
+    name="argus_ip_lookup",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def argus_ip_lookup(params: ArgusIpLookupInput) -> str:
+    """Analyze a public IP address using Argus Threat Intelligence by TangerangKota-CSIRT.
+
+    This tool is READ-ONLY — it queries the Argus Threat Intelligence API which
+    aggregates data from multiple sources: VirusTotal, AbuseIPDB, CyberProtect,
+    CrowdSec CTI, ThreatBook, IPAPI geo-location, and local Argus reports.
+
+    Each source result is surfaced independently; partial source failures
+    (e.g., rate-limited upstream) are reported inline and do not abort the call.
+
+    Args:
+        params (ArgusIpLookupInput): Validated parameters containing:
+            - ip (str): Public IPv4/IPv6 address to analyze
+            - response_format ('markdown' | 'json'): Output format (default: markdown)
+
+    Returns:
+        str: If markdown, a formatted analysis report with threat summary table,
+        per-source details (VirusTotal, AbuseIPDB, CyberProtect, Argus Reports),
+        geo-location, and source error reporting.
+        If json, the raw aggregated API response.
+
+    Example usage:
+        - Use when: "Check if IP 117.247.110.24 is malicious according to Argus TI"
+        - Use when: "Get multi-source threat intel on a suspicious IP"
+        - Do NOT use for private/internal IPs — this tool queries an external API
+
+    Error Handling:
+        - "Error: Invalid or missing API key (401)" if ARGUS_API_KEY is missing/wrong
+        - "Error: ARGUS_BASE_URL is not set" if base URL is not configured
+        - "Error: No data found for this target (404)" if IP has no data
+        - "Error: Rate limit reached (429)" if API quota is exhausted
+        - Per-source failures (e.g., ThreatBook 429) are reported in the output
+    """
+    _audit_log("argus_ip_lookup", {"ip": params.ip})
+    try:
+        raw = await _argus_request("/lookup-jobs", {"observable": params.ip})
+    except (httpx.HTTPStatusError, httpx.TimeoutException, CircuitBreakerOpenError, RuntimeError) as e:
+        return _handle_api_error(e, context="argus_ip_lookup")
+
+    if params.response_format == ResponseFormat.JSON:
+        return _truncate_if_needed(json.dumps(raw, indent=2, ensure_ascii=False))
+
+    result = _format_argus_markdown(params.ip, raw)
+    return _truncate_if_needed(result)
+
+
 # LOG ANALYSIS
 class LogInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     lines: int = Field(default=200, description="Number of recent lines to return", ge=1, le=MAX_LOG_LINES)
     grep: Optional[str] = Field(default=None, max_length=MAX_GREP_PATTERN_LENGTH, description="Optional keyword/regex to filter lines (case-insensitive)")
+    bypass_redaction: bool = Field(default=False, description="When true, skip PII/credential redaction for audit investigations")
 
 @mcp.tool(
     name="blueteam_read_auth_log",
@@ -2243,7 +2567,7 @@ async def blueteam_read_auth_log(params: LogInput) -> str:
         if params.grep:
             cmd += ["--grep", params.grep]
         r = _run(cmd)
-        return r["stdout"] or r["stderr"]
+        return _redact_alert_data(r["stdout"] or r["stderr"], bypass=params.bypass_redaction)
 
     content = _tail_file(log_path, params.lines)
     if params.grep:
@@ -2273,8 +2597,8 @@ async def blueteam_read_syslog(params: LogInput) -> str:
             if params.grep:
                 safe_grep = _sanitize_regex(params.grep)
                 lines = [l for l in content.splitlines() if re.search(safe_grep, l, re.IGNORECASE)]
-                return "\n".join(lines) if lines else f"No matches for: {params.grep}"
-            return content
+                return _redact_alert_data("\n".join(lines, bypass=params.bypass_redaction) if lines else f"No matches for: {params.grep}")
+            return _redact_alert_data(content, bypass=params.bypass_redaction)
     # Fallback to journalctl
     cmd = ["journalctl", "-n", str(params.lines), "--no-pager"]
     if params.grep:
@@ -2288,6 +2612,7 @@ class WebLogInput(BaseModel):
     log_type: str = Field(default="access", description="Log type: 'access' or 'error'")
     lines: int = Field(default=200, ge=1, le=MAX_LOG_LINES)
     grep: Optional[str] = Field(default=None, max_length=MAX_GREP_PATTERN_LENGTH, description="Optional filter pattern")
+    bypass_redaction: bool = Field(default=False, description="When true, skip PII/credential redaction for audit investigations")
 
 @mcp.tool(
     name="blueteam_read_web_log",
@@ -2328,8 +2653,8 @@ async def blueteam_read_web_log(params: WebLogInput) -> str:
     if params.grep:
         safe_grep = _sanitize_regex(params.grep)
         lines = [l for l in content.splitlines() if re.search(safe_grep, l, re.IGNORECASE)]
-        return "\n".join(lines) if lines else f"No matches for: {params.grep}"
-    return content
+        return _redact_alert_data("\n".join(lines, bypass=params.bypass_redaction) if lines else f"No matches for: {params.grep}")
+    return _redact_alert_data(content, bypass=params.bypass_redaction)
 
 class JournalInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
@@ -2337,6 +2662,7 @@ class JournalInput(BaseModel):
     since: Optional[str] = Field(default="1 hour ago", max_length=64, description="Time range, e.g. '2 hours ago', '2024-01-15 10:00'")
     lines: int = Field(default=200, ge=1, le=MAX_LOG_LINES)
     grep: Optional[str] = Field(default=None, max_length=MAX_GREP_PATTERN_LENGTH)
+    bypass_redaction: bool = Field(default=False, description="When true, skip PII/credential redaction for audit investigations")
 
 @mcp.tool(
     name="blueteam_journalctl",
@@ -2363,14 +2689,14 @@ async def blueteam_journalctl(params: JournalInput) -> str:
     if params.grep:
         cmd += ["--grep", params.grep]
     r = _run(cmd)
-    return r["stdout"] or r["stderr"]
+    return _redact_alert_data(r["stdout"] or r["stderr"], bypass=params.bypass_redaction)
 
 # NETWORK MONITORING
 @mcp.tool(
     name="blueteam_list_listening_ports",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
-async def blueteam_list_listening_ports() -> str:
+async def blueteam_list_listening_ports(bypass_redaction: bool = False) -> str:
     """List all TCP/UDP ports currently listening, with owning process.
     Equivalent to 'ss -tulpn'. Identifies unexpected services.
 
@@ -2381,14 +2707,14 @@ async def blueteam_list_listening_ports() -> str:
     r = _run(["ss", "-tulpn"])
     if r["returncode"] != 0:
         r = _run(["netstat", "-tulpn"])
-    return r["stdout"] or r["stderr"]
+    return _redact_alert_data(r["stdout"] or r["stderr"], bypass=bypass_redaction)
 
 
 @mcp.tool(
     name="blueteam_list_connections",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
-async def blueteam_list_connections() -> str:
+async def blueteam_list_connections(bypass_redaction: bool = False) -> str:
     """List all established TCP connections with remote IPs and local processes.
     Useful for spotting unexpected outbound connections (beaconing, exfil).
 
@@ -2399,7 +2725,7 @@ async def blueteam_list_connections() -> str:
     r = _run(["ss", "-tnp", "state", "established"])
     if r["returncode"] != 0:
         r = _run(["netstat", "-tnp"])
-    return r["stdout"] or r["stderr"]
+    return _redact_alert_data(r["stdout"] or r["stderr"], bypass=bypass_redaction)
 
 
 class CaptureInput(BaseModel):
@@ -5419,7 +5745,7 @@ async def blueteam_lookup_domain_virustotal(params: DomainInput) -> str:
     name="blueteam_fail2ban_status",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
-async def blueteam_fail2ban_status() -> str:
+async def blueteam_fail2ban_status(bypass_redaction: bool = False) -> str:
     """List all active fail2ban jails and their ban counts.
 
     Returns:
@@ -5429,12 +5755,13 @@ async def blueteam_fail2ban_status() -> str:
     if not shutil.which("fail2ban-client"):
         return _tool_not_found("fail2ban")
     r = _run(["fail2ban-client", "status"])
-    return r["stdout"] or r["stderr"]
+    return _redact_alert_data(r["stdout"] or r["stderr"], bypass=bypass_redaction)
 
 
 class JailInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     jail: str = Field(..., description="Jail name, e.g. 'sshd', 'nginx-http-auth'")
+    bypass_redaction: bool = Field(default=False, description="When true, skip PII/credential redaction for audit investigations")
 
 
 @mcp.tool(
@@ -5454,13 +5781,14 @@ async def blueteam_fail2ban_jail_status(params: JailInput) -> str:
     if not shutil.which("fail2ban-client"):
         return _tool_not_found("fail2ban")
     r = _run(["fail2ban-client", "status", params.jail])
-    return r["stdout"] or r["stderr"]
+    return _redact_alert_data(r["stdout"] or r["stderr"], bypass=params.bypass_redaction)
 
 
 class UnbanInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     jail: str = Field(..., max_length=64, description="Jail name")
     ip: str = Field(..., max_length=45, description="IP address to unban")
+    bypass_redaction: bool = Field(default=False, description="When true, skip PII/credential redaction for audit investigations")
 
     @field_validator("ip")
     @classmethod
@@ -5503,6 +5831,7 @@ class HashFileInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     path: str = Field(..., max_length=4096, description="Absolute path to file to hash (must be under /, /var, /etc, /home, /opt)")
     algorithm: str = Field(default="sha256", description="Hash algorithm: 'md5', 'sha1', 'sha256', 'sha512'")
+    bypass_redaction: bool = Field(default=False, description="When true, skip PII/credential redaction for audit investigations")
 
 
 @mcp.tool(
@@ -5553,7 +5882,7 @@ async def blueteam_hash_file(params: HashFileInput) -> str:
             "modified": datetime.fromtimestamp(p.stat().st_mtime).isoformat(),
         }, indent=2)
         _audit_log("blueteam_hash_file", {"path": params.path, "algorithm": algo}, result[:200])
-        return result
+        return _redact_alert_data(result, bypass=params.bypass_redaction)
     except PermissionError:
         return json.dumps({"error": f"Permission denied reading {params.path}"})
     except Exception as e:
@@ -5564,7 +5893,7 @@ async def blueteam_hash_file(params: HashFileInput) -> str:
     name="blueteam_find_suid_files",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
-async def blueteam_find_suid_files() -> str:
+async def blueteam_find_suid_files(bypass_redaction: bool = False) -> str:
     """Find all SUID/SGID binaries on the system. Unexpected SUID files
     can indicate privilege escalation backdoors.
 
@@ -5573,14 +5902,14 @@ async def blueteam_find_suid_files() -> str:
     """
     _audit_log("blueteam_find_suid_files", {})
     r = _run(["find", "/", "-type", "f", r"-perm", "/6000", "-ls"], timeout=60)
-    return r["stdout"] or r["stderr"]
+    return _redact_alert_data(r["stdout"] or r["stderr"], bypass=bypass_redaction)
 
 
 @mcp.tool(
     name="blueteam_find_world_writable",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
-async def blueteam_find_world_writable() -> str:
+async def blueteam_find_world_writable(bypass_redaction: bool = False) -> str:
     """Find world-writable files and directories (excluding /proc, /sys, /dev).
     World-writable files in unexpected places are common persistence mechanisms.
 
@@ -5598,12 +5927,13 @@ async def blueteam_find_world_writable() -> str:
         "-ls"
     ]
     r = _run(cmd, timeout=60)
-    return r["stdout"] or r["stderr"]
+    return _redact_alert_data(r["stdout"] or r["stderr"], bypass=bypass_redaction)
 
 
 class RootkitInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     tool: str = Field(default="rkhunter", description="Tool to use: 'rkhunter' or 'chkrootkit'")
+    bypass_redaction: bool = Field(default=False, description="When true, skip PII/credential redaction for audit investigations")
 
 
 @mcp.tool(
@@ -5632,7 +5962,7 @@ async def blueteam_rootkit_scan(params: RootkitInput) -> str:
     else:
         return json.dumps({"error": f"Unknown tool '{tool}'. Use 'rkhunter' or 'chkrootkit'"})
 
-    return r["stdout"] or r["stderr"]
+    return _redact_alert_data(r["stdout"] or r["stderr"], bypass=params.bypass_redaction)
 
 
 # SYSTEM HARDENING
@@ -5640,7 +5970,7 @@ async def blueteam_rootkit_scan(params: RootkitInput) -> str:
     name="blueteam_lynis_audit",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}
 )
-async def blueteam_lynis_audit() -> str:
+async def blueteam_lynis_audit(bypass_redaction: bool = False) -> str:
     """Run a Lynis system hardening audit. Checks hundreds of security controls
     and produces prioritized recommendations. Takes 1-2 minutes.
 
@@ -5651,14 +5981,14 @@ async def blueteam_lynis_audit() -> str:
     if not shutil.which("lynis"):
         return _tool_not_found("lynis")
     r = _run(["lynis", "audit", "system", "--quick", "--no-colors"], timeout=180)
-    return r["stdout"] or r["stderr"]
+    return _redact_alert_data(r["stdout"] or r["stderr"], bypass=bypass_redaction)
 
 
 @mcp.tool(
     name="blueteam_check_updates",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True}
 )
-async def blueteam_check_updates() -> str:
+async def blueteam_check_updates(bypass_redaction: bool = False) -> str:
     """Check for available security updates (Debian/Ubuntu: apt, RHEL: dnf/yum).
 
     Returns:
@@ -5667,13 +5997,13 @@ async def blueteam_check_updates() -> str:
     _audit_log("blueteam_check_updates", {})
     if shutil.which("apt"):
         r = _run(["apt", "list", "--upgradeable"], timeout=60)
-        return r["stdout"] or r["stderr"]
+        return _redact_alert_data(r["stdout"] or r["stderr"], bypass=bypass_redaction)
     elif shutil.which("dnf"):
         r = _run(["dnf", "check-update", "--security"], timeout=60)
-        return r["stdout"] or r["stderr"]
+        return _redact_alert_data(r["stdout"] or r["stderr"], bypass=bypass_redaction)
     elif shutil.which("yum"):
         r = _run(["yum", "check-update", "--security"], timeout=60)
-        return r["stdout"] or r["stderr"]
+        return _redact_alert_data(r["stdout"] or r["stderr"], bypass=bypass_redaction)
     return json.dumps({"error": "No supported package manager found (apt, dnf, yum)"})
 
 
@@ -5681,7 +6011,7 @@ async def blueteam_check_updates() -> str:
     name="blueteam_check_open_firewall",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
-async def blueteam_check_open_firewall() -> str:
+async def blueteam_check_open_firewall(bypass_redaction: bool = False) -> str:
     """Show current firewall rules (iptables/nftables/ufw). Identifies
     overly permissive rules or missing protections.
 
@@ -5692,13 +6022,13 @@ async def blueteam_check_open_firewall() -> str:
     if shutil.which("ufw"):
         r = _run(["ufw", "status", "verbose"])
         if r["returncode"] == 0:
-            return r["stdout"]
+            return _redact_alert_data(r["stdout"], bypass=bypass_redaction)
     if shutil.which("nft"):
         r = _run(["nft", "list", "ruleset"])
         if r["returncode"] == 0:
-            return r["stdout"]
+            return _redact_alert_data(r["stdout"], bypass=bypass_redaction)
     r = _run(["iptables", "-L", "-n", "-v"])
-    return r["stdout"] or r["stderr"]
+    return _redact_alert_data(r["stdout"] or r["stderr"], bypass=bypass_redaction)
 
 
 
@@ -5707,7 +6037,7 @@ async def blueteam_check_open_firewall() -> str:
     name="blueteam_who_is_logged_in",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
-async def blueteam_who_is_logged_in() -> str:
+async def blueteam_who_is_logged_in(bypass_redaction: bool = False) -> str:
     """Show currently logged-in users, their source IPs, and session times.
     Useful for detecting unauthorized active sessions.
 
@@ -5716,14 +6046,14 @@ async def blueteam_who_is_logged_in() -> str:
     """
     _audit_log("blueteam_who_is_logged_in", {})
     r = _run(["w", "-h"])
-    return r["stdout"] or r["stderr"]
+    return _redact_alert_data(r["stdout"] or r["stderr"], bypass=bypass_redaction)
 
 
 @mcp.tool(
     name="blueteam_last_logins",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
-async def blueteam_last_logins() -> str:
+async def blueteam_last_logins(bypass_redaction: bool = False) -> str:
     """Show recent login history from /var/log/wtmp. Includes successful
     and failed logins with source IP and timestamps.
 
@@ -5732,14 +6062,14 @@ async def blueteam_last_logins() -> str:
     """
     _audit_log("blueteam_last_logins", {})
     r = _run(["last", "-n", "50", "-a", "-i"])
-    return r["stdout"] or r["stderr"]
+    return _redact_alert_data(r["stdout"] or r["stderr"], bypass=bypass_redaction)
 
 
 @mcp.tool(
     name="blueteam_failed_logins",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
-async def blueteam_failed_logins() -> str:
+async def blueteam_failed_logins(bypass_redaction: bool = False) -> str:
     """Show all failed login attempts from /var/log/btmp (lastb).
     High counts from a single IP indicate brute force.
 
@@ -5752,15 +6082,15 @@ async def blueteam_failed_logins() -> str:
         # Try parsing auth.log directly
         r2 = _run(["grep", "-i", r"failed password\|authentication failure", "/var/log/auth.log"])
         lines = r2["stdout"].splitlines()
-        return "\n".join(lines[-100:]) if lines else "No failed logins found in auth.log"
-    return r["stdout"] or r["stderr"]
+        return _redact_alert_data("\n".join(lines[-100:], bypass=bypass_redaction) if lines else "No failed logins found in auth.log")
+    return _redact_alert_data(r["stdout"] or r["stderr"], bypass=bypass_redaction)
 
 
 @mcp.tool(
     name="blueteam_sudo_history",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
-async def blueteam_sudo_history() -> str:
+async def blueteam_sudo_history(bypass_redaction: bool = False) -> str:
     """Show recent sudo command usage from auth.log.
     Identifies privilege escalation abuse.
 
@@ -5770,14 +6100,14 @@ async def blueteam_sudo_history() -> str:
     _audit_log("blueteam_sudo_history", {})
     r = _run(["grep", "sudo:", "/var/log/auth.log"])
     lines = r["stdout"].splitlines()
-    return "\n".join(lines[-200:]) if lines else "No sudo activity found (or no auth.log)"
+    return _redact_alert_data("\n".join(lines[-200:], bypass=bypass_redaction) if lines else "No sudo activity found (or no auth.log)")
 
 
 @mcp.tool(
     name="blueteam_list_users",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
-async def blueteam_list_users() -> str:
+async def blueteam_list_users(bypass_redaction: bool = False) -> str:
     """List all local user accounts with UID, GID, home dir, and shell.
     Highlights users with UID 0 (root-level) and users with login shells.
 
@@ -5815,14 +6145,14 @@ async def blueteam_list_users() -> str:
 
     # Sort: UID 0 first, then regular users, then system accounts
     users.sort(key=lambda u: (not u["flags"]["uid_zero_root"], not u["flags"]["has_login_shell"], u["uid"]))
-    return json.dumps(users, indent=2)
+    return _redact_alert_data(json.dumps(users, indent=2, bypass=bypass_redaction))
 
 
 @mcp.tool(
     name="blueteam_check_ssh_authorized_keys",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
-async def blueteam_check_ssh_authorized_keys() -> str:
+async def blueteam_check_ssh_authorized_keys(bypass_redaction: bool = False) -> str:
     """List all SSH authorized_keys files across all user home directories.
     Unexpected keys indicate backdoors or persistence mechanisms.
 
@@ -5847,7 +6177,7 @@ async def blueteam_check_ssh_authorized_keys() -> str:
         except PermissionError:
             result["root"] = ["<permission denied>"]
 
-    return json.dumps(result, indent=2) if result else json.dumps({"result": "No authorized_keys files found"})
+    return _redact_alert_data(json.dumps(result, indent=2, bypass=bypass_redaction) if result else json.dumps({"result": "No authorized_keys files found"}))
 
 
 
@@ -5856,7 +6186,7 @@ async def blueteam_check_ssh_authorized_keys() -> str:
     name="blueteam_list_processes",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
-async def blueteam_list_processes() -> str:
+async def blueteam_list_processes(bypass_redaction: bool = False) -> str:
     """List all running processes with CPU, memory, PID, and command line.
     Useful for spotting unexpected processes or cryptominers.
 
@@ -5865,14 +6195,14 @@ async def blueteam_list_processes() -> str:
     """
     _audit_log("blueteam_list_processes", {})
     r = _run(["ps", "auxf"])
-    return r["stdout"] or r["stderr"]
+    return _redact_alert_data(r["stdout"] or r["stderr"], bypass=bypass_redaction)
 
 
 @mcp.tool(
     name="blueteam_list_cron_jobs",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
-async def blueteam_list_cron_jobs() -> str:
+async def blueteam_list_cron_jobs(bypass_redaction: bool = False) -> str:
     """List all system and user cron jobs. Attackers often add cron jobs
     for persistence. Check for unexpected entries.
 
@@ -5902,7 +6232,7 @@ async def blueteam_list_cron_jobs() -> str:
             if r2["returncode"] == 0:
                 output.append(f"=== crontab for {user} ===\n{r2['stdout']}")
 
-    return "\n\n".join(output) if output else "No cron jobs found (or insufficient permissions)"
+    return _redact_alert_data("\n\n".join(output, bypass=bypass_redaction) if output else "No cron jobs found (or insufficient permissions)")
 
 
 
@@ -5911,7 +6241,7 @@ async def blueteam_list_cron_jobs() -> str:
     name="blueteam_system_health",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
-async def blueteam_system_health() -> str:
+async def blueteam_system_health(bypass_redaction: bool = False) -> str:
     """Get an overview of system health: uptime, disk, memory, CPU load.
     Useful baseline before deeper investigation.
 
@@ -5926,7 +6256,7 @@ async def blueteam_system_health() -> str:
     hostname = _run(["hostname", "-f"])
     kernel = _run(["uname", "-r"])
 
-    return json.dumps({
+    return _redact_alert_data(json.dumps({
         "hostname": hostname["stdout"].strip(),
         "kernel": kernel["stdout"].strip(),
         "uptime": uptime["stdout"].strip(),
@@ -5934,7 +6264,7 @@ async def blueteam_system_health() -> str:
         "memory": mem["stdout"],
         "disk": disk["stdout"],
         "timestamp": datetime.utcnow().isoformat() + "Z",
-    }, indent=2)
+    }, indent=2), bypass=bypass_redaction)
 
 
 # Shared aggregation helper — posts raw OpenSearch bodies with circuit breaker
@@ -7015,6 +7345,7 @@ def _validate_configuration() -> None:
         ("ABUSEIPDB_API_KEY", "https://docs.abuseipdb.com/"),
         ("VIRUSTOTAL_API_KEY", "https://docs.virustotal.com/reference/overview"),
         ("NETRA_API_KEY", "https://netra.tangerangkota.go.id/docs"),
+        ("ARGUS_API_KEY", "https://argus.tangerangkota.go.id/docs"),
     ]
     for env_var, doc_url in _check_key:
         if not os.environ.get(env_var, "").strip():
