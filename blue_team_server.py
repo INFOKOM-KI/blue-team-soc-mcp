@@ -55,6 +55,19 @@ from typing import Any, Dict, List, Optional
 import httpx
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field, AliasChoices, field_validator, model_validator
+from pydantic import AfterValidator
+from typing import Annotated
+
+# 3-Sum Correlation Engine
+from correlation.three_sum_engine import (
+    evaluate_engine_a,
+    evaluate_engine_b,
+    format_evaluation_dict,
+    normalize_srcip_to_cidr,
+    DEFAULT_THRESHOLD_SCORE,
+    DEFAULT_Z_THRESHOLD,
+    DEFAULT_WINDOW_MINUTES,
+)
 
 # Logging - Must go to stderr. stdout is used by the MCP stdio protocol.
 logging.basicConfig(
@@ -857,7 +870,7 @@ async def _wazuh_indexer_search(
                 "minimum_should_match": 1,
             }
         })
-    # Multi-IP search: OR-of-AND within each IP, AND between different IPs.
+    # Multi IP search: OR-of-AND within each IP, AND between different IPs.
     # Each IP searched across data.srcip, data.srcip2, srcip, and full_log.
     if srcips:
         # Deduplicate and strip
@@ -3180,6 +3193,11 @@ def _validate_rule_groups_field(v: Optional[str]) -> Optional[str]:
                 raise ValueError(f"Invalid rule group name: '{g}'")
     return v
 
+# Annotated types for reusable field validation (replaces per-model validators)
+ValidKeyword = Annotated[Optional[str], AfterValidator(_validate_keyword_field)]
+ValidAgentName = Annotated[Optional[str], AfterValidator(_validate_agent_name_field)]
+ValidRuleGroups = Annotated[Optional[str], AfterValidator(_validate_rule_groups_field)]
+
 
 class WazuhIndexerSearchInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid", populate_by_name=True)
@@ -3220,7 +3238,7 @@ class WazuhIndexerSearchInput(BaseModel):
                 del data[alias]
         return data
 
-    agent_name: Optional[str] = Field(
+    agent_name: ValidAgentName = Field(
         default=None,
         validation_alias=AliasChoices("agent", "host", "hostname"),
         max_length=64,
@@ -3257,7 +3275,7 @@ class WazuhIndexerSearchInput(BaseModel):
         description="End of time window — ISO 8601 or relative expression. "
                     "Defaults to now if omitted. Can be used alone (no since required).",
     )
-    keyword: Optional[str] = Field(
+    keyword: ValidKeyword = Field(
         default=None,
         validation_alias=AliasChoices("query", "search"),
         max_length=1024,
@@ -3371,10 +3389,6 @@ class WazuhIndexerSearchInput(BaseModel):
             return cleaned if cleaned else None
         return v
 
-    @field_validator("keyword")
-    @classmethod
-    def validate_keyword(cls, v: Optional[str]) -> Optional[str]:
-        return _validate_keyword_field(v)
 
     @field_validator("srcips")
     @classmethod
@@ -3437,10 +3451,6 @@ class WazuhIndexerSearchInput(BaseModel):
             return cleaned if cleaned else None
         return v
 
-    @field_validator("agent_name")
-    @classmethod
-    def validate_agent_name(cls, v: Optional[str]) -> Optional[str]:
-        return _validate_agent_name_field(v)
 
     @field_validator("srcip")
     @classmethod
@@ -3873,7 +3883,7 @@ def _extract_emails_from_doc(doc: dict) -> set[str]:
 class WazuhEmailLookupInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
-    agent_name: Optional[str] = Field(
+    agent_name: ValidAgentName = Field(
         default=None,
         max_length=64,
         description="Optional agent name filter (e.g. 'mailbox-new'). Omit to search all agents.",
@@ -3895,7 +3905,7 @@ class WazuhEmailLookupInput(BaseModel):
         ge=1,
         le=500,
     )
-    rule_groups: Optional[str] = Field(
+    rule_groups: ValidRuleGroups = Field(
         default=None,
         max_length=1024,
         description="Comma-separated rule groups to filter by "
@@ -3913,27 +3923,15 @@ class WazuhEmailLookupInput(BaseModel):
         default=ResponseFormat.MARKDOWN,
         description="'markdown' for human-readable report, 'json' for structured data.",
     )
-    keyword: Optional[str] = Field(
+    keyword: ValidKeyword = Field(
         default=None,
         max_length=1024,
         description="Free-text keyword search to further narrow email results. "
                     "Same syntax as blueteam_wazuh_indexer_search.",
     )
 
-    @field_validator("agent_name")
-    @classmethod
-    def validate_agent_name(cls, v: Optional[str]) -> Optional[str]:
-        return _validate_agent_name_field(v)
 
-    @field_validator("rule_groups")
-    @classmethod
-    def validate_rule_groups(cls, v: Optional[str]) -> Optional[str]:
-        return _validate_rule_groups_field(v)
 
-    @field_validator("keyword")
-    @classmethod
-    def validate_keyword(cls, v: Optional[str]) -> Optional[str]:
-        return _validate_keyword_field(v)
 
 
 @mcp.tool(
@@ -4150,7 +4148,7 @@ class WazuhDomainLookupInput(BaseModel):
         description="Domain name to search for in Wazuh alerts "
                     "(e.g. 'tangerangkota.go.id', 'gmail.com').",
     )
-    agent_name: Optional[str] = Field(
+    agent_name: ValidAgentName = Field(
         default=None,
         max_length=64,
         description="Optional agent name filter.",
@@ -4185,7 +4183,7 @@ class WazuhDomainLookupInput(BaseModel):
         default=ResponseFormat.MARKDOWN,
         description="'markdown' for human-readable summary, 'json' for structured data.",
     )
-    keyword: Optional[str] = Field(
+    keyword: ValidKeyword = Field(
         default=None,
         max_length=1024,
         description="Free-text keyword search to further narrow domain results. "
@@ -4220,15 +4218,7 @@ class WazuhDomainLookupInput(BaseModel):
             )
         return v
 
-    @field_validator("agent_name")
-    @classmethod
-    def validate_agent_name(cls, v: Optional[str]) -> Optional[str]:
-        return _validate_agent_name_field(v)
 
-    @field_validator("keyword")
-    @classmethod
-    def validate_keyword(cls, v: Optional[str]) -> Optional[str]:
-        return _validate_keyword_field(v)
 
 
 async def _wazuh_domain_lookup_full_scan(
@@ -4582,7 +4572,7 @@ class WazuhCompromisedEmailsAnalysisInput(BaseModel):
         description="List of email addresses to analyze "
                     "(e.g. from wazuh_email_lookup results). Max 50.",
     )
-    agent_name: Optional[str] = Field(
+    agent_name: ValidAgentName = Field(
         default=None,
         max_length=64,
         description="Optional agent name filter.",
@@ -4608,7 +4598,7 @@ class WazuhCompromisedEmailsAnalysisInput(BaseModel):
         description="If true, query Netra for each attacker IP (adds latency). "
                     "Rate limiting applies. Only top 10 IPs are enriched.",
     )
-    keyword: Optional[str] = Field(
+    keyword: ValidKeyword = Field(
         default=None,
         max_length=1024,
         description="Free-text keyword search to further narrow results. "
@@ -4636,15 +4626,7 @@ class WazuhCompromisedEmailsAnalysisInput(BaseModel):
             raise ValueError("At least one valid email address is required")
         return cleaned
 
-    @field_validator("agent_name")
-    @classmethod
-    def validate_agent_name(cls, v: Optional[str]) -> Optional[str]:
-        return _validate_agent_name_field(v)
 
-    @field_validator("keyword")
-    @classmethod
-    def validate_keyword(cls, v: Optional[str]) -> Optional[str]:
-        return _validate_keyword_field(v)
 
 
 @mcp.tool(
@@ -4977,12 +4959,12 @@ class WazuhAlertTimelineInput(BaseModel):
         description="Bucket size: '1m', '5m', '15m', '1h', '6h', '1d', or 'auto'. "
                     "'auto' picks based on window: ≤1h→1m, ≤24h→15m, ≤7d→1h, ≤30d→6h, ≤365d→1d.",
     )
-    agent_name: Optional[str] = Field(
+    agent_name: ValidAgentName = Field(
         default=None,
         max_length=64,
         description="Optional agent name filter.",
     )
-    rule_groups: Optional[str] = Field(
+    rule_groups: ValidRuleGroups = Field(
         default=None,
         max_length=1024,
         description="Comma-separated rule groups to filter by (e.g. 'brute_force,authentication_failed').",
@@ -4993,7 +4975,7 @@ class WazuhAlertTimelineInput(BaseModel):
         le=16,
         description="Minimum rule level (e.g., 8 for medium+ severity).",
     )
-    keyword: Optional[str] = Field(
+    keyword: ValidKeyword = Field(
         default=None,
         max_length=1024,
         description="Free-text keyword search to narrow the timeline. Same syntax as "
@@ -5005,15 +4987,7 @@ class WazuhAlertTimelineInput(BaseModel):
         description="'markdown' for human-readable timeline, 'json' for structured bucket data.",
     )
 
-    @field_validator("agent_name")
-    @classmethod
-    def validate_agent_name(cls, v: Optional[str]) -> Optional[str]:
-        return _validate_agent_name_field(v)
 
-    @field_validator("keyword")
-    @classmethod
-    def validate_keyword(cls, v: Optional[str]) -> Optional[str]:
-        return _validate_keyword_field(v)
 
     @field_validator("bucket")
     @classmethod
@@ -5025,10 +4999,6 @@ class WazuhAlertTimelineInput(BaseModel):
             raise ValueError("bucket: use 'auto', '1m', '5m', '15m', '1h', '6h', or '1d'")
         return v
 
-    @field_validator("rule_groups")
-    @classmethod
-    def validate_rule_groups(cls, v: Optional[str]) -> Optional[str]:
-        return _validate_rule_groups_field(v)
 
 
 @mcp.tool(
@@ -5233,12 +5203,12 @@ class WazuhAttackVelocityInput(BaseModel):
         description="Window size for comparison — relative expression: '15m', '1h', '6h', '24h'. "
                     "'1h' compares the last hour against the hour before that.",
     )
-    agent_name: Optional[str] = Field(
+    agent_name: ValidAgentName = Field(
         default=None,
         max_length=64,
         description="Optional agent name filter.",
     )
-    rule_groups: Optional[str] = Field(
+    rule_groups: ValidRuleGroups = Field(
         default=None,
         max_length=1024,
         description="Comma-separated rule groups to filter by.",
@@ -5248,7 +5218,7 @@ class WazuhAttackVelocityInput(BaseModel):
         max_length=10,
         description="Bucket size within each window: '1m', '5m', '15m', '1h', or 'auto'.",
     )
-    keyword: Optional[str] = Field(
+    keyword: ValidKeyword = Field(
         default=None,
         max_length=1024,
         description="Free-text keyword search to narrow the analysis. Same syntax as "
@@ -5259,10 +5229,6 @@ class WazuhAttackVelocityInput(BaseModel):
         description="'markdown' for human-readable, 'json' for structured.",
     )
 
-    @field_validator("agent_name")
-    @classmethod
-    def validate_agent_name(cls, v: Optional[str]) -> Optional[str]:
-        return _validate_agent_name_field(v)
 
     @field_validator("window")
     @classmethod
@@ -5273,15 +5239,7 @@ class WazuhAttackVelocityInput(BaseModel):
             )
         return v.strip()
 
-    @field_validator("rule_groups")
-    @classmethod
-    def validate_rule_groups(cls, v: Optional[str]) -> Optional[str]:
-        return _validate_rule_groups_field(v)
 
-    @field_validator("keyword")
-    @classmethod
-    def validate_keyword(cls, v: Optional[str]) -> Optional[str]:
-        return _validate_keyword_field(v)
 
 
 @mcp.tool(
@@ -5374,15 +5332,16 @@ async def wazuh_attack_velocity(params: WazuhAttackVelocityInput = WazuhAttackVe
     if isinstance(previous_data.get("error"), str):
         return json.dumps(previous_data, indent=2)
 
-    def extract_buckets(data: dict) -> list[dict]:
-        return (
-            data.get("aggregations", {})
-            .get("alerts_over_time", {})
-            .get("buckets", [])
-        )
-
-    current_buckets = extract_buckets(current_data)
-    previous_buckets = extract_buckets(previous_data)
+    current_buckets = (
+        current_data.get("aggregations", {})
+        .get("alerts_over_time", {})
+        .get("buckets", [])
+    )
+    previous_buckets = (
+        previous_data.get("aggregations", {})
+        .get("alerts_over_time", {})
+        .get("buckets", [])
+    )
 
     total_current = sum(b.get("doc_count", 0) for b in current_buckets)
     total_previous = sum(b.get("doc_count", 0) for b in previous_buckets)
@@ -6267,7 +6226,7 @@ async def blueteam_system_health(bypass_redaction: bool = False) -> str:
     }, indent=2), bypass=bypass_redaction)
 
 
-# Shared aggregation helper — posts raw OpenSearch bodies with circuit breaker
+# Shared aggregation helper - posts raw OpenSearch bodies with circuit breaker
 async def _wazuh_indexer_post(body: dict, index_pattern: Optional[str] = None) -> Dict:
     """Post a raw OpenSearch query body to the Wazuh Indexer.
 
@@ -6325,12 +6284,12 @@ class AggregateAnalysisInput(BaseModel):
         max_length=30,
         description="End of time window. Defaults to now.",
     )
-    agent_name: Optional[str] = Field(
+    agent_name: ValidAgentName = Field(
         default=None,
         max_length=64,
         description="Filter to a specific Wazuh agent.",
     )
-    rule_groups: Optional[str] = Field(
+    rule_groups: ValidRuleGroups = Field(
         default=None,
         description="Comma-separated rule group names (e.g. 'authentication_failure,bruteforce').",
     )
@@ -6340,7 +6299,7 @@ class AggregateAnalysisInput(BaseModel):
         le=16,
         description="Minimum rule level (e.g. 8 for medium+ severity).",
     )
-    keyword: Optional[str] = Field(
+    keyword: ValidKeyword = Field(
         default=None,
         max_length=1024,
         description="Free-text keyword filter. Supports +term, -term, OR, *wildcard*.",
@@ -6364,20 +6323,8 @@ class AggregateAnalysisInput(BaseModel):
             raise ValueError("mode must be one of: topology, anomaly, correlation, trend, summary")
         return v
 
-    @field_validator("agent_name")
-    @classmethod
-    def validate_agent_name(cls, v: Optional[str]) -> Optional[str]:
-        return _validate_agent_name_field(v)
 
-    @field_validator("keyword")
-    @classmethod
-    def validate_keyword(cls, v: Optional[str]) -> Optional[str]:
-        return _validate_keyword_field(v)
 
-    @field_validator("rule_groups")
-    @classmethod
-    def validate_rule_groups(cls, v: Optional[str]) -> Optional[str]:
-        return _validate_rule_groups_field(v)
 
 
 def _build_filter_clauses(
@@ -6711,20 +6658,6 @@ def _format_aggregate_markdown(
     return "\n".join(lines)
 
 
-def _format_aggregate_json(
-    params: AggregateAnalysisInput,
-    results_by_mode: dict,
-    since_str: str,
-    until_str: str,
-) -> str:
-    """Render aggregate analysis results as JSON."""
-    return _truncate_if_needed(json.dumps({
-        "window": {"since": since_str, "until": until_str},
-        "mode": params.mode,
-        "results": results_by_mode,
-    }, indent=2, default=str))
-
-
 @mcp.tool(
     name="wazuh_alert_aggregate_analysis",
     annotations={
@@ -6832,7 +6765,11 @@ async def wazuh_alert_aggregate_analysis(params: AggregateAnalysisInput) -> str:
             results_by_mode[mode_name] = result
 
     if params.response_format == ResponseFormat.JSON:
-        return _format_aggregate_json(params, results_by_mode, since_str, until_str)
+        return _truncate_if_needed(json.dumps({
+            "window": {"since": since_str, "until": until_str},
+            "mode": params.mode,
+            "results": results_by_mode,
+        }, indent=2, default=str))
     return _format_aggregate_markdown(params, results_by_mode, since_str, until_str, errors)
 
 
@@ -6993,7 +6930,7 @@ class FocusedCrawlInput(BaseModel):
         max_length=32,
         description="Specific rule ID to drill into (e.g. '5763' for authentication failure).",
     )
-    agent_name: Optional[str] = Field(
+    agent_name: ValidAgentName = Field(
         default=None,
         max_length=64,
         description="Filter to a specific Wazuh agent.",
@@ -7056,10 +6993,6 @@ class FocusedCrawlInput(BaseModel):
                 raise ValueError("rule_id must be numeric (e.g. '5763')")
         return v
 
-    @field_validator("agent_name")
-    @classmethod
-    def validate_agent_name(cls, v: Optional[str]) -> Optional[str]:
-        return _validate_agent_name_field(v)
 
     @field_validator("fields")
     @classmethod
@@ -7264,7 +7197,384 @@ async def wazuh_alert_focused_crawl(params: FocusedCrawlInput = FocusedCrawlInpu
     return _truncate_if_needed("\n".join(lines))
 
 
-# Case-insensitive tool lookup — transparently handles LLM casing variations.
+# 3 Sum Threat Detection Correlation Tool
+class ThreeSumCorrelationInput(BaseModel):
+    """Evaluate 3-Sum threat detection across Wazuh alert categories.
+
+    Runs two correlation engines:
+
+    **Engine A — Multi-IoC Risk Thresholding**: Finds external IPs (srcip)
+    appearing in alerts from 3 distinct categories within the time window,
+    sums per-category risk scores, and flags combinations meeting or exceeding
+    ``threshold_score`` (default 10, minimum 3+4+4=11 for default category scores).
+
+    **Engine B — 3-Source Volumetric Z-Score**: Fetches per-minute alert counts
+    from the same 3 categories, computes rolling mean and standard deviation
+    over the sliding window, and triggers when all 3 sources simultaneously
+    cross ``z_score_threshold`` in the same 1-minute bucket.
+
+    Default category mappings reflect TangerangKota-CSIRT's infrastructure:
+    recon (web/WAF), access_anomaly (auth/mail), c2_exfil (firewall/IDS).
+
+    Requires: WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD env vars.
+    Rate limits: Queries 4 Indexer aggregations per invocation (1 for Engine A
+    with 3 grouped terms, 3 for Engine B's date_histograms).
+
+    **Worked Examples**
+
+    1. *Default scan over last 30 minutes*:
+       ``three_sum_correlation()`` — returns any 3-sum triggers
+
+    2. *Custom threshold + 1-hour window*:
+       ``three_sum_correlation(time_window_minutes=60, threshold_score=12, z_score_threshold=3.0)``
+
+    3. *Suppress known vendor scanner*:
+       ``three_sum_correlation(exclude_srcips=["203.0.113.42"])``
+
+    4. *Opt-in CIDR normalization for distributed attacks*:
+       ``three_sum_correlation(cidr_normalize=true)`` — groups srcips to /24
+       before evaluating intersection (catches attackers rotating last octet)
+
+    5. *No events in window*:
+       Returns ``{"engine_a": {"stats": {"intersection_count": 0}}, ...}``
+       with summary "Engine-A: no threshold crossings".
+    """
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    engine_a_enabled: bool = Field(
+        default=True,
+        description="Enable Engine A (Multi-IoC Risk Thresholding).",
+    )
+    engine_b_enabled: bool = Field(
+        default=True,
+        description="Enable Engine B (Volumetric Z-Score Anomaly Detection).",
+    )
+    time_window_minutes: int = Field(
+        default=DEFAULT_WINDOW_MINUTES,
+        ge=5,
+        le=1440,
+        description="Sliding time window in minutes (5–1440). Default: 30.",
+    )
+    threshold_score: int = Field(
+        default=DEFAULT_THRESHOLD_SCORE,
+        ge=6,
+        le=30,
+        description="Minimum combined risk score to trigger Engine A. Default: 10.",
+    )
+    z_score_threshold: float = Field(
+        default=DEFAULT_Z_THRESHOLD,
+        ge=1.0,
+        le=5.0,
+        description="Minimum Z-score to flag a bucket as anomalous in Engine B. Default: 2.5.",
+    )
+    category_a_groups: list[str] = Field(
+        default=["web", "attack", "webshell_scan"],
+        description="Wazuh rule.groups for Category A (Recon/Probe).",
+    )
+    category_b_groups: list[str] = Field(
+        default=["authentication_failures", "bruteforce", "zimbra"],
+        description="Wazuh rule.groups for Category B (Access Anomaly).",
+    )
+    category_c_groups: list[str] = Field(
+        default=["firewall", "pfsense", "ids", "suricata"],
+        description="Wazuh rule.groups for Category C (C2/Exfil).",
+    )
+    category_a_label: str = Field(
+        default="recon",
+        description="Human-readable label for Category A.",
+    )
+    category_b_label: str = Field(
+        default="access_anomaly",
+        description="Human-readable label for Category B.",
+    )
+    category_c_label: str = Field(
+        default="c2_exfil",
+        description="Human-readable label for Category C.",
+    )
+    category_a_score: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Risk score per srcip in Category A. Default: 3.",
+    )
+    category_b_score: int = Field(
+        default=4,
+        ge=1,
+        le=10,
+        description="Risk score per srcip in Category B. Default: 4.",
+    )
+    category_c_score: int = Field(
+        default=4,
+        ge=1,
+        le=10,
+        description="Risk score per srcip in Category C. Default: 4.",
+    )
+    cidr_normalize: bool = Field(
+        default=False,
+        description="Group srcips by /24 (IPv4) or /64 (IPv6) before intersection. Opt-in — disabled by default to avoid false matches from IP rotation.",
+    )
+    exclude_srcips: list[str] = Field(
+        default=[],
+        description="Srcips to suppress before scoring (e.g., known vendor scanners). Evaluated early; matching IPs are dropped from all categories.",
+    )
+
+
+@mcp.tool(
+    name="three_sum_correlation",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def three_sum_correlation(params: ThreeSumCorrelationInput) -> str:
+    """Evaluate 3-Sum APT threat detection across 3 Wazuh alert categories.
+
+    Runs Engine A (Multi-IoC Risk Thresholding via terms aggregation on
+    data.srcip.keyword) and Engine B (3-source volumetric Z-score via
+    date_histogram aggregation) concurrently. Both engines target the
+    Wazuh Indexer API (read-only ``_search`` endpoint with ``size: 0``).
+
+    Returns a JSON object with per-engine triggers, statistics, and a
+    human-readable summary. All Indexer queries are aggregated — no
+    individual alert documents are fetched, keeping memory bounded.
+
+    **Required Permissions**: Wazuh Indexer user with ``read`` access to
+    ``wazuh-alerts-*`` indices.
+    """
+    if not WAZUH_INDEXER_URL or not WAZUH_INDEXER_PASSWORD:
+        return json.dumps({
+            "error": "WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD must be set.",
+            "detail": "Set these environment variables and restart to use the 3-Sum correlation engine.",
+        }, indent=2)
+
+    start_time = time.monotonic()
+
+    # Parse time window
+    since_dt = (datetime.utcnow() - timedelta(minutes=params.time_window_minutes))
+    until_dt = datetime.utcnow()
+    since_iso = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    until_iso = until_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    logger.info(
+        "[3SUM-EVAL] Starting evaluation window=%s -> %s (engineA=%s engineB=%s threshold=%d z=%.1f)",
+        since_iso, until_iso,
+        params.engine_a_enabled, params.engine_b_enabled,
+        params.threshold_score, params.z_score_threshold,
+    )
+
+    try:
+        engine_a_results = None
+        engine_b_result = None
+
+        # Engine A: terms aggregation per category (3 parallel queries)
+        if params.engine_a_enabled:
+            label_to_groups = [
+                (params.category_a_label, params.category_a_groups),
+                (params.category_b_label, params.category_b_groups),
+                (params.category_c_label, params.category_c_groups),
+            ]
+
+            async def _fetch_srcip_terms(label: str, groups: list[str]) -> tuple[str, list[tuple[str, int]]]:
+                """Fetch distinct srcips and their max rule.level per category via terms agg."""
+                body = {
+                    "size": 0,
+                    "query": {
+                        "bool": {
+                            "filter": [
+                                {
+                                    "range": {
+                                        "@timestamp": {
+                                            "gte": since_iso,
+                                            "lt": until_iso,
+                                            "format": "strict_date_optional_time",
+                                        },
+                                    }
+                                },
+                                {"terms": {"rule.groups": groups}},
+                            ]
+                        }
+                    },
+                    "aggs": {
+                        "unique_srcips": {
+                            "terms": {
+                                "field": "data.srcip.keyword",
+                                "size": 10000,
+                                "min_doc_count": 2,
+                            },
+                            "aggs": {
+                                "max_level": {
+                                    "max": {"field": "rule.level"},
+                                },
+                            },
+                        }
+                    },
+                }
+                raw = await _wazuh_indexer_post(body, _WAZUH_INDEX_PATTERNS["alerts"])
+                if "error" in raw:
+                    logger.warning("[3SUM-EVAL] Engine-A query failed for %s: %s", label, raw["error"])
+                    return (label, [])
+
+                buckets = raw.get("aggregations", {}).get("unique_srcips", {}).get("buckets", [])
+                return (label, [(b["key"], int(b.get("max_level", {}).get("value", 1))) for b in buckets])
+
+            label_a, label_b, label_c = (
+                params.category_a_label,
+                params.category_b_label,
+                params.category_c_label,
+            )
+            groups_a, groups_b, groups_c = (
+                params.category_a_groups,
+                params.category_b_groups,
+                params.category_c_groups,
+            )
+
+            fetched = await asyncio.gather(
+                _fetch_srcip_terms(label_a, groups_a),
+                _fetch_srcip_terms(label_b, groups_b),
+                _fetch_srcip_terms(label_c, groups_c),
+            )
+
+            # Map label -> srcip list; apply CIDR normalization if requested
+            srcips_by_label: dict[str, list[tuple[str, int]]] = {}
+            for label_ret, entries in fetched:
+                if params.cidr_normalize and entries:
+                    ips = [e[0] for e in entries]
+                    cidr_map = normalize_srcip_to_cidr(ips)
+                    cidr_scores: dict[str, int] = {}
+                    for srcip, score in entries:
+                        cidr = cidr_map.get(srcip, srcip)
+                        cidr_scores[cidr] = cidr_scores.get(cidr, 0) + score
+                    srcips_by_label[label_ret] = [(cidr, score) for cidr, score in cidr_scores.items()]
+                else:
+                    srcips_by_label[label_ret] = entries
+
+            triggers_a, stats_a = evaluate_engine_a(
+                srcips_by_label.get(label_a, []),
+                srcips_by_label.get(label_b, []),
+                srcips_by_label.get(label_c, []),
+                category_a_label=label_a,
+                category_b_label=label_b,
+                category_c_label=label_c,
+                threshold_score=params.threshold_score,
+                exclude_srcips=params.exclude_srcips if params.exclude_srcips else None,
+            )
+
+            engine_a_results = (triggers_a, stats_a)
+            logger.info("[3SUM-EVAL] Engine-A evaluation complete — %d triggers", len(triggers_a))
+
+
+        # Engine B: date_histogram per source (3 parallel queries)
+        if params.engine_b_enabled:
+            async def _fetch_bucket_counts(label: str, groups: list[str]) -> tuple[str, list[dict[str, Any]]]:
+                """Fetch per-minute alert counts for a single source."""
+                body = {
+                    "size": 0,
+                    "query": {
+                        "bool": {
+                            "filter": [
+                                {
+                                    "range": {
+                                        "@timestamp": {
+                                            "gte": since_iso,
+                                            "lt": until_iso,
+                                            "format": "strict_date_optional_time",
+                                        },
+                                    }
+                                },
+                                {"terms": {"rule.groups": groups}},
+                            ]
+                        }
+                    },
+                    "aggs": {
+                        "alerts_over_time": {
+                            "date_histogram": {
+                                "field": "@timestamp",
+                                "fixed_interval": "1m",
+                                "min_doc_count": 0,
+                                "extended_bounds": {"min": since_iso, "max": until_iso},
+                            }
+                        }
+                    },
+                }
+                raw = await _wazuh_indexer_post(body, _WAZUH_INDEX_PATTERNS["alerts"])
+                if "error" in raw:
+                    logger.warning("[3SUM-EVAL] Engine-B query failed for %s: %s", label, raw["error"])
+                    return (label, [])
+
+                buckets = (
+                    raw.get("aggregations", {})
+                    .get("alerts_over_time", {})
+                    .get("buckets", [])
+                )
+                return (label, buckets)
+
+            # All 3 source labels are the same categories
+            label_a, label_b, label_c = (
+                params.category_a_label,
+                params.category_b_label,
+                params.category_c_label,
+            )
+            groups_a, groups_b, groups_c = (
+                params.category_a_groups,
+                params.category_b_groups,
+                params.category_c_groups,
+            )
+
+            fetched_b = await asyncio.gather(
+                _fetch_bucket_counts(label_a, groups_a),
+                _fetch_bucket_counts(label_b, groups_b),
+                _fetch_bucket_counts(label_c, groups_c),
+            )
+
+            buckets_by_label: dict[str, list[dict[str, Any]]] = {}
+            for label_ret, buckets in fetched_b:
+                buckets_by_label[label_ret] = buckets
+
+            engine_b_result = evaluate_engine_b(
+                buckets_by_label.get(label_a, []),
+                buckets_by_label.get(label_b, []),
+                buckets_by_label.get(label_c, []),
+                source_1_label=label_a,
+                source_2_label=label_b,
+                source_3_label=label_c,
+                z_score_threshold=params.z_score_threshold,
+            )
+            logger.info(
+                "[3SUM-EVAL] Engine-B evaluation complete — %d simultaneous triggers",
+                len(engine_b_result.simultaneous_triggers),
+            )
+
+        # Build unified result
+        elapsed_ms = (time.monotonic() - start_time) * 1000
+
+        result = format_evaluation_dict(
+            window_since=since_iso,
+            window_until=until_iso,
+            engine_a_results=engine_a_results,
+            engine_b_result=engine_b_result,
+            evaluation_time_ms=elapsed_ms,
+        )
+
+        logger.info("[3SUM-EVAL] Evaluation finished — %d ms", round(elapsed_ms))
+        return json.dumps(result, indent=2)
+
+    except CircuitBreakerOpenError:
+        return json.dumps({
+            "error": "Wazuh Indexer is temporarily unavailable (circuit breaker open)",
+            "detail": "The Indexer has been unresponsive. Retry after the circuit breaker recovery timeout (~60s).",
+        }, indent=2)
+    except Exception as e:
+        logger.exception("[3SUM-EVAL] Unexpected error during evaluation")
+        return json.dumps({
+            "error": f"Correlation evaluation failed: {type(e).__name__}",
+            "detail": str(e),
+        }, indent=2)
+
+
+# Case insensitive tool lookup transparently handles LLM casing variations.
 # When an LLM generates a tool call like "CrowdSec_IP_Reputation" instead of
 # "crowdsec_ip_reputation", this layer normalizes the name before the FastMCP
 # dispatcher sees it — no user configuration required. The fast path (exact
@@ -7333,7 +7643,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 def _validate_configuration() -> None:
     """Validate required secrets at startup and warn on missing optional credentials.
-
     Per CLAUDE.md Hard Rule 8 and AGENTS.md §1.4 checklist item 2: fail fast
     on missing configuration. All API keys are optional (the server starts
     without them and tools that need them return actionable errors at call
