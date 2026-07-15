@@ -497,6 +497,18 @@ MITRE_TACTIC_TO_CATEGORY: Dict[str, str] = {
     "Collection":              "C",
 }
 
+# Source IP field paths - Wazuh decoders may emit the attacker IP under different data.* fields
+# depending on the log source. Engine A queries all known paths via multi_terms aggregation
+# to avoid silent false negatives from decoder field-path fragmentation.
+_SRCIP_FIELD_PATHS: list[str] = [
+    "data.srcip.keyword",
+    "data.src_ip.keyword",
+    "data.client_ip.keyword",
+    "data.remote_ip.keyword",
+    "data.source_ip.keyword",
+    "data.ip.keyword",
+]
+
 
 def _classify_alert_mitre(
     mitre_tactics: Optional[list[str]],
@@ -7335,22 +7347,32 @@ class ThreeSumCorrelationInput(BaseModel):
                     "Dual-counts multi-tactic alerts (opt-in, default False).",
     )
     category_a_groups: list[str] = Field(
-        default=["web_attack", "webshell", "xss", "sqlinjection", "lfi", "rfi", "rce",
-                 "command_injection", "vulnerability_scan", "encoded_payload", "evasion_attempt",
-                 "injection", "suspicious_wp", "path_traversal", "dir_traversal", "suspicious_url",
-                 "user_agent", "suspicious_ua", "malicious_request", "content_violation", "web_scan",
+        default=["web", "attack", "webshell", "webshell_scan", "scan", "recon",
+                 "evasion", "case_variation", "asp_extension", "syscheck", "accesslog",
+                 "sqlinjection", "lfi", "rfi", "xss", "rce", "command_injection",
+                 "vulnerability_scan", "encoded_payload", "injection", "suspicious_wp",
+                 "path_traversal", "dir_traversal", "suspicious_url", "user_agent",
+                 "suspicious_ua", "malicious_request", "content_violation", "web_scan",
                  "gambling"],
-        description="Wazuh rule.groups for Category A (Recon/Probe). TangerangKota-CSIRT production taxonomy.",
+        description="Wazuh rule.groups for Category A (Recon/Probe). "
+                    "Atomic tokens (web, attack, scan, recon, etc.) verified against "
+                    "wazuh-alerts-4.x-2026.07.08 production index. TangerangKota-CSIRT taxonomy.",
     )
     category_b_groups: list[str] = Field(
         default=["authentication_failures", "bruteforce", "malicious_login", "blocklist",
                  "blacklist", "credential_breach", "account_compromised", "zimbra"],
-        description="Wazuh rule.groups for Category B (Access Anomaly). TangerangKota-CSIRT production taxonomy.",
+        description="Wazuh rule.groups for Category B (Access Anomaly). "
+                    "Partially validated against Zimbra alerts (authentication_failures, "
+                    "bruteforce, blocklist, zimbra all present). TangerangKota-CSIRT taxonomy. "
+                    "MCP-TAXONOMY-V2: full diagnostic scan pending.",
     )
     category_c_groups: list[str] = Field(
         default=["firewall_drop", "exfiltration", "overflow", "opencti", "persistent",
                  "backdoor", "common_webshell", "react2shell", "defacement"],
-        description="Wazuh rule.groups for Category C (C2/Exfil/Maintain). TangerangKota-CSIRT production taxonomy.",
+        description="Wazuh rule.groups for Category C (C2/Exfil/Maintain). "
+                    "UNVERIFIED — no production index diagnostic has been run. "
+                    "May suffer same atomic-vs-compound mismatch as Category A. "
+                    "MCP-TAXONOMY-V2: diagnostic scan required before trusting Engine A results.",
     )
     category_a_label: str = Field(
         default="recon",
@@ -7520,8 +7542,8 @@ async def three_sum_correlation(data: ThreeSumCorrelationInput) -> str:
                     },
                     "aggs": {
                         "unique_srcips": {
-                            "terms": {
-                                "field": "data.srcip.keyword",
+                            "multi_terms": {
+                                "terms": [{"field": f} for f in _SRCIP_FIELD_PATHS],
                                 "size": 10000,
                                 "min_doc_count": 1,
                             },
@@ -7532,13 +7554,19 @@ async def three_sum_correlation(data: ThreeSumCorrelationInput) -> str:
                 raw = await _wazuh_indexer_post(body, _WAZUH_INDEX_PATTERNS["alerts"])
                 if "error" in raw:
                     logger.warning("[3SUM-EVAL] Engine-A query failed for %s: %s", label, raw["error"])
-                    return (label, [])
+                    return (label, [], {})
 
                 buckets = raw.get("aggregations", {}).get("unique_srcips", {}).get("buckets", [])
                 entries: list[tuple[str, int]] = []
                 mitre_samples: dict[str, list[str]] = {}
                 for b in buckets:
-                    srcip = b["key"]
+                    # multi_terms returns compound keys: [val_or_null per field path]
+                    # Extract the first non-null IP from the key array
+                    raw_key = b["key"]
+                    if isinstance(raw_key, list):
+                        srcip = next((v for v in raw_key if v is not None), "0.0.0.0")
+                    else:
+                        srcip = raw_key  # fallback for single-term compatibility
                     score = int(b.get("max_level", {}).get("value", 1))
                     entries.append((srcip, score))
                     if data.use_mitre:
