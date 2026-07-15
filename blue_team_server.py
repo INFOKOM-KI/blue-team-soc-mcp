@@ -501,6 +501,7 @@ MITRE_TACTIC_TO_CATEGORY: Dict[str, str] = {
 # depending on the log source. Engine A queries all known paths via multi_terms aggregation
 # to avoid silent false negatives from decoder field-path fragmentation.
 _SRCIP_FIELD_PATHS: list[str] = [
+    "data.srcip",
     "data.srcip.keyword",
     "data.src_ip.keyword",
     "data.client_ip.keyword",
@@ -7536,7 +7537,15 @@ async def three_sum_correlation(data: ThreeSumCorrelationInput) -> str:
                                         },
                                     }
                                 },
-                                {"terms": {"rule.groups": groups}},
+                                {
+                                    "bool": {
+                                        "should": [
+                                            {"terms": {"rule.groups": groups}},
+                                            {"terms": {"rule.groups.keyword": groups}},
+                                        ],
+                                        "minimum_should_match": 1,
+                                    }
+                                },
                             ]
                         }
                     },
@@ -7675,7 +7684,15 @@ async def three_sum_correlation(data: ThreeSumCorrelationInput) -> str:
                                         },
                                     }
                                 },
-                                {"terms": {"rule.groups": groups}},
+                                {
+                                    "bool": {
+                                        "should": [
+                                            {"terms": {"rule.groups": groups}},
+                                            {"terms": {"rule.groups.keyword": groups}},
+                                        ],
+                                        "minimum_should_match": 1,
+                                    }
+                                },
                             ]
                         }
                     },
