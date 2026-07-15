@@ -476,6 +476,10 @@ _cb_wazuh_manager = CircuitBreaker("wazuh_manager", failure_threshold=5, recover
 _cb_wazuh_indexer = CircuitBreaker("wazuh_indexer", failure_threshold=5, recovery_timeout=60)
 _cb_argus = CircuitBreaker("argus_ti", failure_threshold=5, recovery_timeout=60)
 
+# 3-Sum throttle state — prevents rapid-fire Indexer queries
+_last_eval_time: float = 0.0
+_last_eval_result: Optional[Dict[str, Any]] = None
+
 
 # PII redaction patterns - applied to alert payloads when BLUETEAM_REDACT_PII is enabled
 _REDACT_EMAIL_RE = re.compile(r"([a-zA-Z0-9._%+-]+)@([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})")
@@ -7253,8 +7257,7 @@ class ThreeSumCorrelationInput(BaseModel):
     time_window_minutes: int = Field(
         default=DEFAULT_WINDOW_MINUTES,
         ge=5,
-        le=20160,
-        description="Sliding time window in minutes (5–20160, up to 14 days). Default: 30.",
+        description="Sliding time window in minutes (minimum 5, no upper bound). Default: 30.",
     )
     threshold_score: int = Field(
         default=DEFAULT_THRESHOLD_SCORE,
@@ -7271,6 +7274,20 @@ class ThreeSumCorrelationInput(BaseModel):
     response_format: ResponseFormat = Field(
         default=ResponseFormat.MARKDOWN,
         description="Output format: 'markdown' (default, human-readable) or 'json' (machine-readable).",
+    )
+    categories_map: Optional[dict[str, dict[str, Any]]] = Field(
+        default=None,
+        description="Alternative compact syntax for category definitions. "
+                    "Keys are category labels, values are dicts with 'groups' (list[str]) "
+                    "and optional 'score' (int). Overrides category_*_groups/labels/scores when set. "
+                    'Example: {"recon": {"groups": ["web_attack", "xss"], "score": 3}, "access_anomaly": {...}}.',
+    )
+    throttle: int = Field(
+        default=0,
+        ge=0,
+        description="Minimum seconds between Indexer queries. 0 = disabled (default). "
+                    "When > 0, repeated calls within the throttle window return a cached/quiet "
+                    "response without hitting the Indexer. Prevents accidental resource exhaustion.",
     )
     category_a_groups: list[str] = Field(
         default=["web_attack", "webshell", "xss", "sqlinjection", "lfi", "rfi", "rce",
@@ -7339,7 +7356,7 @@ class ThreeSumCorrelationInput(BaseModel):
         "openWorldHint": True,
     },
 )
-async def three_sum_correlation(params: ThreeSumCorrelationInput) -> str:
+async def three_sum_correlation(data: ThreeSumCorrelationInput) -> str:
     """Evaluate 3-Sum APT threat detection across 3 Wazuh alert categories.
 
     Runs Engine A (Multi-IoC Risk Thresholding via terms aggregation on
@@ -7362,8 +7379,23 @@ async def three_sum_correlation(params: ThreeSumCorrelationInput) -> str:
 
     start_time = time.monotonic()
 
+    # Throttle gate: skip Indexer query if within quiet period
+    global _last_eval_time, _last_eval_result
+    if data.throttle > 0 and _last_eval_time > 0:
+        elapsed = start_time - _last_eval_time
+        if elapsed < data.throttle:
+            logger.info(
+                "[3SUM-EVAL] Throttled — %.1fs since last evaluation (throttle=%ds). Returning cached result.",
+                elapsed, data.throttle,
+            )
+            cached = dict(_last_eval_result) if _last_eval_result else {}
+            cached["meta"] = dict(cached.get("meta", {}))
+            cached["meta"]["throttled"] = True
+            cached["meta"]["throttle_elapsed_s"] = round(elapsed, 1)
+            return json.dumps(cached, indent=2)
+
     # Parse time window
-    since_dt = (datetime.utcnow() - timedelta(minutes=params.time_window_minutes))
+    since_dt = (datetime.utcnow() - timedelta(minutes=data.time_window_minutes))
     until_dt = datetime.utcnow()
     since_iso = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     until_iso = until_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -7371,20 +7403,45 @@ async def three_sum_correlation(params: ThreeSumCorrelationInput) -> str:
     logger.info(
         "[3SUM-EVAL] Starting evaluation window=%s -> %s (engineA=%s engineB=%s threshold=%d z=%.1f)",
         since_iso, until_iso,
-        params.engine_a_enabled, params.engine_b_enabled,
-        params.threshold_score, params.z_score_threshold,
+        data.engine_a_enabled, data.engine_b_enabled,
+        data.threshold_score, data.z_score_threshold,
     )
 
     try:
         engine_a_results = None
         engine_b_result = None
 
+        # categories_map override: unpack compact syntax into flat fields
+        cat_a_groups = data.category_a_groups
+        cat_b_groups = data.category_b_groups
+        cat_c_groups = data.category_c_groups
+        cat_a_label = data.category_a_label
+        cat_b_label = data.category_b_label
+        cat_c_label = data.category_c_label
+        if data.categories_map is not None:
+            cm = data.categories_map
+            # Each entry: {"groups": [...], "score": N (optional)}
+            labels = list(cm.keys())
+            if len(labels) != 3:
+                return json.dumps({
+                    "error": "categories_map must have exactly 3 entries (one per category).",
+                    "detail": f"Got {len(labels)}: {labels}",
+                }, indent=2)
+            cat_a_label, cat_b_label, cat_c_label = labels[0], labels[1], labels[2]
+            cat_a_groups = cm[cat_a_label].get("groups", [])
+            cat_b_groups = cm[cat_b_label].get("groups", [])
+            cat_c_groups = cm[cat_c_label].get("groups", [])
+            logger.info(
+                "[3SUM-EVAL] Using categories_map override: %s (%d groups), %s (%d groups), %s (%d groups)",
+                cat_a_label, len(cat_a_groups), cat_b_label, len(cat_b_groups), cat_c_label, len(cat_c_groups),
+            )
+
         # Engine A: terms aggregation per category (3 parallel queries)
-        if params.engine_a_enabled:
+        if data.engine_a_enabled:
             label_to_groups = [
-                (params.category_a_label, params.category_a_groups),
-                (params.category_b_label, params.category_b_groups),
-                (params.category_c_label, params.category_c_groups),
+                (cat_a_label, cat_a_groups),
+                (cat_b_label, cat_b_groups),
+                (cat_c_label, cat_c_groups),
             ]
 
             async def _fetch_srcip_terms(label: str, groups: list[str]) -> tuple[str, list[tuple[str, int]]]:
@@ -7431,14 +7488,14 @@ async def three_sum_correlation(params: ThreeSumCorrelationInput) -> str:
                 return (label, [(b["key"], int(b.get("max_level", {}).get("value", 1))) for b in buckets])
 
             label_a, label_b, label_c = (
-                params.category_a_label,
-                params.category_b_label,
-                params.category_c_label,
+                cat_a_label,
+                cat_b_label,
+                cat_c_label,
             )
             groups_a, groups_b, groups_c = (
-                params.category_a_groups,
-                params.category_b_groups,
-                params.category_c_groups,
+                cat_a_groups,
+                cat_b_groups,
+                cat_c_groups,
             )
 
             fetched = await asyncio.gather(
@@ -7450,7 +7507,7 @@ async def three_sum_correlation(params: ThreeSumCorrelationInput) -> str:
             # Map label -> srcip list; apply CIDR normalization if requested
             srcips_by_label: dict[str, list[tuple[str, int]]] = {}
             for label_ret, entries in fetched:
-                if params.cidr_normalize and entries:
+                if data.cidr_normalize and entries:
                     ips = [e[0] for e in entries]
                     cidr_map = normalize_srcip_to_cidr(ips)
                     cidr_scores: dict[str, int] = {}
@@ -7468,8 +7525,8 @@ async def three_sum_correlation(params: ThreeSumCorrelationInput) -> str:
                 category_a_label=label_a,
                 category_b_label=label_b,
                 category_c_label=label_c,
-                threshold_score=params.threshold_score,
-                exclude_srcips=params.exclude_srcips if params.exclude_srcips else None,
+                threshold_score=data.threshold_score,
+                exclude_srcips=data.exclude_srcips if data.exclude_srcips else None,
             )
 
             engine_a_results = (triggers_a, stats_a)
@@ -7477,7 +7534,7 @@ async def three_sum_correlation(params: ThreeSumCorrelationInput) -> str:
 
 
         # Engine B: date_histogram per source (3 parallel queries)
-        if params.engine_b_enabled:
+        if data.engine_b_enabled:
             async def _fetch_bucket_counts(label: str, groups: list[str]) -> tuple[str, list[dict[str, Any]]]:
                 """Fetch per-minute alert counts for a single source."""
                 body = {
@@ -7523,14 +7580,14 @@ async def three_sum_correlation(params: ThreeSumCorrelationInput) -> str:
 
             # All 3 source labels are the same categories
             label_a, label_b, label_c = (
-                params.category_a_label,
-                params.category_b_label,
-                params.category_c_label,
+                cat_a_label,
+                cat_b_label,
+                cat_c_label,
             )
             groups_a, groups_b, groups_c = (
-                params.category_a_groups,
-                params.category_b_groups,
-                params.category_c_groups,
+                cat_a_groups,
+                cat_b_groups,
+                cat_c_groups,
             )
 
             fetched_b = await asyncio.gather(
@@ -7550,7 +7607,7 @@ async def three_sum_correlation(params: ThreeSumCorrelationInput) -> str:
                 source_1_label=label_a,
                 source_2_label=label_b,
                 source_3_label=label_c,
-                z_score_threshold=params.z_score_threshold,
+                z_score_threshold=data.z_score_threshold,
             )
             logger.info(
                 "[3SUM-EVAL] Engine-B evaluation complete — %d simultaneous triggers",
@@ -7567,6 +7624,10 @@ async def three_sum_correlation(params: ThreeSumCorrelationInput) -> str:
             engine_b_result=engine_b_result,
             evaluation_time_ms=elapsed_ms,
         )
+
+        # Cache result for throttle gate
+        _last_eval_time = time.monotonic()
+        _last_eval_result = result
 
         logger.info("[3SUM-EVAL] Evaluation finished — %d ms", round(elapsed_ms))
         return json.dumps(result, indent=2)
@@ -7688,7 +7749,7 @@ def _validate_configuration() -> None:
             "will be unavailable."
         )
 
-    # WAZUH_INDEXER_MAX_SIZE guard — warn if it exceeds OpenSearch's default max_result_window
+    # WAZUH_INDEXER_MAX_SIZE guard - warn if it exceeds OpenSearch's default max_result_window
     if _WAZUH_INDEXER_MAX_SIZE > 10000:
         logger.warning(
             "WAZUH_INDEXER_MAX_SIZE is %d — this exceeds OpenSearch's default "
@@ -7748,7 +7809,7 @@ def main() -> None:
             args.port,
         )
         mcp.run(transport="streamable-http")
-    else:  # pragma: no cover — unreachable due to argparse choices
+    else:  # pragma: no cover - unreachable due to argparse choices
         raise ValueError(f"Unknown transport: {args.transport}")
 
 
