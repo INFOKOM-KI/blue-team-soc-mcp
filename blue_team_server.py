@@ -173,7 +173,7 @@ _PRIVATE_NETWORKS = [
     )
 ]
 
-# Shared HTTP clients by name — lazy-init, pooled per SSL trust domain
+# Shared HTTP clients by name - lazy-init, pooled per SSL trust domain
 _clients: dict[str, httpx.AsyncClient] = {}
 
 
@@ -6469,7 +6469,7 @@ async def _aggregate_trend(
     dur = _duration_minutes(since_str, until_str)
     fine = _auto_bucket_interval(dur)
 
-    # Coarse = 6× fine interval for zoomed-out view
+    # Coarse = 6x fine interval for zoomed-out view
     unit = fine[-1]
     num = int(fine[:-1])
     coarse = f"{num * 6}{unit}"
@@ -7253,8 +7253,8 @@ class ThreeSumCorrelationInput(BaseModel):
     time_window_minutes: int = Field(
         default=DEFAULT_WINDOW_MINUTES,
         ge=5,
-        le=1440,
-        description="Sliding time window in minutes (5–1440). Default: 30.",
+        le=20160,
+        description="Sliding time window in minutes (5–20160, up to 14 days). Default: 30.",
     )
     threshold_score: int = Field(
         default=DEFAULT_THRESHOLD_SCORE,
@@ -7268,17 +7268,27 @@ class ThreeSumCorrelationInput(BaseModel):
         le=5.0,
         description="Minimum Z-score to flag a bucket as anomalous in Engine B. Default: 2.5.",
     )
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN,
+        description="Output format: 'markdown' (default, human-readable) or 'json' (machine-readable).",
+    )
     category_a_groups: list[str] = Field(
-        default=["web", "attack", "webshell_scan"],
-        description="Wazuh rule.groups for Category A (Recon/Probe).",
+        default=["web_attack", "webshell", "xss", "sqlinjection", "lfi", "rfi", "rce",
+                 "command_injection", "vulnerability_scan", "encoded_payload", "evasion_attempt",
+                 "injection", "suspicious_wp", "path_traversal", "dir_traversal", "suspicious_url",
+                 "user_agent", "suspicious_ua", "malicious_request", "content_violation", "web_scan",
+                 "gambling"],
+        description="Wazuh rule.groups for Category A (Recon/Probe). TangerangKota-CSIRT production taxonomy.",
     )
     category_b_groups: list[str] = Field(
-        default=["authentication_failures", "bruteforce", "zimbra"],
-        description="Wazuh rule.groups for Category B (Access Anomaly).",
+        default=["authentication_failures", "bruteforce", "malicious_login", "blocklist",
+                 "blacklist", "credential_breach", "account_compromised", "zimbra"],
+        description="Wazuh rule.groups for Category B (Access Anomaly). TangerangKota-CSIRT production taxonomy.",
     )
     category_c_groups: list[str] = Field(
-        default=["firewall", "pfsense", "ids", "suricata"],
-        description="Wazuh rule.groups for Category C (C2/Exfil).",
+        default=["firewall_drop", "exfiltration", "overflow", "opencti", "persistent",
+                 "backdoor", "common_webshell", "react2shell", "defacement"],
+        description="Wazuh rule.groups for Category C (C2/Exfil/Maintain). TangerangKota-CSIRT production taxonomy.",
     )
     category_a_label: str = Field(
         default="recon",
@@ -7402,7 +7412,7 @@ async def three_sum_correlation(params: ThreeSumCorrelationInput) -> str:
                             "terms": {
                                 "field": "data.srcip.keyword",
                                 "size": 10000,
-                                "min_doc_count": 2,
+                                "min_doc_count": 1,
                             },
                             "aggs": {
                                 "max_level": {
