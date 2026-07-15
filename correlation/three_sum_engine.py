@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-3-Sum Threat Detection Engine — pure evaluation logic.
+3-Sum Threat Detection Engine pure evaluation logic.
 
 Engine A: Multi-IoC Risk Thresholding
     Finds srcip values appearing across 3 alert categories, sums risk scores,
@@ -10,8 +10,8 @@ Engine B: 3-Source Volumetric Z-Score Anomaly Detection
     Computes rolling μ/σ over per-minute alert counts from 3 sources,
     triggers when all 3 simultaneously cross Z ≥ threshold.
 
-ponytail: stdlib math only — no numpy dependency for 30 float ops per source.
-ponytail: dict-based intersection instead of pandas DataFrame for srcip grouping.
+Stdlib math only - no numpy dependency for 30 float ops per source.
+Dict based intersection instead of pandas DataFrame for srcip grouping.
 """
 
 from __future__ import annotations
