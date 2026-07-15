@@ -480,6 +480,45 @@ _cb_argus = CircuitBreaker("argus_ti", failure_threshold=5, recovery_timeout=60)
 _last_eval_time: float = 0.0
 _last_eval_result: Optional[Dict[str, Any]] = None
 
+# MITRE ATT&CK tactic → 3-Sum category mapping (Phase 1/2)
+MITRE_TACTIC_TO_CATEGORY: Dict[str, str] = {
+    "Reconnaissance":          "A",
+    "Resource Development":    "A",
+    "Discovery":               "A",
+    "Initial Access":          "B",
+    "Credential Access":       "B",
+    "Privilege Escalation":    "B",
+    "Defense Evasion":         "B",
+    "Execution":               "B",
+    "Persistence":             "C",
+    "Command and Control":     "C",
+    "Exfiltration":            "C",
+    "Impact":                  "C",
+    "Collection":              "C",
+}
+
+
+def _classify_alert_mitre(
+    mitre_tactics: Optional[list[str]],
+    target_category: str,
+) -> tuple[float, Optional[str]]:
+    """Weighted MITRE ATT&CK tactic classification (Phase 1/2).
+
+    Alpha (α = 0.6) groups-match score: handled by the caller — a srcip is already
+    in ``srcips_by_label[category]`` if its rule.groups match that category.
+
+    Beta (β = 0.4) MITRE overlay score: computed here. If ANY tactic in the alert's
+    ``rule.mitre.tactic`` array maps to ``target_category``, returns (0.4, tactic_name).
+
+    The combined total = α + β > 0 qualifies the srcip for the category.
+    """
+    if not mitre_tactics:
+        return (0.0, None)
+    for tactic in mitre_tactics:
+        if MITRE_TACTIC_TO_CATEGORY.get(tactic) == target_category:
+            return (0.4, tactic)
+    return (0.0, None)
+
 
 # PII redaction patterns - applied to alert payloads when BLUETEAM_REDACT_PII is enabled
 _REDACT_EMAIL_RE = re.compile(r"([a-zA-Z0-9._%+-]+)@([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})")
@@ -7289,6 +7328,12 @@ class ThreeSumCorrelationInput(BaseModel):
                     "When > 0, repeated calls within the throttle window return a cached/quiet "
                     "response without hitting the Indexer. Prevents accidental resource exhaustion.",
     )
+    use_mitre: bool = Field(
+        default=False,
+        description="Enable MITRE ATT&CK tactic refinement for Engine A classification. "
+                    "When True, applies α=0.6 groups + β=0.4 mitre.tactic weighted scoring. "
+                    "Dual-counts multi-tactic alerts (opt-in, default False).",
+    )
     category_a_groups: list[str] = Field(
         default=["web_attack", "webshell", "xss", "sqlinjection", "lfi", "rfi", "rce",
                  "command_injection", "vulnerability_scan", "encoded_payload", "evasion_attempt",
@@ -7444,8 +7489,17 @@ async def three_sum_correlation(data: ThreeSumCorrelationInput) -> str:
                 (cat_c_label, cat_c_groups),
             ]
 
-            async def _fetch_srcip_terms(label: str, groups: list[str]) -> tuple[str, list[tuple[str, int]]]:
-                """Fetch distinct srcips and their max rule.level per category via terms agg."""
+            async def _fetch_srcip_terms(label: str, groups: list[str]) -> tuple[str, list[tuple[str, int]], dict[str, list[str]]]:
+                """Fetch distinct srcips and their max rule.level per category via terms agg.
+
+                Returns (label, [(srcip, score), ...], {srcip: [tactic, ...]}) where the
+                third element is MITRE tactic data per srcip (empty dict when use_mitre=False).
+                """
+                aggs_inner: dict[str, Any] = {"max_level": {"max": {"field": "rule.level"}}}
+                if data.use_mitre:
+                    aggs_inner["sample_mitre"] = {
+                        "top_hits": {"size": 1, "_source": {"includes": ["rule.mitre"]}},
+                    }
                 body = {
                     "size": 0,
                     "query": {
@@ -7471,11 +7525,7 @@ async def three_sum_correlation(data: ThreeSumCorrelationInput) -> str:
                                 "size": 10000,
                                 "min_doc_count": 1,
                             },
-                            "aggs": {
-                                "max_level": {
-                                    "max": {"field": "rule.level"},
-                                },
-                            },
+                            "aggs": aggs_inner,
                         }
                     },
                 }
@@ -7485,7 +7535,20 @@ async def three_sum_correlation(data: ThreeSumCorrelationInput) -> str:
                     return (label, [])
 
                 buckets = raw.get("aggregations", {}).get("unique_srcips", {}).get("buckets", [])
-                return (label, [(b["key"], int(b.get("max_level", {}).get("value", 1))) for b in buckets])
+                entries: list[tuple[str, int]] = []
+                mitre_samples: dict[str, list[str]] = {}
+                for b in buckets:
+                    srcip = b["key"]
+                    score = int(b.get("max_level", {}).get("value", 1))
+                    entries.append((srcip, score))
+                    if data.use_mitre:
+                        hits = b.get("sample_mitre", {}).get("hits", {}).get("hits", [])
+                        if hits and "_source" in hits[0]:
+                            mitre_data = hits[0]["_source"].get("rule", {}).get("mitre", {})
+                            tactics = mitre_data.get("tactic")
+                            if tactics and isinstance(tactics, list):
+                                mitre_samples[srcip] = list(tactics)
+                return (label, entries, mitre_samples)
 
             label_a, label_b, label_c = (
                 cat_a_label,
@@ -7504,9 +7567,19 @@ async def three_sum_correlation(data: ThreeSumCorrelationInput) -> str:
                 _fetch_srcip_terms(label_c, groups_c),
             )
 
+            # Merge MITRE samples across all 3 categories
+            all_mitre_samples: dict[str, list[str]] = {}
+            if data.use_mitre:
+                for _, _, mitre_samples in fetched:
+                    for srcip, tactics in mitre_samples.items():
+                        existing = all_mitre_samples.get(srcip, [])
+                        all_mitre_samples[srcip] = list(set(existing + tactics))
+
             # Map label -> srcip list; apply CIDR normalization if requested
             srcips_by_label: dict[str, list[tuple[str, int]]] = {}
-            for label_ret, entries in fetched:
+            label_to_cat = {label_a: "A", label_b: "B", label_c: "C"}
+            cat_to_label = {"A": label_a, "B": label_b, "C": label_c}
+            for label_ret, entries, _ in fetched:
                 if data.cidr_normalize and entries:
                     ips = [e[0] for e in entries]
                     cidr_map = normalize_srcip_to_cidr(ips)
@@ -7516,7 +7589,30 @@ async def three_sum_correlation(data: ThreeSumCorrelationInput) -> str:
                         cidr_scores[cidr] = cidr_scores.get(cidr, 0) + score
                     srcips_by_label[label_ret] = [(cidr, score) for cidr, score in cidr_scores.items()]
                 else:
-                    srcips_by_label[label_ret] = entries
+                    srcips_by_label[label_ret] = list(entries)
+
+            # MITRE overlay: dual-count srcips to additional categories via α+β scoring
+            if data.use_mitre and all_mitre_samples:
+                for srcip, tactics in all_mitre_samples.items():
+                    for cat in ("A", "B", "C"):
+                        target_label = cat_to_label[cat]
+                        if any(e[0] == srcip for e in srcips_by_label.get(target_label, [])):
+                            continue  # already classified via rule.groups
+                        mitre_score, matching_tactic = _classify_alert_mitre(tactics, cat)
+                        if mitre_score > 0:
+                            for lbl in [label_a, label_b, label_c]:
+                                for e in srcips_by_label.get(lbl, []):
+                                    if e[0] == srcip:
+                                        srcips_by_label[target_label].append((srcip, e[1]))
+                                        logger.info(
+                                            "[3SUM-EVAL] MITRE overlay: srcip=%s dual-counted "
+                                            "to %s via tactic '%s' (β=%.1f, α=0.0, total=%.1f)",
+                                            srcip, cat, matching_tactic, mitre_score, mitre_score,
+                                        )
+                                        break
+                                else:
+                                    continue
+                                break
 
             triggers_a, stats_a = evaluate_engine_a(
                 srcips_by_label.get(label_a, []),
