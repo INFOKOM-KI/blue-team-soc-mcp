@@ -26,6 +26,11 @@ DEFAULT_THRESHOLD_SCORE = 10
 DEFAULT_Z_THRESHOLD = 2.5
 DEFAULT_WINDOW_MINUTES = 30
 
+# Fallback IPs from non-networked decoders (syscheck, auditd, vulnerability-detector,
+# oscap) that match rule.groups tokens but never populate data.srcip.
+# These are suppressed before the 3-way intersection to keep metrics accurate.
+_EXCLUDE_IP_FALLBACKS: set[str] = {"0.0.0.0", "unknown", ""}
+
 
 # Result types
 
@@ -33,7 +38,7 @@ DEFAULT_WINDOW_MINUTES = 30
 class EngineAResult:
     """One 3-Sum trigger from Engine A."""
     srcip: str
-    scores: Dict[str, int]          # category_label → score
+    scores: Dict[str, int]          # category_label -> score
     total_score: int
     severity: str = "CRITICAL"
 
@@ -89,6 +94,7 @@ def evaluate_engine_a(
         Tuple of (triggered_combinations, intersection_stats).
     """
     exclude_set: set[str] = set(exclude_srcips or [])
+    exclude_set.update(_EXCLUDE_IP_FALLBACKS)
 
     def _build_map(entries: List[Tuple[str, int]], cat_label: str) -> Dict[str, int]:
         result: Dict[str, int] = {}
@@ -334,7 +340,7 @@ def normalize_srcip_to_cidr(
     prefix_length: int = 24,
 ) -> Dict[str, str]:
     """Group IPs by /prefix_length for opt-in CIDR normalization.
-    Returns a mapping: srcip → cidr_key (e.g., '109.123.239.235' -> '109.123.239.0/24').
+    Returns a mapping: srcip -> cidr_key (e.g., '109.123.239.235' -> '109.123.239.0/24').
     IPs that fail to parse are mapped to themselves.
     """
     import ipaddress
