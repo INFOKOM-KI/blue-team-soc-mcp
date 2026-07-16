@@ -4336,9 +4336,9 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
     rule_group_counter: Counter[str] = Counter()
     rule_counter: Counter[str] = Counter()
     for doc in docs:
-        params.ip = (doc.get("data") or {}).get("srcip", "")
-        if params.ip:
-            srcip_counter[params.ip] += 1
+        ip = (doc.get("data") or {}).get("srcip", "")
+        if ip:
+            srcip_counter[ip] += 1
         rule = doc.get("rule") or {}
         for g in rule.get("groups", []):
             rule_group_counter[g] += 1
@@ -4360,7 +4360,7 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
             "alerts": docs,
             "aggregations": {
                 "top_srcips": [
-                    {"ip": ip, "count": c} for params.ip, c in srcip_counter.most_common(20)
+                    {"ip": ip, "count": c} for ip, c in srcip_counter.most_common(20)
                 ],
                 "top_rule_groups": [
                     {"group": g, "count": c} for g, c in rule_group_counter.most_common(20)
@@ -4394,16 +4394,16 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
         rule = doc.get("rule") or {}
         rule_str = f"{rule.get('id', '-')}: {rule.get('description', '-')}"
         level = rule.get("level", "-")
-        params.ip = (doc.get("data") or {}).get("srcip", "-")
+        ip = (doc.get("data") or {}).get("srcip", "-")
         account = (doc.get("data") or {}).get("account", "-")
-        lines.append(f"| {ts} | {_escape_md_table(agent)} | {_escape_md_table(rule_str)} | {level} | {params.ip} | {_escape_md_table(account)} |")
+        lines.append(f"| {ts} | {_escape_md_table(agent)} | {_escape_md_table(rule_str)} | {level} | {ip} | {_escape_md_table(account)} |")
 
     lines.append("")
     if srcip_counter:
         lines.append("## Top Source IPs (this page)")
         lines.append("| IP | Alert Count |")
         lines.append("|----|-------------|")
-        for params.ip, c in srcip_counter.most_common(20):
+        for ip, c in srcip_counter.most_common(20):
             lines.append(f"| {_escape_md_table(ip)} | {c:,} |")
         lines.append("")
 
@@ -4693,7 +4693,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
         )
         for i, (ip, count) in enumerate(top_ips, 1):
             targeted = len(ip_to_emails.get(ip, set()))
-            nr = netra_results.get(params.ip, {})
+            nr = netra_results.get(ip, {})
             score = nr.get("threat_score", "-")
             level = nr.get("threat_level", "-")
             country = nr.get("country_name") or nr.get("country") or "-"
@@ -4722,7 +4722,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
             lines.append("| IP | Count | Netra Level |")
             lines.append("|----|-------|-------------|")
             for ip, c in ips_for_email.most_common(10):
-                level = (netra_results.get(params.ip) or {}).get("threat_level", "-")
+                level = (netra_results.get(ip) or {}).get("threat_level", "-")
                 lines.append(f"| {_escape_md_table(ip)} | {c:,} | {_escape_md_table(str(level))} |")
         else:
             lines.append("_No attacker IPs found for this email._")
@@ -4731,9 +4731,9 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
     if params.enrich_with_netra and netra_results:
         lines.append("## Netra Enrichment (top attacker IPs)")
         lines.append("")
-        for params.ip, nr in netra_results.items():
+        for ip, nr in netra_results.items():
             if "error" in nr:
-                lines.append(f"### {params.ip} — Error: {nr['error']}")
+                lines.append(f"### {ip} — Error: {nr['error']}")
                 continue
             score = nr.get("threat_score", "-")
             level = nr.get("threat_level", "-")
@@ -4745,7 +4745,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
             )
             country = nr.get("country_name") or nr.get("country") or "-"
             isp = nr.get("isp") or "-"
-            lines.append(f"### {params.ip} — Threat Level: {level} (Score: {score}/100)")
+            lines.append(f"### {ip} — Threat Level: {level} (Score: {score}/100)")
             lines.append(f"- **AI Assessment**: {ai}")
             lines.append(f"- **VirusTotal**: {vt} malicious")
             lines.append(f"- **AbuseIPDB**: {ab}")
