@@ -308,9 +308,6 @@ def _is_private_or_reserved(ip: str) -> bool:
     return any(addr in net for net in _PRIVATE_NETWORKS)
 
 
-ValidPublicIp = Annotated[str, AfterValidator(_validate_public_ip)]
-
-
 def _validate_public_ip(v: str) -> str:
     """Reject private/reserved IPs for public threat-intel tools (SSRF guard — MCP05).
 
@@ -325,6 +322,9 @@ def _validate_public_ip(v: str) -> str:
             "Use Wazuh Indexer search tools for internal IP investigation."
         )
     return v
+
+
+ValidPublicIp = Annotated[str, AfterValidator(_validate_public_ip)]
 
 def _handle_api_error(e: Exception, context: str = "") -> str:
     """Consistent, actionable error formatting for all API-based tools."""
