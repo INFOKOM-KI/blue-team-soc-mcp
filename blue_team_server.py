@@ -3489,10 +3489,10 @@ async def _wazuh_indexer_search_full_scan(
             output["document_count"] = len(all_docs)
         else:
             output["sample_documents"] = sample_docs
-        if since:
-            output["since"] = since
-        if until:
-            output["until"] = until
+        if params.since:
+            output["since"] = params.since
+        if params.until:
+            output["until"] = params.until
         return _truncate_if_needed(
             json.dumps(output, indent=2, ensure_ascii=False),
             bypass=params.bypass_character_limit,
@@ -3511,8 +3511,8 @@ async def _wazuh_indexer_search_full_scan(
     if forensic_mode:
         lines.append(f"**Mode**: FORENSIC (all {len(all_docs):,} documents returned)")
     lines.append(f"**Index**: {params.index_type} | **Timezone**: UTC")
-    if since or until:
-        window_str = f"{since or '...'} → {until or '...'}"
+    if params.since or params.until:
+        window_str = f"{params.since or '...'} → {params.until or '...'}"
         lines.append(f"**Window**: {window_str}")
     lines.append("")
 
