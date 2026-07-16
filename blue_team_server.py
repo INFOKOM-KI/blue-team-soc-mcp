@@ -7513,7 +7513,7 @@ async def three_sum_correlation(data: ThreeSumCorrelationInput) -> str:
             )
             logger.info(
                 "[3SUM-EVAL] Engine-B evaluation complete — %d simultaneous triggers",
-                len(engine_b_result.simultaneous_triggers),
+                len(engine_b_result["simultaneous_triggers"]),
             )
 
         # Build unified result
