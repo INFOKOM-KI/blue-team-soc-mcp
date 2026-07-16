@@ -1277,7 +1277,7 @@ async def _wazuh_indexer_aggregate(
     """
     index_pattern = _WAZUH_INDEX_PATTERNS["alerts"]
 
-    # Filter context (no scoring needed — filter is faster than query)
+    # Filter context (no scoring needed - filter is faster than query)
     filter_clauses: list[dict] = [
         {"range": {
             "@timestamp": {
@@ -1293,7 +1293,7 @@ async def _wazuh_indexer_aggregate(
         filter_clauses.append({"terms": {"rule.groups": list(rule_groups)}})
     if rule_level_min is not None:
         filter_clauses.append({"range": {"rule.level": {"gte": rule_level_min}}})
-    # Free-text keyword filter — same query_string pattern as _wazuh_indexer_search
+    # Free-text keyword filter - same query_string pattern as _wazuh_indexer_search
     if keyword and keyword.strip():
         k = keyword.strip()
         field_parts = []
@@ -1552,8 +1552,8 @@ async def crowdsec_ip_reputation(params: CrowdsecIpReputationInput) -> str:
 
     Args:
         params (CrowdsecIpReputationInput): Validated parameters containing:
-            - ip (str): Public IPv4/IPv6 address to check (e.g. "185.220.101.1")
-            - response_format ('markdown' | 'json'): Output format (default: markdown)
+            - params.ip (str): Public IPv4/IPv6 address to check (e.g. "185.220.101.1")
+            - params.response_format ('markdown' | 'json'): Output format (default: markdown)
 
     Returns:
         str: If markdown, a formatted reputation report. If json, an object with fields:
@@ -1578,15 +1578,15 @@ async def crowdsec_ip_reputation(params: CrowdsecIpReputationInput) -> str:
         - "Error: Rate limit reached (429)" if API quota is exhausted
         - IP format validation is handled automatically by Pydantic before the request
     """
-    _audit_log("crowdsec_ip_reputation", {"ip": ip})
+    _audit_log("crowdsec_ip_reputation", {"ip": params.ip})
     try:
-        raw = await _crowdsec_request(f"/v2/smoke/{ip}")
+        raw = await _crowdsec_request(f"/v2/smoke/{params.ip}")
     except (httpx.HTTPStatusError, httpx.TimeoutException, RuntimeError) as e:
         return _handle_api_error(e, context="crowdsec_ip_reputation")
 
-    if response_format == "json":
+    if params.response_format == "json":
         output = {
-            "ip": ip,
+            "ip": params.ip,
             "reputation": raw.get("reputation", "unknown"),
             "as_name": raw.get("as_name"),
             "ip_range_score": raw.get("ip_range_score"),
@@ -1598,7 +1598,7 @@ async def crowdsec_ip_reputation(params: CrowdsecIpReputationInput) -> str:
         }
         result = json.dumps(output, indent=2, ensure_ascii=False)
     else:
-        result = _format_crowdsec_markdown(ip, raw)
+        result = _format_crowdsec_markdown(params.ip, raw)
 
     return _truncate_if_needed(result)
 
@@ -2556,8 +2556,8 @@ async def blueteam_read_web_log(params: WebLogInput) -> str:
     if log_type not in paths[server]:
         return json.dumps({"error": f"Unknown log type '{params.log_type}'. Use 'access' or 'error'."})
 
-    path = paths[server][log_type]
-    content = _tail_file(path, params.lines)
+    params.path = paths[server][log_type]
+    content = _tail_file(params.path, params.lines)
     if params.grep:
         safe_grep = _sanitize_regex(params.grep)
         lines = [l for l in content.splitlines() if re.search(safe_grep, l, re.IGNORECASE)]
@@ -2581,7 +2581,7 @@ async def blueteam_journalctl(params: JournalInput) -> str:
 
     Args:
         params.unit: Systemd unit (optional — omit for all units)
-        since: Time range string
+        params.since: Time range string
         params.lines: Max lines
         params.grep: Filter pattern
 
@@ -2592,8 +2592,8 @@ async def blueteam_journalctl(params: JournalInput) -> str:
     cmd = ["journalctl", "--no-pager", "-n", str(params.lines)]
     if params.unit:
         cmd += ["-u", params.unit]
-    if since:
-        cmd += ["--since", since]
+    if params.since:
+        cmd += ["--since", params.since]
     if params.grep:
         cmd += ["--grep", params.grep]
     r = _run(cmd)
@@ -2658,10 +2658,10 @@ async def blueteam_capture_traffic(params: CaptureInput) -> str:
         params.interface: Network interface
         params.count: Packet count to capture then stop
         params.filter_expr: BPF filter (optional)
-        params.output_file: Save pcap to this path (optional, under CAPTURE_OUTPUT_DIR)
+        params.output_file: Save pcap to this params.path (optional, under CAPTURE_OUTPUT_DIR)
 
     Returns:
-        str: Packet summary or path to saved pcap
+        str: Packet summary or params.path to saved pcap
     """
     if not _check_rate_limit():
         return json.dumps({"error": "Rate limit exceeded"})
@@ -3572,13 +3572,13 @@ async def _wazuh_indexer_search_full_scan(
 )
 async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhIndexerSearchInput()) -> str:
     """Query Wazuh Indexer (OpenSearch) for alerts/events with cursor pagination.
-    Supports filtering by agent_name, srcip/s (source IP), keyword, or all simultaneously.
+    Supports filtering by agent_name, params.srcip/s (source IP), keyword, or all simultaneously.
     Requires WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD (port 9200).
 
     **Three modes**:
 
     - **Single-page** (default, ``max_scanned`` not set): Returns one page per call.
-      Pass the returned ``next_cursor`` back as the ``cursor`` parameter to fetch
+      Pass the returned ``next_cursor`` back as the ``params.cursor`` parameter to fetch
       the next page. ``next_cursor`` is null when all results are exhausted.
     - **Full-scan aggregate** (set ``max_scanned``): Auto-paginates across ALL
       matching pages and returns aggregated summary (top IPs, top rules) with 50
@@ -3590,15 +3590,15 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhI
 
     Args:
         agent_name: Optional agent name filter (e.g. HYDRA-DC)
-        srcip: Optional single source IP filter (e.g. '180.254.78.145')
+        params.srcip: Optional single source IP filter (e.g. '180.254.78.145')
         srcips: Optional list of source IPs to match ANY of (max 25)
                        (e.g. ['114.10.116.20', '51.159.125.199'])
         params.keyword: Optional free-text keyword search (e.g. 'gambling OR "brute force"')
-        since: Optional ISO 8601 start time in UTC (e.g. '2026-07-05T18:30:00Z')
-        until: Optional ISO 8601 end time in UTC (e.g. '2026-07-05T19:00:00Z')
+        params.since: Optional ISO 8601 start time in UTC (e.g. '2026-07-05T18:30:00Z')
+        params.until: Optional ISO 8601 end time in UTC (e.g. '2026-07-05T19:00:00Z')
         params.index_type: alerts (default), events, or vulnerabilities
         limit: Max documents per page in single-page mode (default 500, max 10000)
-        cursor: next_cursor from previous response (omit for first page)
+        params.cursor: next_cursor from previous response (omit for first page)
         params.max_scanned: When set, run full-scan auto-pagination (max 1,000,000)
         params.include_all_docs: When True, return all documents in full-scan mode
         params.bypass_character_limit: When True, skip 100K-char response cap
@@ -3615,8 +3615,8 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhI
 
     # Decode pagination cursor — search_after uses sort-key values, not numeric offsets
     search_after: Optional[list] = None
-    if cursor:
-        decoded = _decode_cursor(cursor)
+    if params.cursor:
+        decoded = _decode_cursor(params.cursor)
         if decoded:
             search_after = decoded.get("search_after")
 
@@ -3631,9 +3631,9 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhI
         agent_name=agent_name,
         size=limit,
         search_after=search_after,
-        srcip=srcip,
-        since=since,
-        until=until,
+        srcip=params.srcip,
+        since=params.since,
+        until=params.until,
         keyword=params.keyword,
         srcips=srcips,
         fields=params.fields,
@@ -3668,12 +3668,12 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhI
     if data.get("applied_size") is not None:
         meta["applied_size"] = data["applied_size"]
         meta["requested_size"] = data["requested_size"]
-    if since:
-        meta["since"] = since
-    if until:
-        meta["until"] = until
+    if params.since:
+        meta["since"] = params.since
+    if params.until:
+        meta["until"] = params.until
 
-    if response_format == "json":
+    if params.response_format == "json":
         meta["documents"] = _redact_alert_data(meta["documents"], bypass=bypass_redaction)
         return _truncate_if_needed(
             json.dumps(meta, indent=2),
@@ -3687,8 +3687,8 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhI
         f"**Total**: {total_val} ({total_relation}) | **Returned**: {len(docs)} | **Page size**: {limit}",
         f"**Index**: {params.index_type} | **Timezone**: UTC",
     ]
-    if since or until:
-        window = f"{since or '...'} → {until or '...'}"
+    if params.since or params.until:
+        window = f"{params.since or '...'} → {params.until or '...'}"
         lines.append(f"**Window**: {window}")
     if next_cursor:
         lines.append(f"**Cursor**: `{next_cursor[:40]}...` (more pages available)")
@@ -3700,12 +3700,12 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhI
         agent = str((d.get("agent") or {}).get("name", ""))[:25]
         rule_id = str((d.get("rule") or {}).get("id", ""))
         level = str((d.get("rule") or {}).get("level", ""))
-        srcip = str(
+        params.srcip = str(
             (d.get("data") or {}).get("srcip")
             or d.get("srcip", "")
         )[:18]
         desc = str((d.get("rule") or {}).get("description", ""))[:60]
-        lines.append(f"| {i} | {_escape_md_table(ts)} | {_escape_md_table(agent)} | {_escape_md_table(rule_id)} | {_escape_md_table(level)} | {_escape_md_table(srcip)} | {_escape_md_table(desc)} |")
+        lines.append(f"| {i} | {_escape_md_table(ts)} | {_escape_md_table(agent)} | {_escape_md_table(rule_id)} | {_escape_md_table(level)} | {_escape_md_table(params.srcip)} | {_escape_md_table(desc)} |")
     if len(docs) > 100:
         lines.append(f"")
         lines.append(f"_(showing first 100 of {len(docs)} documents — set response_format=json for full output)_")
@@ -3813,13 +3813,13 @@ async def wazuh_email_lookup(params: WazuhEmailLookupInput) -> str:
     it appears in.  Results are sorted by frequency descending.
 
     Querying the full year requires scanning many documents.  The internal scanner
-    pages through alerts using ``search_after`` cursors until either the Indexer
+    pages through alerts using ``search_after`` cursors params.until either the Indexer
     is exhausted or ``max_scanned`` documents have been processed.
 
     Args:
         agent_name: Optional agent to filter (e.g. 'mailbox-new')
-        since: ISO 8601 start (default: 365 days ago)
-        until: ISO 8601 end (default: now)
+        params.since: ISO 8601 start (default: 365 days ago)
+        params.until: ISO 8601 end (default: now)
         params.top_n: How many top emails to return (1-500, default 100)
         params.rule_groups: Comma-separated groups filter
         params.max_scanned: Hard cap on documents scanned (1000-200000, default 50000)
@@ -3833,15 +3833,15 @@ async def wazuh_email_lookup(params: WazuhEmailLookupInput) -> str:
         - "Find the top 100 most compromised email addresses in the last year"
         - "Show me the most targeted mailboxes on agent mailbox-new"
     """
-    _audit_log("wazuh_email_lookup", {"since": since})
-    since_str, until_str = _parse_time_window(since, until)
+    _audit_log("wazuh_email_lookup", {"since": params.since})
+    since_str, until_str = _parse_time_window(params.since, params.until)
 
     rule_group_list: Optional[list[str]] = None
     if params.rule_groups:
         rule_group_list = [g.strip() for g in params.rule_groups.split(",") if g.strip()]
 
     email_counter: Counter[str] = Counter()
-    email_srcips: dict[str, set[str]] = {}    # email -> set of srcip
+    email_srcips: dict[str, set[str]] = {}    # email -> set of params.srcip
     email_rules: dict[str, set[str]] = {}     # email -> set of "rule_id: description"
     email_groups: dict[str, set[str]] = {}    # email -> set of rule groups
     email_first_seen: dict[str, str] = {}     # email -> earliest timestamp
@@ -3878,7 +3878,7 @@ async def wazuh_email_lookup(params: WazuhEmailLookupInput) -> str:
             for doc in docs:
                 emails = _extract_emails_from_doc(doc)
                 ts = doc.get("@timestamp", "")
-                srcip = (doc.get("data") or {}).get("srcip", "")
+                params.srcip = (doc.get("data") or {}).get("srcip", "")
                 rule = doc.get("rule") or {}
                 rule_id = rule.get("id", "")
                 rule_desc = rule.get("description", "")
@@ -3886,8 +3886,8 @@ async def wazuh_email_lookup(params: WazuhEmailLookupInput) -> str:
 
                 for email in emails:
                     email_counter[email] += 1
-                    if srcip:
-                        email_srcips.setdefault(email, set()).add(srcip)
+                    if params.srcip:
+                        email_srcips.setdefault(email, set()).add(params.srcip)
                     if rule_id:
                         email_rules.setdefault(email, set()).add(f"{rule_id}: {rule_desc}")
                     for g in groups:
@@ -4251,7 +4251,7 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
     """Search Wazuh alerts for a specific domain name.
 
     Queries the structured ``data.domain`` field (boosted) and also searches
-    ``full_log`` for the domain as a phrase.
+    ``full_log`` for the params.domain as a phrase.
 
     **Two modes**:
 
@@ -4265,10 +4265,10 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
       exhausted or the ceiling is hit.
 
     Args:
-        domain: Domain to search for (e.g. 'tangerangkota.go.id')
+        params.domain: Domain to search for (e.g. 'tangerangkota.go.id')
         agent_name: Optional agent filter
-        since: ISO 8601 start in UTC (default: 365 days ago)
-        until: ISO 8601 end in UTC (default: now)
+        params.since: ISO 8601 start in UTC (default: 365 days ago)
+        params.until: ISO 8601 end in UTC (default: now)
         limit: Max alerts per page in single-page mode (1-10000, default 500)
         params.include_full_log: Include raw log lines (default false — forced false in full-scan mode)
         cursor: Pagination cursor from previous response
@@ -4281,11 +4281,11 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
 
     Example usage:
         - "Search for all alerts involving tangerangkota.go.id"
-        - "Get the complete picture for this domain over the past 12h — use full-scan"
-        - "Show me who's hitting the mail server domain"
+        - "Get the complete picture for this params.domain over the past 12h — use full-scan"
+        - "Show me who's hitting the mail server params.domain"
     """
-    _audit_log("wazuh_domain_lookup", {"domain": domain, "since": since})
-    since_str, until_str = _parse_time_window(since, until)
+    _audit_log("wazuh_domain_lookup", {"domain": params.domain, "since": params.since})
+    since_str, until_str = _parse_time_window(params.since, params.until)
 
     search_after: Optional[list] = None
     if cursor:
@@ -4301,7 +4301,7 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
 
     try:
         data = await _wazuh_indexer_domain_search(
-            domain=domain,
+            domain=params.domain,
             agent_name=agent_name,
             size=limit,
             search_after=search_after,
@@ -4336,9 +4336,9 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
     rule_group_counter: Counter[str] = Counter()
     rule_counter: Counter[str] = Counter()
     for doc in docs:
-        ip = (doc.get("data") or {}).get("srcip", "")
-        if ip:
-            srcip_counter[ip] += 1
+        params.ip = (doc.get("data") or {}).get("srcip", "")
+        if params.ip:
+            srcip_counter[params.ip] += 1
         rule = doc.get("rule") or {}
         for g in rule.get("groups", []):
             rule_group_counter[g] += 1
@@ -4349,7 +4349,7 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
 
     if response_format == "json":
         output = {
-            "domain": domain,
+            "domain": params.domain,
             "total": {"value": total_val, "relation": total_relation},
             "count": len(docs),
             "size": limit,
@@ -4360,7 +4360,7 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
             "alerts": docs,
             "aggregations": {
                 "top_srcips": [
-                    {"ip": ip, "count": c} for ip, c in srcip_counter.most_common(20)
+                    {"ip": params.ip, "count": c} for params.ip, c in srcip_counter.most_common(20)
                 ],
                 "top_rule_groups": [
                     {"group": g, "count": c} for g, c in rule_group_counter.most_common(20)
@@ -4376,7 +4376,7 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
     total_display = f"{total_val:,}" + ("+" if total_relation == "gte" else "")
     page_info = f"Page ({len(docs)} of {total_display})"
     lines: list[str] = [
-        f"# Wazuh Domain Lookup — {domain}",
+        f"# Wazuh Domain Lookup — {params.domain}",
         "",
         f"**Total matches**: {total_display}",
         f"**{page_info}**",
@@ -4394,17 +4394,17 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
         rule = doc.get("rule") or {}
         rule_str = f"{rule.get('id', '-')}: {rule.get('description', '-')}"
         level = rule.get("level", "-")
-        ip = (doc.get("data") or {}).get("srcip", "-")
+        params.ip = (doc.get("data") or {}).get("srcip", "-")
         account = (doc.get("data") or {}).get("account", "-")
-        lines.append(f"| {ts} | {_escape_md_table(agent)} | {_escape_md_table(rule_str)} | {level} | {ip} | {_escape_md_table(account)} |")
+        lines.append(f"| {ts} | {_escape_md_table(agent)} | {_escape_md_table(rule_str)} | {level} | {params.ip} | {_escape_md_table(account)} |")
 
     lines.append("")
     if srcip_counter:
         lines.append("## Top Source IPs (this page)")
         lines.append("| IP | Alert Count |")
         lines.append("|----|-------------|")
-        for ip, c in srcip_counter.most_common(20):
-            lines.append(f"| {_escape_md_table(ip)} | {c:,} |")
+        for params.ip, c in srcip_counter.most_common(20):
+            lines.append(f"| {_escape_md_table(params.ip)} | {c:,} |")
         lines.append("")
 
     if rule_group_counter:
@@ -4514,8 +4514,8 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
     Args:
         params.emails: List of email addresses to analyze (1-50)
         agent_name: Optional agent filter
-        since: ISO 8601 start (default: 365 days ago)
-        until: ISO 8601 end (default: now)
+        params.since: ISO 8601 start (default: 365 days ago)
+        params.until: ISO 8601 end (default: now)
         params.top_ips: Number of top attacker IPs to rank (1-100, default 20)
         params.enrich_with_netra: Query Netra for top IPs (default false)
         response_format: 'markdown' or 'json'
@@ -4529,8 +4529,8 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
         - "Take the top 5 emails from the lookup and find who's attacking them"
         - "Enrich the attacker IPs for these compromised accounts through Netra"
     """
-    _audit_log("wazuh_compromised_emails_analysis", {"top_ips": params.top_ips, "since": since})
-    since_str, until_str = _parse_time_window(since, until)
+    _audit_log("wazuh_compromised_emails_analysis", {"top_ips": params.top_ips, "since": params.since})
+    since_str, until_str = _parse_time_window(params.since, params.until)
 
     ip_counter: Counter[str] = Counter()
     ip_to_emails: dict[str, set[str]] = {}  # IP -> set of targeted emails
@@ -4570,7 +4570,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
                     break
 
                 for doc in docs:
-                    srcip = (doc.get("data") or {}).get("srcip", "")
+                    params.srcip = (doc.get("data") or {}).get("srcip", "")
                     # Also extract emails from this doc for association
                     doc_emails = _extract_emails_from_doc(doc)
                     # Intersect with our target list
@@ -4578,11 +4578,11 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
                     if not matched:
                         continue
 
-                    if srcip:
-                        ip_counter[srcip] += 1
-                        ip_to_emails.setdefault(srcip, set()).update(matched)
+                    if params.srcip:
+                        ip_counter[params.srcip] += 1
+                        ip_to_emails.setdefault(params.srcip, set()).update(matched)
                         for email in matched:
-                            email_to_ips.setdefault(email, Counter())[srcip] += 1
+                            email_to_ips.setdefault(email, Counter())[params.srcip] += 1
                             email_alert_counts[email] += 1
 
                 batch_scanned += len(docs)
@@ -4609,9 +4609,9 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
     netra_results: dict[str, dict] = {}
     if params.enrich_with_netra:
         enrich_count = min(len(top_ips), 10)
-        for ip, _ in top_ips[:enrich_count]:
+        for params.ip, _ in top_ips[:enrich_count]:
             try:
-                raw = await _netra_request(f"/analysis/{ip}")
+                raw = await _netra_request(f"/analysis/{params.ip}")
                 data = raw.get("data", {})
                 results = data.get("results", {})
                 ts = results.get("threat_score", {})
@@ -4619,7 +4619,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
                 vt = results.get("virustotal", {})
                 ab = results.get("abuseipdb", {})
                 geo = results.get("ipapi", {})
-                netra_results[ip] = {
+                netra_results[params.ip] = {
                     "threat_score": ts.get("score"),
                     "threat_level": ts.get("level"),
                     "breakdown": ts.get("breakdown"),
@@ -4636,19 +4636,19 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
                 # Rate-limit courtesy: 1s delay between Netra calls
                 await asyncio.sleep(1)
             except (httpx.HTTPStatusError, httpx.TimeoutException, Exception) as e:
-                netra_results[ip] = {"error": str(e)}
+                netra_results[params.ip] = {"error": str(e)}
 
     if response_format == "json":
         attacker_ips = []
-        for ip, count in top_ips:
+        for params.ip, count in top_ips:
             entry: dict = {
-                "ip": ip,
+                "ip": params.ip,
                 "alert_count": count,
-                "targeted_emails": sorted(ip_to_emails.get(ip, set())),
-                "targeted_email_count": len(ip_to_emails.get(ip, set())),
+                "targeted_emails": sorted(ip_to_emails.get(params.ip, set())),
+                "targeted_email_count": len(ip_to_emails.get(params.ip, set())),
             }
-            if ip in netra_results:
-                entry["netra"] = netra_results[ip]
+            if params.ip in netra_results:
+                entry["netra"] = netra_results[params.ip]
             attacker_ips.append(entry)
 
         per_email: dict[str, dict] = {}
@@ -4657,8 +4657,8 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
             per_email[email] = {
                 "total_alerts": email_alert_counts.get(email, 0),
                 "attacker_ips": [
-                    {"ip": ip, "count": c}
-                    for ip, c in ips_for_email.most_common(20)
+                    {"ip": params.ip, "count": c}
+                    for params.ip, c in ips_for_email.most_common(20)
                 ],
             }
 
@@ -4691,14 +4691,14 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
         lines.append(
             "|---|----|------------|-----------------|-------------|-------------|---------|"
         )
-        for i, (ip, count) in enumerate(top_ips, 1):
-            targeted = len(ip_to_emails.get(ip, set()))
-            nr = netra_results.get(ip, {})
+        for i, (params.ip, count) in enumerate(top_ips, 1):
+            targeted = len(ip_to_emails.get(params.ip, set()))
+            nr = netra_results.get(params.ip, {})
             score = nr.get("threat_score", "-")
             level = nr.get("threat_level", "-")
             country = nr.get("country_name") or nr.get("country") or "-"
             lines.append(
-                f"| {i} | {_escape_md_table(ip)} | {count:,} | {targeted} | {score} | {_escape_md_table(str(level))} | {_escape_md_table(str(country))} |"
+                f"| {i} | {_escape_md_table(params.ip)} | {count:,} | {targeted} | {score} | {_escape_md_table(str(level))} | {_escape_md_table(str(country))} |"
             )
     else:
         lines.append(
@@ -4707,9 +4707,9 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
         lines.append(
             "|---|----|------------|-----------------|"
         )
-        for i, (ip, count) in enumerate(top_ips, 1):
-            targeted = len(ip_to_emails.get(ip, set()))
-            lines.append(f"| {i} | {_escape_md_table(ip)} | {count:,} | {targeted} |")
+        for i, (params.ip, count) in enumerate(top_ips, 1):
+            targeted = len(ip_to_emails.get(params.ip, set()))
+            lines.append(f"| {i} | {_escape_md_table(params.ip)} | {count:,} | {targeted} |")
 
     lines.append("")
     lines.append("## Per-Email Summary")
@@ -4721,9 +4721,9 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
         if ips_for_email:
             lines.append("| IP | Count | Netra Level |")
             lines.append("|----|-------|-------------|")
-            for ip, c in ips_for_email.most_common(10):
-                level = (netra_results.get(ip) or {}).get("threat_level", "-")
-                lines.append(f"| {_escape_md_table(ip)} | {c:,} | {_escape_md_table(str(level))} |")
+            for params.ip, c in ips_for_email.most_common(10):
+                level = (netra_results.get(params.ip) or {}).get("threat_level", "-")
+                lines.append(f"| {_escape_md_table(params.ip)} | {c:,} | {_escape_md_table(str(level))} |")
         else:
             lines.append("_No attacker IPs found for this email._")
         lines.append("")
@@ -4731,9 +4731,9 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
     if params.enrich_with_netra and netra_results:
         lines.append("## Netra Enrichment (top attacker IPs)")
         lines.append("")
-        for ip, nr in netra_results.items():
+        for params.ip, nr in netra_results.items():
             if "error" in nr:
-                lines.append(f"### {ip} — Error: {nr['error']}")
+                lines.append(f"### {params.ip} — Error: {nr['error']}")
                 continue
             score = nr.get("threat_score", "-")
             level = nr.get("threat_level", "-")
@@ -4745,7 +4745,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
             )
             country = nr.get("country_name") or nr.get("country") or "-"
             isp = nr.get("isp") or "-"
-            lines.append(f"### {ip} — Threat Level: {level} (Score: {score}/100)")
+            lines.append(f"### {params.ip} — Threat Level: {level} (Score: {score}/100)")
             lines.append(f"- **AI Assessment**: {ai}")
             lines.append(f"- **VirusTotal**: {vt} malicious")
             lines.append(f"- **AbuseIPDB**: {ab}")
@@ -4793,8 +4793,8 @@ def _auto_bucket_interval(window_duration_minutes: float) -> str:
 def _duration_minutes(since: str, until: str) -> float:
     """Return the duration in minutes between two ISO 8601 timestamps."""
     try:
-        s = datetime.fromisoformat(since.replace("Z", "+00:00").rstrip("Z"))
-        u = datetime.fromisoformat(until.replace("Z", "+00:00").rstrip("Z"))
+        s = datetime.fromisoformat(params.since.replace("Z", "+00:00").rstrip("Z"))
+        u = datetime.fromisoformat(params.until.replace("Z", "+00:00").rstrip("Z"))
         return (u - s).total_seconds() / 60.0
     except Exception:
         return 60.0  # fallback 1h
@@ -4884,9 +4884,9 @@ async def wazuh_alert_timeline(params: WazuhAlertTimelineInput) -> str:
     - Top rules, top source IPs, and top agents within that bucket
 
     Args:
-        since: Start of time window (default '1h').  Accepts ISO 8601 or relative
+        params.since: Start of time window (default '1h').  Accepts ISO 8601 or relative
                      expressions ('5m', '1h', '24h', '7d', '30d').
-        until: End of time window.  Defaults to now.
+        params.until: End of time window.  Defaults to now.
         params.bucket: Bucket size — '1m', '5m', '15m', '1h', '6h', '1d', or 'auto'.
         agent_name: Optional agent filter.
         params.rule_groups: Optional comma-separated rule groups filter.
@@ -4902,8 +4902,8 @@ async def wazuh_alert_timeline(params: WazuhAlertTimelineInput) -> str:
         - "Break down yesterday's brute force alerts by 15-minute intervals"
         - "What's the attack volume trend over the last 7 days?"
     """
-    _audit_log("wazuh_alert_timeline", {"since": since, "bucket": params.bucket})
-    since_str, until_str = _parse_time_window(since, until)
+    _audit_log("wazuh_alert_timeline", {"since": params.since, "bucket": params.bucket})
+    since_str, until_str = _parse_time_window(params.since, params.until)
 
     # Determine bucket interval
     if params.bucket == "auto":
@@ -5045,7 +5045,7 @@ async def wazuh_alert_timeline(params: WazuhAlertTimelineInput) -> str:
         f"- High (≥10): {all_high:,} ({all_high / max(total_alerts, 1) * 100:.0f}%)",
         "",
         "## Query Parameters",
-        f"- Since: `{since}`",
+        f"- Since: `{params.since}`",
         f"- Bucket: `{bucket_interval}`",
         f"- Agent: {agent_name or 'all'}",
         f"- Rule groups: {params.rule_groups or 'all'}",
@@ -5586,7 +5586,7 @@ async def blueteam_fail2ban_unban(params: UnbanInput) -> str:
 
     Args:
         params.jail: Jail name
-        ip: IP address to unban
+        params.ip: IP address to unban
 
     Returns:
         str: Result of unban operation
@@ -5595,9 +5595,9 @@ async def blueteam_fail2ban_unban(params: UnbanInput) -> str:
         return json.dumps({"error": "Rate limit exceeded"})
     if not shutil.which("fail2ban-client"):
         return _tool_not_found("fail2ban")
-    r = _run(["fail2ban-client", "set", params.jail, "unbanip", ip])
+    r = _run(["fail2ban-client", "set", params.jail, "unbanip", params.ip])
     out = r["stdout"] or r["stderr"]
-    _audit_log("blueteam_fail2ban_unban", {"jail": params.jail, "ip": ip}, out[:200])
+    _audit_log("blueteam_fail2ban_unban", {"jail": params.jail, "ip": params.ip}, out[:200])
     return out
 
 
@@ -5619,11 +5619,11 @@ async def blueteam_hash_file(params: HashFileInput) -> str:
     Pair with blueteam_lookup_hash_virustotal to check for known malware.
 
     Args:
-        params.path: File path
+        params.path: File params.path
         params.algorithm: Hash algorithm
 
     Returns:
-        str: JSON with file path, size, hash algorithm, and hash value
+        str: JSON with file params.path, size, hash algorithm, and hash value
     """
     algo_map = {
         "md5": hashlib.md5,
@@ -6505,9 +6505,9 @@ async def wazuh_alert_aggregate_analysis(params: AggregateAnalysisInput) -> str:
     3. Use ``wazuh_alert_focused_crawl`` to drill into those specific slices
 
     Args:
-        params.mode: Analysis mode (default 'summary').
-        since: Start of time window (default '24h').
-        until: End of time window (default: now).
+        params.mode: Analysis params.mode (default 'summary').
+        params.since: Start of time window (default '24h').
+        params.until: End of time window (default: now).
         agent_name: Optional agent filter.
         params.rule_groups: Optional comma-separated rule groups (e.g. 'authentication_failure').
         params.rule_level_min: Minimum rule level (e.g. 8).
@@ -6527,10 +6527,10 @@ async def wazuh_alert_aggregate_analysis(params: AggregateAnalysisInput) -> str:
     Error Handling:
         - Returns partial results if individual modes fail (errors listed at end)
         - All modes go through the Wazuh Indexer circuit breaker
-        - Timeout/connection failures surface actionable error messages per mode
+        - Timeout/connection failures surface actionable error messages per params.mode
     """
-    _audit_log("wazuh_alert_aggregate_analysis", {"mode": params.mode, "since": since})
-    since_str, until_str = _parse_time_window(since, until)
+    _audit_log("wazuh_alert_aggregate_analysis", {"mode": params.mode, "since": params.since})
+    since_str, until_str = _parse_time_window(params.since, params.until)
 
     rule_group_list: Optional[list[str]] = None
     if params.rule_groups:
@@ -6849,8 +6849,8 @@ async def wazuh_alert_focused_crawl(params: FocusedCrawlInput = FocusedCrawlInpu
         params.src_ip: Specific source IP identified as a hot spot.
         params.rule_id: Specific rule ID (e.g. '5763') identified as a top offender.
         agent_name: Filter to a specific agent.
-        since: Start of time window (default '24h').
-        until: End of time window (default: now).
+        params.since: Start of time window (default '24h').
+        params.until: End of time window (default: now).
         params.sample_size: Alert documents to retrieve (default 50, max 200).
         params.include_full_log: Include raw log lines (PII-redacted).
         bypass_redaction: Skip PII masking for audit (if BLUETEAM_REDACT_PII allows).
@@ -6872,7 +6872,7 @@ async def wazuh_alert_focused_crawl(params: FocusedCrawlInput = FocusedCrawlInpu
         - PII redaction applied automatically (bypass with bypass_redaction=True)
     """
     _audit_log("wazuh_alert_focused_crawl", {"src_ip": params.src_ip, "rule_id": params.rule_id, "sample_size": params.sample_size})
-    since_str, until_str = _parse_time_window(since, until)
+    since_str, until_str = _parse_time_window(params.since, params.until)
 
     # Build _source fields: defaults + user-specified extras
     source_fields = [
