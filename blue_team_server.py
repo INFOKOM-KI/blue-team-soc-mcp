@@ -308,6 +308,9 @@ def _is_private_or_reserved(ip: str) -> bool:
     return any(addr in net for net in _PRIVATE_NETWORKS)
 
 
+ValidPublicIp = Annotated[str, AfterValidator(_validate_public_ip)]
+
+
 def _validate_public_ip(v: str) -> str:
     """Reject private/reserved IPs for public threat-intel tools (SSRF guard — MCP05).
 
@@ -3057,9 +3060,6 @@ def _validate_rule_groups_field(v: Optional[str]) -> Optional[str]:
 ValidKeyword = Annotated[Optional[str], AfterValidator(_validate_keyword_field)]
 ValidAgentName = Annotated[Optional[str], AfterValidator(_validate_agent_name_field)]
 ValidRuleGroups = Annotated[Optional[str], AfterValidator(_validate_rule_groups_field)]
-ValidPublicIp = Annotated[str, AfterValidator(_validate_public_ip)]
-
-
 class WazuhIndexerSearchInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid", populate_by_name=True)
 
