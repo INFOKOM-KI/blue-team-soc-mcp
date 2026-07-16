@@ -3462,9 +3462,9 @@ async def _wazuh_indexer_search_full_scan(
 
     # Forensic mode: collect all docs from paginator output
     if forensic_mode:
-        all_docs = _redact_alert_data(all_docs, bypass=bypass_redaction)
-    sample_docs = _redact_alert_data(sample_docs, bypass=bypass_redaction)
-    if response_format == "json":
+        all_docs = _redact_alert_data(all_docs, bypass=params.bypass_redaction)
+    sample_docs = _redact_alert_data(sample_docs, bypass=params.bypass_redaction)
+    if params.response_format == "json":
         output: dict = {
             "mode": "full_scan",
             "index": params.index_type,
