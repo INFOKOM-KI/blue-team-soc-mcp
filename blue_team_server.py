@@ -51,7 +51,7 @@ from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from collections import Counter
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Literal
 import httpx
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field, AliasChoices, field_validator, model_validator
