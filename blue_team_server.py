@@ -4608,8 +4608,8 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
     # Optional Netra enrichment for top IPs (max 10)
     netra_results: dict[str, dict] = {}
     if params.enrich_with_netra:
-        enrich_count = min(len(params.top_ips), 10)
-        for ip, _ in params.top_ips[:enrich_count]:
+        enrich_count = min(len(top_ips), 10)
+        for ip, _ in top_ips[:enrich_count]:
             try:
                 raw = await _netra_request(f"/analysis/{ip}")
                 data = raw.get("data", {})
@@ -4640,7 +4640,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
 
     if params.response_format == "json":
         attacker_ips = []
-        for ip, count in params.top_ips:
+        for ip, count in top_ips:
             entry: dict = {
                 "ip": ip,
                 "alert_count": count,
@@ -4691,7 +4691,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
         lines.append(
             "|---|----|------------|-----------------|-------------|-------------|---------|"
         )
-        for i, (ip, count) in enumerate(params.top_ips, 1):
+        for i, (ip, count) in enumerate(top_ips, 1):
             targeted = len(ip_to_emails.get(ip, set()))
             nr = netra_results.get(params.ip, {})
             score = nr.get("threat_score", "-")
@@ -4707,7 +4707,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
         lines.append(
             "|---|----|------------|-----------------|"
         )
-        for i, (ip, count) in enumerate(params.top_ips, 1):
+        for i, (ip, count) in enumerate(top_ips, 1):
             targeted = len(ip_to_emails.get(ip, set()))
             lines.append(f"| {i} | {_escape_md_table(ip)} | {count:,} | {targeted} |")
 
@@ -7534,10 +7534,10 @@ async def three_sum_correlation(data: ThreeSumCorrelationInput) -> str:
         logger.info("[3SUM-EVAL] Evaluation finished — %d ms", round(elapsed_ms))
         return json.dumps(result, indent=2)
 
-    except Exception:
+    except httpx.HTTPStatusError as e:
         return json.dumps({
-            "error": "Wazuh Indexer is temporarily unavailable (circuit breaker open)",
-            "detail": "The Indexer has been unresponsive. Retry after the circuit breaker recovery timeout (~60s).",
+            "error": f"Wazuh Indexer error: HTTP {e.response.status_code}",
+            "detail": str(e)[:500],
         }, indent=2)
     except Exception as e:
         logger.exception("[3SUM-EVAL] Unexpected error during evaluation")
