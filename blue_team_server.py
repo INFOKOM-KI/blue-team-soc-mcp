@@ -59,14 +59,10 @@ from pydantic import AfterValidator
 from typing import Annotated
 
 # 3-Sum Correlation Engine
-from correlation.three_sum_engine import (
-    evaluate_engine_a,
-    evaluate_engine_b,
-    format_evaluation_dict,
+from correlation.three_sum_core import (
+    evaluate_engine_a, evaluate_engine_b, format_evaluation_dict,
     normalize_srcip_to_cidr,
-    DEFAULT_THRESHOLD_SCORE,
-    DEFAULT_Z_THRESHOLD,
-    DEFAULT_WINDOW_MINUTES,
+    DEFAULT_THRESHOLD_SCORE, DEFAULT_Z_THRESHOLD, DEFAULT_WINDOW_MINUTES,
 )
 
 # Logging - Must go to stderr. stdout is used by the MCP stdio protocol.
@@ -100,6 +96,9 @@ BLUETEAM_AUDIT_LOG = os.environ.get("BLUETEAM_AUDIT_LOG", "")
 BLUETEAM_RATE_LIMIT = int(os.environ.get("BLUETEAM_RATE_LIMIT", "0"))  # max calls/min, 0=disabled
 BLUETEAM_REDACT_PII = os.environ.get("BLUETEAM_REDACT_PII", "true").lower() in ("1", "true", "yes")
 BLUETEAM_REDACT_EMAILS = os.environ.get("BLUETEAM_REDACT_EMAILS", "true").lower() in ("1", "true", "yes")
+BLUETEAM_REDACT_DOMAINS = os.environ.get("BLUETEAM_REDACT_DOMAINS", "true").lower() in ("1", "true", "yes")
+BLUETEAM_REDACT_LOCATIONS = os.environ.get("BLUETEAM_REDACT_LOCATIONS", "true").lower() in ("1", "true", "yes")
+BLUETEAM_REDACT_UAS = os.environ.get("BLUETEAM_REDACT_UAS", "true").lower() in ("1", "true", "yes")
 
 # Path safety: allowlist for blueteam_hash_file (colon-separated, e.g. /var:/etc:/home:/opt)
 ALLOWED_PATH_PREFIXES = [
@@ -291,11 +290,14 @@ _wazuh_token: Optional[str] = None
 _wazuh_token_expiry: float = 0.0
 
 # Shared enums & formatting utilities
-class ResponseFormat(str, Enum):
-    """Output format for threat-intel tool responses."""
+ResponseFormat = Literal["markdown", "json"]
+# Shared field descriptions — single source of truth
+_BYPASS_REDACTION_DESC = "When true, skip PII/credential redaction for audit investigations."
+_RESPONSE_FORMAT_DESC = "Output format: 'markdown' (default) or 'json'."
+_SINCE_DESC = "ISO 8601 start time in UTC. Defaults to 365 days ago."
+_UNTIL_DESC = "ISO 8601 end time in UTC. Defaults to now."
+_AGENT_NAME_DESC = "Optional agent name filter."
 
-    MARKDOWN = "markdown"
-    JSON = "json"
 
 def _is_private_or_reserved(ip: str) -> bool:
     """Check whether an IP belongs to a private or reserved range (not routable)."""
@@ -340,7 +342,7 @@ def _handle_api_error(e: Exception, context: str = "") -> str:
         return f"{prefix}Error: API request failed with status {status}."
     if isinstance(e, httpx.TimeoutException):
         return f"{prefix}Error: Request timed out after {HTTP_TIMEOUT}s. Try again."
-    if isinstance(e, CircuitBreakerOpenError):
+    if isinstance(e):
         return f"{prefix}Error: Circuit breaker is open — {e}"
     if isinstance(e, RuntimeError):
         return f"{prefix}Error: {e}"
@@ -376,106 +378,6 @@ def _escape_md_table(value: str) -> str:
 
 
 # Circuit Breaker - prevents cascading failures when upstream APIs are down.
-# CLOSED - normal operation, calls pass through
-# OPEN - fail-fast for recovery_timeout seconds after failure_threshold failures
-# HALF_OPEN - single probe call allowed; success -> CLOSED, failure -> OPEN
-class CircuitBreakerOpenError(Exception):
-    """Raised when a call is attempted while the circuit breaker is OPEN."""
-
-class CircuitBreaker:
-    """Async-safe circuit breaker for external API calls.
-
-    Usage:
-        cb = CircuitBreaker("crowdsec", failure_threshold=5, recovery_timeout=60)
-        data = await cb.call(_crowdsec_request, f"/v2/smoke/{ip}")
-    """
-
-    def __init__(
-        self,
-        name: str,
-        failure_threshold: int = 5,
-        recovery_timeout: float = 60.0,
-    ) -> None:
-        self.name = name
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
-        self._failure_count = 0
-        self._state: str = "CLOSED"  # CLOSED | OPEN | HALF_OPEN
-        self._opened_at: float = 0.0
-        self._lock = asyncio.Lock()
-
-    @property
-    def state(self) -> str:
-        return self._state
-
-    async def call(self, fn, *args: Any, **kwargs: Any) -> Any:
-        """Execute ``fn(*args, **kwargs)`` with circuit-breaker protection.
-
-        Returns the callable's result on success.
-        Raises ``CircuitBreakerOpenError`` if the circuit is OPEN.
-        Re-raises the original exception on failure.
-        """
-        async with self._lock:
-            now = time.monotonic()
-
-            if self._state == "OPEN":
-                if now - self._opened_at >= self.recovery_timeout:
-                    self._state = "HALF_OPEN"
-                    logger.info(
-                        "Circuit breaker '%s' → HALF_OPEN (probing after %.0fs timeout)",
-                        self.name, self.recovery_timeout,
-                    )
-                else:
-                    remaining = self.recovery_timeout - (now - self._opened_at)
-                    logger.warning(
-                        "Circuit breaker '%s' is OPEN — failing fast (%.0fs remaining)",
-                        self.name, remaining,
-                    )
-                    raise CircuitBreakerOpenError(
-                        f"Circuit breaker '{self.name}' is OPEN. "
-                        f"Upstream API is unavailable. Retry in {remaining:.0f}s."
-                    )
-
-        # Execute the call outside the lock to avoid blocking concurrent callers
-        try:
-            result = await fn(*args, **kwargs)
-        except Exception:
-            async with self._lock:
-                self._failure_count += 1
-                if self._state == "HALF_OPEN":
-                    logger.warning(
-                        "Circuit breaker '%s' HALF_OPEN probe FAILED (%d/%d) → OPEN",
-                        self.name, self._failure_count, self.failure_threshold,
-                    )
-                    self._state = "OPEN"
-                    self._opened_at = time.monotonic()
-                elif self._failure_count >= self.failure_threshold:
-                    logger.error(
-                        "Circuit breaker '%s' threshold reached (%d failures) → OPEN",
-                        self.name, self._failure_count,
-                    )
-                    self._state = "OPEN"
-                    self._opened_at = time.monotonic()
-            raise
-
-        # Success — reset
-        async with self._lock:
-            if self._state == "HALF_OPEN":
-                logger.info(
-                    "Circuit breaker '%s' HALF_OPEN probe SUCCEEDED → CLOSED", self.name,
-                )
-            self._failure_count = 0
-            self._state = "CLOSED"
-
-        return result
-
-
-# Per-service circuit breakers - one per external API trust domain
-_cb_crowdsec = CircuitBreaker("crowdsec_cti", failure_threshold=5, recovery_timeout=60)
-_cb_wazuh_manager = CircuitBreaker("wazuh_manager", failure_threshold=5, recovery_timeout=60)
-_cb_wazuh_indexer = CircuitBreaker("wazuh_indexer", failure_threshold=5, recovery_timeout=60)
-_cb_argus = CircuitBreaker("argus_ti", failure_threshold=5, recovery_timeout=60)
-
 # 3-Sum throttle state — prevents rapid-fire Indexer queries
 _last_eval_time: float = 0.0
 _last_eval_result: Optional[Dict[str, Any]] = None
@@ -535,7 +437,6 @@ def _classify_alert_mitre(
 
 # PII redaction patterns - applied to alert payloads when BLUETEAM_REDACT_PII is enabled
 _REDACT_EMAIL_RE = re.compile(r"([a-zA-Z0-9._%+-]+)@([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})")
-_REDACT_HOSTNAME_RE = re.compile(r"(?<![a-zA-Z0-9-])([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.(?:[a-zA-Z]{2,}|xn--[a-zA-Z0-9]+))(?![a-zA-Z0-9.])")
 
 # Credential/secret stripping patterns - applied BEFORE PII redaction.
 # Prevents tokens, keys, and secrets in Wazuh full_log fields from leaking to the LLM.
@@ -563,24 +464,20 @@ _CREDENTIAL_STRIP_RULES: list[tuple[re.Pattern, str]] = [
         r'-----END (?:RSA |EC |OPENSSH |DSA |ED25519 |ENCRYPTED )?PRIVATE KEY-----',
         re.DOTALL,
     ), '<PRIVATE_KEY_REDACTED>'),
-    # AWS access key IDs: "AKIA" plus secret key pattern "wJalrXUtn..."
-    (re.compile(r'\bAKIA[0-9A-Z]{16}\b'), '<AWS_ACCESS_KEY_REDACTED>'),
-    # Stripe secret keys: sk_live_ / sk_test_
-    (re.compile(r'\bsk_(?:live|test)_[a-zA-Z0-9]{24,}\b'), '<STRIPE_KEY_REDACTED>'),
-    # GitHub personal access tokens: ghp_*, gho_*, ghu_*, ghs_*, ghr_*
-    (re.compile(r'\bgh[pousr]_[A-Za-z0-9_]{36,}\b'), '<GITHUB_TOKEN_REDACTED>'),
-    # GitLab personal access tokens: glpat-
-    (re.compile(r'\bglpat-[A-Za-z0-9_-]{20,}\b'), '<GITLAB_TOKEN_REDACTED>'),
+    # Cloud API keys: AWS (AKIA...) + Stripe (sk_live_/sk_test_)
+    (re.compile(r'\b(AKIA[0-9A-Z]{16}|sk_(?:live|test)_[a-zA-Z0-9]{24,})\b'),
+     '<CLOUD_API_KEY_REDACTED>'),
+    # VCS tokens: GitHub (ghp_/gho_...) + GitLab (glpat-)
+    (re.compile(r'\b(gh[pousr]_[A-Za-z0-9_]{36,}|glpat-[A-Za-z0-9_-]{20,})\b'),
+     '<VCS_TOKEN_REDACTED>'),
     # OpenAI / Anthropic API keys: sk- (but NOT Stripe sk_live/sk_test which are handled above)
     (re.compile(r'\b(?:sk-(?!live|test)|sk-ant-)[a-zA-Z0-9_-]{20,}\b'), '<AI_API_KEY_REDACTED>'),
     # Generic password/secret/passwd/pwd query params or inline: "password=value" -> "password=<REDACTED>"
     (re.compile(r'(password|passwd|pwd|secret)\s*[=:]\s*\S+', re.IGNORECASE),
      r'\1=<PASSWORD_REDACTED>'),
-    # Slack tokens: xoxb-, xoxp-, xoxa-, xoxr-
-    (re.compile(r'\bxox[abpro]-[0-9]+-[0-9]+-[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)?\b'),
-     '<SLACK_TOKEN_REDACTED>'),
-    # Google API keys: AIza (35 chars)
-    (re.compile(r'\bAIza[0-9A-Za-z_-]{35}\b'), '<GOOGLE_API_KEY_REDACTED>'),
+    # Platform tokens: Slack (xoxb-/xoxp-...) + Google (AIza...)
+    (re.compile(r'\b(xox[abpro]-[0-9]+-[0-9]+-[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)?|AIza[0-9A-Za-z_-]{35})\b'),
+     '<PLATFORM_TOKEN_REDACTED>'),
 ]
 
 # Forensic email hashing — preserves domain visibility for SOC analysis while
@@ -599,41 +496,51 @@ def _hash_email_for_audit(email: str) -> str:
     Deterministic: same (salt, email) → same hash every time.  The analyst
     can verify by computing SHA-256 locally:
 
-        echo -n "<salt>:admin@corp.gov" | sha256sum | cut -c1-8
+        echo -n "<salt>:admin@hallow.gov" | sha256sum | cut -c1-8
 
     and matching the result against the ``[h:xxxxxxxx]`` suffix in the output.
     """
     return hashlib.sha256(f"{_REDACT_SALT}:{email}".encode()).hexdigest()[:8]
 
 
+def _mask_domain(domain: str) -> str:
+    """Mask subdomain part, keep parent domain + TLD visible."""
+    parts = domain.rstrip(".").split(".")
+    if len(parts) < 3:
+        return domain
+    sub = parts[0]
+    if len(sub) <= 2:
+        masked = sub[0] + "*" * (len(sub) - 1)
+    else:
+        masked = sub[0] + "*" * (len(sub) - 2) + sub[-1]
+    return f"{masked}." + ".".join(parts[1:])
+
+
 def _redact_alert_data(data: Any, *, bypass: bool = False) -> Any:
     """Apply redacted-but-real PII and credential masking to alert payloads (PRD FR-17).
 
-    **Three independent layers — apply in strict priority order:**
+    **Six layers — apply in strict priority order:**
 
-    1. **Credential stripping** (layer 1 — MANDATORY, never configurable):
-       Bearer tokens, Basic auth, API keys, JWTs, PEM keys, cloud/VCS/AI/Slack/
-       Stripe/Google keys, and password params are ALWAYS stripped.  There is no
-       legitimate operational use case for sending credentials to an LLM.
+    1. **Credential stripping** (layer 1 — MANDATORY, never configurable)
+    2. **Email redaction** (layer 2 — ``BLUETEAM_REDACT_EMAILS``)
+    3. **Internal IP masking** (layer 3 — ``BLUETEAM_REDACT_PII``)
+       RFC1918 + loopback (127.x.x.x) + link-local (169.254.x.x) + IPv6 ::1
+       **Public IPs (attacker IoCs) are NEVER masked.**
+    4. **Domain/hostname masking** (layer 4 — ``BLUETEAM_REDACT_DOMAINS``)
+       Subdomains masked, parent+TLD visible. ``data.url`` NEVER masked.
+    5. **Log location masking** (layer 5 — ``BLUETEAM_REDACT_LOCATIONS``)
+       Directory tree stripped, leaf + forensic hash preserved.
+    6. **User-agent truncation** (layer 6 — ``BLUETEAM_REDACT_UAS``)
+       Truncated to 80 chars (OS/browser preserved).
 
-    2. **Email redaction** (layer 2 — controlled by ``BLUETEAM_REDACT_EMAILS``):
-       Masks the local part (preserving first/last char + forensic hash), keeps
-       the domain FULLY visible for threat intelligence.  Set to ``false`` when
-       SOC analysts need to identify specific compromised accounts.
-
-    3. **Internal IP masking** (layer 3 — controlled by ``BLUETEAM_REDACT_PII``):
-       Masks RFC1918 addresses (10.x, 172.16-31.x, 192.168.x).  **Public IPs
-       (attacker IoCs) are NEVER masked** — only internal infrastructure addresses.
-
-    The per-call ``bypass`` parameter skips layers 2 and 3 only — credential
-    stripping can NEVER be bypassed because it has no legitimate use case.
+    The ``bypass`` parameter skips all optional layers (2-6). Layer 1 is NEVER
+    bypassable. Each layer is independently controlled by its ``BLUETEAM_REDACT_*``
+    env var, so operators can selectively disable masking at the deployment level.
 
     Returns the redacted copy — original is never mutated.
     """
     if isinstance(data, str):
         # Layer 1: Credential stripping (MANDATORY — no env var override) ──
-        # These patterns protect against secrets in Wazuh full_log fields.
-        # Bypass is NOT honored here — credentials must never reach the LLM.
         for pattern, replacement in _CREDENTIAL_STRIP_RULES:
             data = pattern.sub(replacement, data)
 
@@ -648,13 +555,12 @@ def _redact_alert_data(data: Any, *, bypass: bool = False) -> Any:
                 else:
                     rlocal = local[0] + "*" * max(1, len(local) - 2) + local[-1]
                 return f"{rlocal}@{domain} [h:{forensic_hash}]"
-
             data = _REDACT_EMAIL_RE.sub(_redact_email, data)
 
-        # Layer 3: RFC1918 internal IP masking (BLUETEAM_REDACT_PII) ──
-        # Public IPs (attacker IoCs) are NEVER masked — only internal infra.
+        # Layer 3: Internal IP masking (BLUETEAM_REDACT_PII) ──
+        # RFC1918 + 127.x.x.x + 169.254.x.x + IPv6 ::1
         if not bypass and BLUETEAM_REDACT_PII:
-            def _redact_rfc1918(m: re.Match) -> str:
+            def _redact_internal_ip(m: re.Match) -> str:
                 ip = m.group(0)
                 octets = ip.split(".")
                 if octets[0] == "10":
@@ -663,17 +569,53 @@ def _redact_alert_data(data: Any, *, bypass: bool = False) -> Any:
                     return f"172.{octets[1]}.{'***'}.{octets[3]}"
                 elif octets[0] == "192" and octets[1] == "168":
                     return f"192.168.{'***'}.{octets[3]}"
+                elif octets[0] == "127":
+                    return f"127.{'***'}.{'***'}.{octets[3]}"
+                elif octets[0] == "169" and octets[1] == "254":
+                    return f"169.254.{'***'}.{octets[3]}"
                 return ip
-
             data = re.sub(
-                r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})\b",
-                _redact_rfc1918,
-            data,
-        )
+                r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
+                r"172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|"
+                r"192\.168\.\d{1,3}\.\d{1,3}|"
+                r"127\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
+                r"169\.254\.\d{1,3}\.\d{1,3})\b",
+                _redact_internal_ip, data,
+            )
+            # IPv6 loopback
+            data = re.sub(r"\b::1\b", "<LOOPBACK_REDACTED>", data)
+
+        # Layer 4: Domain/hostname masking in text (BLUETEAM_REDACT_DOMAINS) ──
+        if not bypass and BLUETEAM_REDACT_DOMAINS:
+            data = re.sub(
+                r"(?<![@\w])([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
+                r"(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*"
+                r"\.(?:[a-zA-Z]{2,}|xn--[a-zA-Z0-9]+))\b",
+                lambda m: _mask_domain(m.group(1)), data,
+            )
+
+        # Layer 6: UA truncation in full_log ──
+        if not bypass and BLUETEAM_REDACT_UAS:
+            if len(data) > 80 and re.search(r"Mozilla|Chrome|Safari|Firefox|curl|wget|python", data):
+                data = data[:80] + "..."
+
         return data
 
     if isinstance(data, dict):
-        return {k: _redact_alert_data(v, bypass=bypass) for k, v in data.items()}
+        result: dict[str, Any] = {}
+        for k, v in data.items():
+            if not bypass:
+                if k == "domain" and isinstance(v, str) and BLUETEAM_REDACT_DOMAINS:
+                    v = _mask_domain(v)
+                elif k == "location" and isinstance(v, str) and BLUETEAM_REDACT_LOCATIONS:
+                    parts = v.rstrip("/").split("/")
+                    leaf = parts[-1] if len(parts) > 1 else v
+                    path_hash = hashlib.sha256(f"{_REDACT_SALT}:{v}".encode()).hexdigest()[:6]
+                    v = f".../{leaf} [h:{path_hash}]"
+                elif k == "user_agent" and isinstance(v, str) and BLUETEAM_REDACT_UAS and len(v) > 80:
+                    v = v[:80] + "..."
+            result[k] = _redact_alert_data(v, bypass=bypass)
+        return result
 
     if isinstance(data, list):
         return [_redact_alert_data(item, bypass=bypass) for item in data]
@@ -831,7 +773,7 @@ async def _wazuh_get_token() -> Optional[str]:
             resp.raise_for_status()
             return resp.text.strip().strip('"')
 
-        _wazuh_token = await _cb_wazuh_manager.call(_do_wazuh_auth_http)
+        _wazuh_token = await _do_wazuh_auth_http()
         _wazuh_token_expiry = now + _WAZUH_TOKEN_TTL
         return _wazuh_token
     except httpx.HTTPStatusError as e:
@@ -839,7 +781,7 @@ async def _wazuh_get_token() -> Optional[str]:
         _wazuh_token = None
         _wazuh_token_expiry = 0.0
         return None
-    except CircuitBreakerOpenError as e:
+    except Exception as e:
         logger.warning("Wazuh auth failed: circuit breaker open — %s", e)
         _wazuh_token = None
         _wazuh_token_expiry = 0.0
@@ -877,10 +819,10 @@ async def _wazuh_api_get(path: str, params: Dict[str, str] = None) -> Dict:
             resp.raise_for_status()
             return resp.json()
 
-        return await _cb_wazuh_manager.call(_do_wazuh_api_http)
+        return await _do_wazuh_api_http()
     except httpx.HTTPStatusError as e:
         return {"error": f"Wazuh API error: {e.response.status_code}", "detail": e.response.text[:500]}
-    except CircuitBreakerOpenError:
+    except Exception:
         return {
             "error": "Wazuh Manager API is temporarily unavailable (circuit breaker open)",
             "detail": (
@@ -1031,7 +973,7 @@ async def _wazuh_indexer_search(
         return resp.json()
 
     try:
-        result = await _cb_wazuh_indexer.call(_do_indexer_http)
+        result = await _do_indexer_http()
         # Report clamping when _WAZUH_INDEXER_MAX_SIZE caps the requested size,
         # so callers can programmatically detect incomplete pages.
         applied = body["size"]
@@ -1464,7 +1406,7 @@ async def _crowdsec_request(path: str) -> dict[str, Any]:
         response.raise_for_status()
         return response.json()
 
-    data = await _cb_crowdsec.call(_do_crowdsec_http)
+    data = await _do_crowdsec_http()
 
     #Cache store
     _crowdsec_cache[path] = (now + CROWDSEC_CACHE_TTL, data)
@@ -1532,25 +1474,16 @@ class CrowdsecIpReputationInput(BaseModel):
 
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
-    ip: str = Field(
+    ip: ValidPublicIp = Field(
         ...,
         description="Public IPv4 or IPv6 address to check (e.g. '185.220.101.1').",
         min_length=3,
         max_length=45,
     )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="'markdown' for a human-readable report, 'json' for structured data.",
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown",
+        description="_RESPONSE_FORMAT_DESC",
     )
-
-    @field_validator("ip")
-    @classmethod
-    def validate_ip(cls, v: str) -> str:
-        try:
-            ipaddress.ip_address(v)
-        except ValueError as exc:
-            raise ValueError(f"'{v}' is not a valid IP address (IPv4/IPv6).") from exc
-        return _validate_public_ip(v)
 
 class CrowdsecIpReputationBulkInput(BaseModel):
     """Input model for batch IP reputation lookup via CrowdSec CTI."""
@@ -1563,9 +1496,9 @@ class CrowdsecIpReputationBulkInput(BaseModel):
         min_length=1,
         max_length=10,
     )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="'markdown' for a human-readable report, 'json' for structured data.",
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown",
+        description="_RESPONSE_FORMAT_DESC",
     )
 
     @field_validator("ips")
@@ -1642,15 +1575,15 @@ async def crowdsec_ip_reputation(params: CrowdsecIpReputationInput) -> str:
         - "Error: Rate limit reached (429)" if API quota is exhausted
         - IP format validation is handled automatically by Pydantic before the request
     """
-    _audit_log("crowdsec_ip_reputation", {"ip": params.ip})
+    _audit_log("crowdsec_ip_reputation", {"ip": ip})
     try:
-        raw = await _crowdsec_request(f"/v2/smoke/{params.ip}")
-    except (httpx.HTTPStatusError, httpx.TimeoutException, CircuitBreakerOpenError, RuntimeError) as e:
+        raw = await _crowdsec_request(f"/v2/smoke/{ip}")
+    except (httpx.HTTPStatusError, httpx.TimeoutException, RuntimeError) as e:
         return _handle_api_error(e, context="crowdsec_ip_reputation")
 
-    if params.response_format == ResponseFormat.JSON:
+    if response_format == "json":
         output = {
-            "ip": params.ip,
+            "ip": ip,
             "reputation": raw.get("reputation", "unknown"),
             "as_name": raw.get("as_name"),
             "ip_range_score": raw.get("ip_range_score"),
@@ -1662,7 +1595,7 @@ async def crowdsec_ip_reputation(params: CrowdsecIpReputationInput) -> str:
         }
         result = json.dumps(output, indent=2, ensure_ascii=False)
     else:
-        result = _format_crowdsec_markdown(params.ip, raw)
+        result = _format_crowdsec_markdown(ip, raw)
 
     return _truncate_if_needed(result)
 
@@ -1700,9 +1633,9 @@ async def crowdsec_ip_reputation_bulk(params: CrowdsecIpReputationBulkInput) -> 
         - Failure for one IP does not abort the entire batch — per-IP errors are
           reported inline in the results rather than stopping the process.
     """
-    _audit_log("crowdsec_ip_reputation_bulk", {"count": len(params.ips)})
+    _audit_log("crowdsec_ip_reputation_bulk", {"count": len(ips)})
     results: list[dict[str, Any]] = []
-    for ip in params.ips:
+    for ip in ips:
         try:
             raw = await _crowdsec_request(f"/v2/smoke/{ip}")
             results.append(
@@ -1713,10 +1646,10 @@ async def crowdsec_ip_reputation_bulk(params: CrowdsecIpReputationBulkInput) -> 
                     "cves": raw.get("cves", []),
                 }
             )
-        except (httpx.HTTPStatusError, httpx.TimeoutException, CircuitBreakerOpenError, RuntimeError) as e:
+        except (httpx.HTTPStatusError, httpx.TimeoutException, RuntimeError) as e:
             results.append({"ip": ip, "error": _handle_api_error(e, context=ip)})
 
-    if params.response_format == ResponseFormat.JSON:
+    if response_format == "json":
         result = json.dumps(results, indent=2, ensure_ascii=False)
     else:
         lines = ["# CrowdSec Bulk Reputation Lookup", ""]
@@ -1818,43 +1751,11 @@ def _format_greynoise_markdown(ip: str, raw: dict[str, Any]) -> str:
 
     return "\n".join(lines)
 
-# GreyNoise Community input model
-class GreynoiseIpContextInput(BaseModel):
-    """Input model for GreyNoise Community IP context lookup."""
-
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    ip: str = Field(
-        ...,
-        description="Public IPv4 or IPv6 address to check against GreyNoise (e.g. '71.6.135.131').",
-        min_length=3,
-        max_length=45,
-    )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="'markdown' for a human-readable report, 'json' for structured data.",
-    )
-
-    @field_validator("ip")
-    @classmethod
-    def validate_ip(cls, v: str) -> str:
-        try:
-            ipaddress.ip_address(v)
-        except ValueError as exc:
-            raise ValueError(f"'{v}' is not a valid IP address (IPv4/IPv6).") from exc
-        return _validate_public_ip(v)
-
-# GREYNOISE COMMUNITY TOOL
 @mcp.tool(
     name="greynoise_ip_context",
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
-async def greynoise_ip_context(params: GreynoiseIpContextInput) -> str:
+async def greynoise_ip_context(ip: ValidPublicIp, response_format: Literal["markdown", "json"] = "markdown") -> str:
     """
     Check whether a public IP address is a known internet scanner or business service
     using the GreyNoise Community API (free, no auth required).
@@ -1893,15 +1794,15 @@ async def greynoise_ip_context(params: GreynoiseIpContextInput) -> str:
         - "Error: Rate limit reached (429)" — back off per GreyNoise fair-use policy
         - IP format validation is handled automatically by Pydantic before the request
     """
-    _audit_log("greynoise_ip_context", {"ip": params.ip})
+    _audit_log("greynoise_ip_context", {"ip": ip})
     try:
-        raw = await _greynoise_community_request(params.ip)
-    except (httpx.HTTPStatusError, httpx.TimeoutException, CircuitBreakerOpenError, RuntimeError) as e:
+        raw = await _greynoise_community_request(ip)
+    except (httpx.HTTPStatusError, httpx.TimeoutException, RuntimeError) as e:
         return _handle_api_error(e, context="greynoise_ip_context")
 
-    if params.response_format == ResponseFormat.JSON:
+    if response_format == "json":
         output = {
-            "ip": raw.get("ip", params.ip),
+            "ip": raw.get("ip", ip),
             "noise": raw.get("noise"),
             "riot": raw.get("riot"),
             "classification": raw.get("classification", "unknown"),
@@ -1912,7 +1813,7 @@ async def greynoise_ip_context(params: GreynoiseIpContextInput) -> str:
         }
         result = json.dumps(output, indent=2, ensure_ascii=False)
     else:
-        result = _format_greynoise_markdown(params.ip, raw)
+        result = _format_greynoise_markdown(ip, raw)
 
     return _truncate_if_needed(result)
 
@@ -2107,45 +2008,11 @@ def _format_netra_markdown(ip: str, raw: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-# Netra Threat Intelligence input model
-class NetraIpAnalysisInput(BaseModel):
-    """Input model for Netra Threat Intelligence IP analysis lookup."""
-
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    ip: str = Field(
-        ...,
-        description="Public IPv4 or IPv6 address to analyze through Netra Threat Intelligence "
-        "(e.g. '185.220.101.1').",
-        min_length=3,
-        max_length=45,
-    )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="'markdown' for a human-readable report, 'json' for structured data.",
-    )
-
-    @field_validator("ip")
-    @classmethod
-    def validate_ip(cls, v: str) -> str:
-        try:
-            ipaddress.ip_address(v)
-        except ValueError as exc:
-            raise ValueError(f"'{v}' is not a valid IP address (IPv4/IPv6).") from exc
-        return _validate_public_ip(v)
-
-
-# NETRA THREAT INTELLIGENCE TOOL
 @mcp.tool(
     name="netra_ip_analysis",
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
-async def netra_ip_analysis(params: NetraIpAnalysisInput) -> str:
+async def netra_ip_analysis(ip: ValidPublicIp, response_format: Literal["markdown", "json"] = "markdown", bypass_redaction: bool = False) -> str:
     """Analyze a public IP address using Netra Threat Intelligence.
 
     This tool is READ-ONLY — it queries the Netra Threat Intelligence API to
@@ -2172,13 +2039,13 @@ async def netra_ip_analysis(params: NetraIpAnalysisInput) -> str:
         - "Error: Rate limit reached (429)" if API quota is exhausted
         - IP format validation is handled automatically by Pydantic before the request
     """
-    _audit_log("netra_ip_analysis", {"ip": params.ip})
+    _audit_log("netra_ip_analysis", {"ip": ip})
     try:
-        raw = await _netra_request(f"/analysis/{params.ip}")
-    except (httpx.HTTPStatusError, httpx.TimeoutException, CircuitBreakerOpenError, RuntimeError) as e:
+        raw = await _netra_request(f"/analysis/{ip}")
+    except (httpx.HTTPStatusError, httpx.TimeoutException, RuntimeError) as e:
         return _handle_api_error(e, context="netra_ip_analysis")
 
-    if params.response_format == ResponseFormat.JSON:
+    if response_format == "json":
         data = raw.get("data", {})
         results = data.get("results", {})
         meta = raw.get("meta", {})
@@ -2224,7 +2091,7 @@ async def netra_ip_analysis(params: NetraIpAnalysisInput) -> str:
             geo = ipapi["results"]
 
         output = {
-            "ip": params.ip,
+            "ip": ip,
             "observable": data.get("observable"),
             "analyzed_at": meta.get("analyzed_at"),
             "threat_score": {
@@ -2286,7 +2153,7 @@ async def netra_ip_analysis(params: NetraIpAnalysisInput) -> str:
         output = {k: v for k, v in output.items() if v is not None}
         result = json.dumps(output, indent=2, ensure_ascii=False)
     else:
-        result = _format_netra_markdown(params.ip, raw)
+        result = _format_netra_markdown(ip, raw)
 
     return _truncate_if_needed(result)
 
@@ -2326,7 +2193,7 @@ async def _argus_request(path: str, payload: dict) -> dict[str, Any]:
         resp.raise_for_status()
         return resp.json()
 
-    return await _cb_argus.call(_do_argus_http)
+    return await _do_argus_http()
 
 
 def _format_argus_markdown(ip: str, raw: dict[str, Any]) -> str:
@@ -2526,42 +2393,11 @@ def _format_argus_markdown(ip: str, raw: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-class ArgusIpLookupInput(BaseModel):
-    """Input model for Argus Threat Intelligence IP lookup."""
-
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    ip: str = Field(
-        ...,
-        description="Public IPv4 or IPv6 address to analyze through Argus Threat Intelligence.",
-        min_length=3,
-        max_length=45,
-    )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="'markdown' for a human-readable report, 'json' for structured data.",
-    )
-
-    @field_validator("ip")
-    @classmethod
-    def validate_ip(cls, v: str) -> str:
-        try:
-            ipaddress.ip_address(v)
-        except ValueError as exc:
-            raise ValueError(f"'{v}' is not a valid IP address (IPv4/IPv6).") from exc
-        return _validate_public_ip(v)
-
-
 @mcp.tool(
     name="argus_ip_lookup",
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
-async def argus_ip_lookup(params: ArgusIpLookupInput) -> str:
+async def argus_ip_lookup(ip: ValidPublicIp, response_format: Literal["markdown", "json"] = "markdown") -> str:
     """Analyze a public IP address using Argus Threat Intelligence by TangerangKota-CSIRT.
 
     This tool is READ-ONLY — it queries the Argus Threat Intelligence API which
@@ -2594,16 +2430,16 @@ async def argus_ip_lookup(params: ArgusIpLookupInput) -> str:
         - "Error: Rate limit reached (429)" if API quota is exhausted
         - Per-source failures (e.g., ThreatBook 429) are reported in the output
     """
-    _audit_log("argus_ip_lookup", {"ip": params.ip})
+    _audit_log("argus_ip_lookup", {"ip": ip})
     try:
-        raw = await _argus_request("/lookup-jobs", {"observable": params.ip})
-    except (httpx.HTTPStatusError, httpx.TimeoutException, CircuitBreakerOpenError, RuntimeError) as e:
+        raw = await _argus_request("/lookup-jobs", {"observable": ip})
+    except (httpx.HTTPStatusError, httpx.TimeoutException, RuntimeError) as e:
         return _handle_api_error(e, context="argus_ip_lookup")
 
-    if params.response_format == ResponseFormat.JSON:
+    if response_format == "json":
         return _truncate_if_needed(json.dumps(raw, indent=2, ensure_ascii=False))
 
-    result = _format_argus_markdown(params.ip, raw)
+    result = _format_argus_markdown(ip, raw)
     return _truncate_if_needed(result)
 
 
@@ -2636,7 +2472,7 @@ async def blueteam_read_auth_log(params: LogInput) -> str:
         if params.grep:
             cmd += ["--grep", params.grep]
         r = _run(cmd)
-        return _redact_alert_data(r["stdout"] or r["stderr"], bypass=params.bypass_redaction)
+        return _redact_alert_data(r["stdout"] or r["stderr"], bypass=bypass_redaction)
 
     content = _tail_file(log_path, params.lines)
     if params.grep:
@@ -2666,8 +2502,8 @@ async def blueteam_read_syslog(params: LogInput) -> str:
             if params.grep:
                 safe_grep = _sanitize_regex(params.grep)
                 lines = [l for l in content.splitlines() if re.search(safe_grep, l, re.IGNORECASE)]
-                return _redact_alert_data("\n".join(lines, bypass=params.bypass_redaction) if lines else f"No matches for: {params.grep}")
-            return _redact_alert_data(content, bypass=params.bypass_redaction)
+                return _redact_alert_data("\n".join(lines, bypass=bypass_redaction) if lines else f"No matches for: {params.grep}")
+            return _redact_alert_data(content, bypass=bypass_redaction)
     # Fallback to journalctl
     cmd = ["journalctl", "-n", str(params.lines), "--no-pager"]
     if params.grep:
@@ -2722,8 +2558,8 @@ async def blueteam_read_web_log(params: WebLogInput) -> str:
     if params.grep:
         safe_grep = _sanitize_regex(params.grep)
         lines = [l for l in content.splitlines() if re.search(safe_grep, l, re.IGNORECASE)]
-        return _redact_alert_data("\n".join(lines, bypass=params.bypass_redaction) if lines else f"No matches for: {params.grep}")
-    return _redact_alert_data(content, bypass=params.bypass_redaction)
+        return _redact_alert_data("\n".join(lines, bypass=bypass_redaction) if lines else f"No matches for: {params.grep}")
+    return _redact_alert_data(content, bypass=bypass_redaction)
 
 class JournalInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
@@ -2742,7 +2578,7 @@ async def blueteam_journalctl(params: JournalInput) -> str:
 
     Args:
         params.unit: Systemd unit (optional — omit for all units)
-        params.since: Time range string
+        since: Time range string
         params.lines: Max lines
         params.grep: Filter pattern
 
@@ -2753,12 +2589,12 @@ async def blueteam_journalctl(params: JournalInput) -> str:
     cmd = ["journalctl", "--no-pager", "-n", str(params.lines)]
     if params.unit:
         cmd += ["-u", params.unit]
-    if params.since:
-        cmd += ["--since", params.since]
+    if since:
+        cmd += ["--since", since]
     if params.grep:
         cmd += ["--grep", params.grep]
     r = _run(cmd)
-    return _redact_alert_data(r["stdout"] or r["stderr"], bypass=params.bypass_redaction)
+    return _redact_alert_data(r["stdout"] or r["stderr"], bypass=bypass_redaction)
 
 # NETWORK MONITORING
 @mcp.tool(
@@ -2854,45 +2690,37 @@ async def blueteam_capture_traffic(params: CaptureInput) -> str:
         # Redact internal RFC1918 IPs from stdout text output (PRD FR-17, AGENTS.md §3.3).
         # Connection metadata contains internal endpoint IPs; mask them without altering
         # the packet-capture file itself (which is forensic evidence and always unredacted).
-        result = _redact_alert_data(result, bypass=params.bypass_redaction)
+        result = _redact_alert_data(result, bypass=bypass_redaction)
     _audit_log("blueteam_capture_traffic", {"interface": params.interface, "count": params.count}, result[:200])
     return result
 
 # WAZUH SIEM
-class WazuhAgentsInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    limit: int = Field(default=100, description="Agents per page", ge=1, le=10000)
-    cursor: Optional[str] = Field(
-        default=None,
-        description="Pagination cursor from previous response (next_cursor). Omit for first page.",
-    )
-
 @mcp.tool(
     name="blueteam_wazuh_agents",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
-async def blueteam_wazuh_agents(params: WazuhAgentsInput) -> str:
+async def blueteam_wazuh_agents(limit: int = 100, cursor: Optional[str] = None) -> str:
     """List Wazuh agents with cursor pagination — one page per call.
     Pass the returned next_cursor back as the cursor parameter for the next page.
     Requires WAZUH_API_URL and WAZUH_API_PASSWORD.
 
     Args:
-        params.limit: Agents per page (default 100, max 10000)
-        params.cursor: next_cursor from previous response (omit for first page)
+        limit: Agents per page (default 100, max 10000)
+        cursor: next_cursor from previous response (omit for first page)
 
     Returns:
         str: JSON with agents, total, offset, limit, and next_cursor
     """
     _audit_log("blueteam_wazuh_agents", {})
     offset = 0
-    if params.cursor:
-        decoded = _decode_cursor(params.cursor)
+    if cursor:
+        decoded = _decode_cursor(cursor)
         if decoded:
             offset = decoded.get("offset", 0)
 
     data = await _wazuh_api_get("/agents", {
         "offset": str(offset),
-        "limit": str(params.limit),
+        "limit": str(limit),
         "pretty": "true",
     })
     if isinstance(data.get("error"), str):
@@ -2915,7 +2743,7 @@ async def blueteam_wazuh_agents(params: WazuhAgentsInput) -> str:
         "agents": summary,
         "total": total,
         "offset": offset,
-        "limit": params.limit,
+        "limit": limit,
         "next_cursor": next_cursor,
     }, indent=2))
 
@@ -2945,29 +2773,19 @@ _WAZUH_LOG_TAG = {
 }
 
 
-class WazuhLogsInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    log_type: str = Field(default="alerts", description="Log type: alerts, api, cluster, integrations")
-    limit: int = Field(default=50, description="Max log entries per page", ge=1, le=1000)
-    cursor: Optional[str] = Field(
-        default=None,
-        description="Pagination cursor from previous response (next_cursor). Omit for first page.",
-    )
-
-
 @mcp.tool(
     name="blueteam_wazuh_manager_logs",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
-async def blueteam_wazuh_manager_logs(params: WazuhLogsInput) -> str:
+async def blueteam_wazuh_manager_logs(log_type: str = "alerts", limit: int = 50, cursor: Optional[str] = None) -> str:
     """Fetch Wazuh manager logs with cursor pagination — one page per call.
     Pass the returned next_cursor back as cursor for the next page.
     Compatible with Wazuh 4.x API (uses 'tag' parameter).
 
     Args:
-        params.log_type: alerts, api, cluster, or integrations
-        params.limit: Max entries per page (default 50, max 1000)
-        params.cursor: next_cursor from previous response (omit for first page)
+        log_type: alerts, api, cluster, or integrations
+        limit: Max entries per page (default 50, max 1000)
+        cursor: next_cursor from previous response (omit for first page)
 
     Returns:
         str: JSON with logs, total, offset, limit, and next_cursor
@@ -2978,14 +2796,14 @@ async def blueteam_wazuh_manager_logs(params: WazuhLogsInput) -> str:
         return json.dumps({"error": f"log_type must be one of: {valid}"})
 
     offset = 0
-    if params.cursor:
-        decoded = _decode_cursor(params.cursor)
+    if cursor:
+        decoded = _decode_cursor(cursor)
         if decoded:
             offset = decoded.get("offset", 0)
 
     # Wazuh Manager API hard-caps limit at 500 — values > 500 return 400.
     # Auto-cap here so LLM clients pass large values without triggering API errors.
-    wazuh_safe_limit = min(params.limit, 500)
+    wazuh_safe_limit = min(limit, 500)
     api_params = {"offset": str(offset), "limit": str(wazuh_safe_limit), "pretty": "true"}
     tag = _WAZUH_LOG_TAG.get(params.log_type)
     if tag:
@@ -3008,7 +2826,7 @@ async def blueteam_wazuh_manager_logs(params: WazuhLogsInput) -> str:
         "logs": items,
         "total": total,
         "offset": offset,
-        "limit": params.limit,
+        "limit": limit,
         "next_cursor": next_cursor,
     }, indent=2))
 
@@ -3018,34 +2836,20 @@ _WAZUH_ALERTS_PATH = "/var/ossec/logs/alerts/alerts.json"
 _WAZUH_ALERTS_MAX_LINES = 2000  # safety cap
 
 
-class WazuhAlertsInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    agent_name: Optional[str] = Field(default=None, max_length=64, description="Filter by agent name (e.g. HYDRA-DC)")
-    srcip: Optional[str] = Field(default=None, max_length=45, description="Source IP filter (e.g. '180.254.78.145')")
-    since: Optional[str] = Field(default=None, max_length=30, description="ISO 8601 or relative time ('24h', '1h', '7d', etc.)")
-    until: Optional[str] = Field(default=None, max_length=30, description="ISO 8601 or relative end time")
-    limit: int = Field(default=500, description="Max alerts per page", ge=1, le=2000)
-    cursor: Optional[str] = Field(
-        default=None,
-        description="Pagination cursor from previous response (next_cursor). Omit for first page.",
-    )
-    bypass_redaction: bool = Field(default=False, description="When true, return raw alert data without PII masking. Overrides BLUETEAM_REDACT_PII for this call only — use for internal audit investigations.")
-
-
 @mcp.tool(
     name="blueteam_wazuh_alerts",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
 )
-async def blueteam_wazuh_alerts(params: WazuhAlertsInput) -> str:
+async def blueteam_wazuh_alerts(agent_name: Optional[str] = None, srcip: Optional[str] = None, since: Optional[str] = None, until: Optional[str] = None, limit: int = 500, cursor: Optional[str] = None, bypass_redaction: bool = False) -> str:
     """Read Wazuh security alerts — local alerts.json first, auto-fallback to Indexer.
     When /var/ossec/logs/alerts/alerts.json is available (MCP on Wazuh Manager host),
     reads directly from the file. When the file is absent (remote Wazuh Manager),
     automatically delegates to the Wazuh Indexer (OpenSearch) — no tool switch needed.
 
     Args:
-        params.agent_name: Optional filter by agent name (e.g. HYDRA-DC)
-        params.limit: Max alerts per page (default 100, max 2000)
-        params.cursor: next_cursor from previous response (omit for first page)
+        agent_name: Optional filter by agent name (e.g. HYDRA-DC)
+        limit: Max alerts per page (default 100, max 2000)
+        cursor: next_cursor from previous response (omit for first page)
 
     Returns:
         str: JSON with alerts, count, next_cursor, and source field ("local" or "wazuh-indexer")
@@ -3071,8 +2875,8 @@ async def blueteam_wazuh_alerts(params: WazuhAlertsInput) -> str:
 
         # Decode cursor — handle both indexer search_after and legacy scanned formats
         search_after: Optional[list] = None
-        if params.cursor:
-            decoded = _decode_cursor(params.cursor)
+        if cursor:
+            decoded = _decode_cursor(cursor)
             if decoded:
                 search_after = decoded.get("search_after") or decoded.get("scanned")
                 # "scanned" is a legacy integer — discard it; search_after needs an array
@@ -3081,12 +2885,12 @@ async def blueteam_wazuh_alerts(params: WazuhAlertsInput) -> str:
 
         data = await _wazuh_indexer_search(
             index_pattern="wazuh-alerts-*",
-            agent_name=params.agent_name,
-            size=params.limit,
+            agent_name=agent_name,
+            size=limit,
             search_after=search_after,
-            srcip=params.srcip,
-            since=params.since,
-            until=params.until,
+            srcip=srcip,
+            since=since,
+            until=until,
         )
         if isinstance(data.get("error"), str):
             return json.dumps(data, indent=2)
@@ -3100,7 +2904,7 @@ async def blueteam_wazuh_alerts(params: WazuhAlertsInput) -> str:
         # Build next_cursor from last document's sort values
         next_cursor = None
         hit_list = hits.get("hits", [])
-        if hit_list and len(docs) >= params.limit:
+        if hit_list and len(docs) >= limit:
             last_sort = hit_list[-1].get("sort")
             if last_sort:
                 next_cursor = _encode_cursor({"search_after": last_sort})
@@ -3109,34 +2913,34 @@ async def blueteam_wazuh_alerts(params: WazuhAlertsInput) -> str:
             "source": "wazuh-indexer",  # signals auto-fallback to the LLM
             "total": {"value": total_val, "relation": total_relation},
             "count": len(docs),
-            "limit": params.limit,
+            "limit": limit,
             "next_cursor": next_cursor,
-            "alerts": _redact_alert_data(docs, bypass=params.bypass_redaction),
+            "alerts": _redact_alert_data(docs, bypass=bypass_redaction),
         }, indent=2))
 
     # Decode cursor to find how many lines were already scanned
     skip_lines = 0
-    if params.cursor:
-        decoded = _decode_cursor(params.cursor)
+    if cursor:
+        decoded = _decode_cursor(cursor)
         if decoded:
             skip_lines = decoded.get("scanned", 0)
 
     # Read from tail — fetch enough lines to cover skip + limit with filtering overhead
-    page_size = min((skip_lines + params.limit) * 3, _WAZUH_ALERTS_MAX_LINES)
+    page_size = min((skip_lines + limit) * 3, _WAZUH_ALERTS_MAX_LINES)
     r = await _run_async(["tail", "-n", str(page_size), _WAZUH_ALERTS_PATH])
     if r.get("returncode", 0) != 0:
         return json.dumps({"error": "Failed to read alerts", "stderr": r.get("stderr", "")})
 
     alerts = []
-    agent_filter = (params.agent_name or "").strip()
-    ip_filter = (params.srcip or "").strip()
+    agent_filter = (agent_name or "").strip()
+    ip_filter = (srcip or "").strip()
     scanned = 0
     for line in (r.get("stdout") or "").strip().splitlines():
         scanned += 1
         # Skip already-returned lines
         if scanned <= skip_lines:
             continue
-        if len(alerts) >= params.limit:
+        if len(alerts) >= limit:
             break
         line = line.strip()
         if not line:
@@ -3165,7 +2969,7 @@ async def blueteam_wazuh_alerts(params: WazuhAlertsInput) -> str:
         except json.JSONDecodeError:
             continue
 
-    next_cursor = _encode_cursor({"scanned": scanned}) if len(alerts) >= params.limit else None
+    next_cursor = _encode_cursor({"scanned": scanned}) if len(alerts) >= limit else None
 
     return _truncate_if_needed(json.dumps({
         "source": "local",
@@ -3253,6 +3057,7 @@ def _validate_rule_groups_field(v: Optional[str]) -> Optional[str]:
 ValidKeyword = Annotated[Optional[str], AfterValidator(_validate_keyword_field)]
 ValidAgentName = Annotated[Optional[str], AfterValidator(_validate_agent_name_field)]
 ValidRuleGroups = Annotated[Optional[str], AfterValidator(_validate_rule_groups_field)]
+ValidPublicIp = Annotated[str, AfterValidator(_validate_public_ip)]
 
 
 class WazuhIndexerSearchInput(BaseModel):
@@ -3302,8 +3107,8 @@ class WazuhIndexerSearchInput(BaseModel):
     )
     index_type: str = Field(default="alerts", validation_alias=AliasChoices("index", "type"), description="Index: alerts, events, or vulnerabilities")
     limit: int = Field(default=500, validation_alias=AliasChoices("size", "count", "max"), description="Max docs to return per page (0 = count-only, no documents)", ge=0, le=10000)
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.JSON,
+    response_format: Literal["markdown", "json"] = Field(
+        default="json",
         validation_alias=AliasChoices("format", "output"),
         description="'json' for structured data with documents/cursor/total, "
                     "'markdown' for a compact summary table of results.",
@@ -3610,14 +3415,14 @@ async def _wazuh_indexer_search_full_scan(
     async def _fetch_page(ps: int, sa):
         return await _wazuh_indexer_search(
             index_pattern=index_pattern,
-            agent_name=params.agent_name,
+            agent_name=agent_name,
             size=ps,
             search_after=sa,
-            srcip=params.srcip,
-            since=params.since,
-            until=params.until,
+            srcip=srcip,
+            since=since,
+            until=until,
             keyword=params.keyword,
-            srcips=params.srcips,
+            srcips=srcips,
             fields=params.fields,
             rule_groups=params.rule_groups,
         )
@@ -3657,9 +3462,9 @@ async def _wazuh_indexer_search_full_scan(
 
     # Forensic mode: collect all docs from paginator output
     if forensic_mode:
-        all_docs = _redact_alert_data(all_docs, bypass=params.bypass_redaction)
-    sample_docs = _redact_alert_data(sample_docs, bypass=params.bypass_redaction)
-    if params.response_format == ResponseFormat.JSON:
+        all_docs = _redact_alert_data(all_docs, bypass=bypass_redaction)
+    sample_docs = _redact_alert_data(sample_docs, bypass=bypass_redaction)
+    if response_format == "json":
         output: dict = {
             "mode": "full_scan",
             "index": params.index_type,
@@ -3684,10 +3489,10 @@ async def _wazuh_indexer_search_full_scan(
             output["document_count"] = len(all_docs)
         else:
             output["sample_documents"] = sample_docs
-        if params.since:
-            output["since"] = params.since
-        if params.until:
-            output["until"] = params.until
+        if since:
+            output["since"] = since
+        if until:
+            output["until"] = until
         return _truncate_if_needed(
             json.dumps(output, indent=2, ensure_ascii=False),
             bypass=params.bypass_character_limit,
@@ -3706,8 +3511,8 @@ async def _wazuh_indexer_search_full_scan(
     if forensic_mode:
         lines.append(f"**Mode**: FORENSIC (all {len(all_docs):,} documents returned)")
     lines.append(f"**Index**: {params.index_type} | **Timezone**: UTC")
-    if params.since or params.until:
-        window_str = f"{params.since or '...'} → {params.until or '...'}"
+    if since or until:
+        window_str = f"{since or '...'} → {until or '...'}"
         lines.append(f"**Window**: {window_str}")
     lines.append("")
 
@@ -3784,16 +3589,16 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhI
       ``bypass_character_limit=True`` to avoid the 100K-character response cap.
 
     Args:
-        params.agent_name: Optional agent name filter (e.g. HYDRA-DC)
-        params.srcip: Optional single source IP filter (e.g. '180.254.78.145')
-        params.srcips: Optional list of source IPs to match ANY of (max 25)
+        agent_name: Optional agent name filter (e.g. HYDRA-DC)
+        srcip: Optional single source IP filter (e.g. '180.254.78.145')
+        srcips: Optional list of source IPs to match ANY of (max 25)
                        (e.g. ['114.10.116.20', '51.159.125.199'])
         params.keyword: Optional free-text keyword search (e.g. 'gambling OR "brute force"')
-        params.since: Optional ISO 8601 start time in UTC (e.g. '2026-07-05T18:30:00Z')
-        params.until: Optional ISO 8601 end time in UTC (e.g. '2026-07-05T19:00:00Z')
+        since: Optional ISO 8601 start time in UTC (e.g. '2026-07-05T18:30:00Z')
+        until: Optional ISO 8601 end time in UTC (e.g. '2026-07-05T19:00:00Z')
         params.index_type: alerts (default), events, or vulnerabilities
-        params.limit: Max documents per page in single-page mode (default 500, max 10000)
-        params.cursor: next_cursor from previous response (omit for first page)
+        limit: Max documents per page in single-page mode (default 500, max 10000)
+        cursor: next_cursor from previous response (omit for first page)
         params.max_scanned: When set, run full-scan auto-pagination (max 1,000,000)
         params.include_all_docs: When True, return all documents in full-scan mode
         params.bypass_character_limit: When True, skip 100K-char response cap
@@ -3810,8 +3615,8 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhI
 
     # Decode pagination cursor — search_after uses sort-key values, not numeric offsets
     search_after: Optional[list] = None
-    if params.cursor:
-        decoded = _decode_cursor(params.cursor)
+    if cursor:
+        decoded = _decode_cursor(cursor)
         if decoded:
             search_after = decoded.get("search_after")
 
@@ -3823,14 +3628,14 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhI
 
     data = await _wazuh_indexer_search(
         index_pattern=index_pattern,
-        agent_name=params.agent_name,
-        size=params.limit,
+        agent_name=agent_name,
+        size=limit,
         search_after=search_after,
-        srcip=params.srcip,
-        since=params.since,
-        until=params.until,
+        srcip=srcip,
+        since=since,
+        until=until,
         keyword=params.keyword,
-        srcips=params.srcips,
+        srcips=srcips,
         fields=params.fields,
         rule_groups=params.rule_groups,
     )
@@ -3845,7 +3650,7 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhI
     # Build next cursor from the last document's sort values
     next_cursor = None
     hit_list = hits.get("hits", [])
-    if hit_list and len(docs) >= params.limit:
+    if hit_list and len(docs) >= limit:
         last_sort = hit_list[-1].get("sort")
         if last_sort:
             next_cursor = _encode_cursor({"search_after": last_sort})
@@ -3853,7 +3658,7 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhI
     meta: dict = {
         "total": {"value": total_val, "relation": total_relation},
         "count": len(docs),
-        "size": params.limit,
+        "size": limit,
         "next_cursor": next_cursor,
         "timezone": "UTC",
         "documents": docs,
@@ -3863,13 +3668,13 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhI
     if data.get("applied_size") is not None:
         meta["applied_size"] = data["applied_size"]
         meta["requested_size"] = data["requested_size"]
-    if params.since:
-        meta["since"] = params.since
-    if params.until:
-        meta["until"] = params.until
+    if since:
+        meta["since"] = since
+    if until:
+        meta["until"] = until
 
-    if params.response_format == ResponseFormat.JSON:
-        meta["documents"] = _redact_alert_data(meta["documents"], bypass=params.bypass_redaction)
+    if response_format == "json":
+        meta["documents"] = _redact_alert_data(meta["documents"], bypass=bypass_redaction)
         return _truncate_if_needed(
             json.dumps(meta, indent=2),
             bypass=params.bypass_character_limit,
@@ -3879,11 +3684,11 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhI
     lines = [
         f"# Wazuh Indexer Search Results",
         f"",
-        f"**Total**: {total_val} ({total_relation}) | **Returned**: {len(docs)} | **Page size**: {params.limit}",
+        f"**Total**: {total_val} ({total_relation}) | **Returned**: {len(docs)} | **Page size**: {limit}",
         f"**Index**: {params.index_type} | **Timezone**: UTC",
     ]
-    if params.since or params.until:
-        window = f"{params.since or '...'} → {params.until or '...'}"
+    if since or until:
+        window = f"{since or '...'} → {until or '...'}"
         lines.append(f"**Window**: {window}")
     if next_cursor:
         lines.append(f"**Cursor**: `{next_cursor[:40]}...` (more pages available)")
@@ -3975,8 +3780,8 @@ class WazuhEmailLookupInput(BaseModel):
         ge=1000,
         le=200000,
     )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown",
         description="'markdown' for human-readable report, 'json' for structured data.",
     )
     keyword: ValidKeyword = Field(
@@ -4012,13 +3817,13 @@ async def wazuh_email_lookup(params: WazuhEmailLookupInput) -> str:
     is exhausted or ``max_scanned`` documents have been processed.
 
     Args:
-        params.agent_name: Optional agent to filter (e.g. 'mailbox-new')
-        params.since: ISO 8601 start (default: 365 days ago)
-        params.until: ISO 8601 end (default: now)
+        agent_name: Optional agent to filter (e.g. 'mailbox-new')
+        since: ISO 8601 start (default: 365 days ago)
+        until: ISO 8601 end (default: now)
         params.top_n: How many top emails to return (1-500, default 100)
         params.rule_groups: Comma-separated groups filter
         params.max_scanned: Hard cap on documents scanned (1000-200000, default 50000)
-        params.response_format: 'markdown' or 'json'
+        response_format: 'markdown' or 'json'
 
     Returns:
         str: Ranked table of email addresses with counts, unique IPs,
@@ -4028,8 +3833,8 @@ async def wazuh_email_lookup(params: WazuhEmailLookupInput) -> str:
         - "Find the top 100 most compromised email addresses in the last year"
         - "Show me the most targeted mailboxes on agent mailbox-new"
     """
-    _audit_log("wazuh_email_lookup", {"since": params.since})
-    since_str, until_str = _parse_time_window(params.since, params.until)
+    _audit_log("wazuh_email_lookup", {"since": since})
+    since_str, until_str = _parse_time_window(since, until)
 
     rule_group_list: Optional[list[str]] = None
     if params.rule_groups:
@@ -4048,7 +3853,7 @@ async def wazuh_email_lookup(params: WazuhEmailLookupInput) -> str:
     try:
         while total_scanned < params.max_scanned:
             data = await _wazuh_indexer_email_search(
-                agent_name=params.agent_name,
+                agent_name=agent_name,
                 size=page_size,
                 search_after=search_after,
                 since=since_str,
@@ -4103,7 +3908,7 @@ async def wazuh_email_lookup(params: WazuhEmailLookupInput) -> str:
             else:
                 break
 
-    except (httpx.HTTPStatusError, httpx.TimeoutException, CircuitBreakerOpenError, RuntimeError) as e:
+    except (httpx.HTTPStatusError, httpx.TimeoutException, RuntimeError) as e:
         if total_scanned == 0:
             return _handle_api_error(e, context="wazuh_email_lookup")
         # Partial results on transient error during pagination
@@ -4126,7 +3931,7 @@ async def wazuh_email_lookup(params: WazuhEmailLookupInput) -> str:
     )
     high_freq = sum(1 for _, c in email_counter.items() if c >= 10)
 
-    if params.response_format == ResponseFormat.JSON:
+    if response_format == "json":
         results = []
         for email, count in top_emails:
             results.append({
@@ -4150,7 +3955,7 @@ async def wazuh_email_lookup(params: WazuhEmailLookupInput) -> str:
                 "emails_with_10plus_appearances": high_freq,
             },
             "query": {
-                "agent_name": params.agent_name,
+                "agent_name": agent_name,
                 "rule_groups": params.rule_groups,
                 "since": since_str,
                 "until": until_str,
@@ -4166,7 +3971,7 @@ async def wazuh_email_lookup(params: WazuhEmailLookupInput) -> str:
         f"**Time window**: {since_str} to {until_str}",
         f"**Documents scanned**: {total_scanned:,}",
         f"**Unique emails found**: {total_unique:,}",
-        f"**Agent**: {params.agent_name or 'all agents'}",
+        f"**Agent**: {agent_name or 'all agents'}",
         f"**Rule groups**: {params.rule_groups or 'all'}",
         "",
         "## Top Email Addresses",
@@ -4207,17 +4012,17 @@ class WazuhDomainLookupInput(BaseModel):
     agent_name: ValidAgentName = Field(
         default=None,
         max_length=64,
-        description="Optional agent name filter.",
+        description=_AGENT_NAME_DESC,
     )
     since: Optional[str] = Field(
         default=None,
         max_length=30,
-        description="ISO 8601 start time in UTC. Defaults to 365 days ago.",
+        description=_SINCE_DESC,
     )
     until: Optional[str] = Field(
         default=None,
         max_length=30,
-        description="ISO 8601 end time in UTC. Defaults to now.",
+        description=_UNTIL_DESC,
     )
     limit: int = Field(
         default=500,
@@ -4235,8 +4040,8 @@ class WazuhDomainLookupInput(BaseModel):
         default=None,
         description="Pagination cursor from previous response (next_cursor).",
     )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown",
         description="'markdown' for human-readable summary, 'json' for structured data.",
     )
     keyword: ValidKeyword = Field(
@@ -4290,8 +4095,8 @@ async def _wazuh_domain_lookup_full_scan(
 
     async def _fetch_page(ps: int, sa):
         return await _wazuh_indexer_domain_search(
-            domain=params.domain,
-            agent_name=params.agent_name,
+            domain=domain,
+            agent_name=agent_name,
             size=ps,
             search_after=sa,
             since=since_str,
@@ -4336,9 +4141,9 @@ async def _wazuh_domain_lookup_full_scan(
         + ("+" if global_total_relation == "gte" else "")
     )
 
-    if params.response_format == ResponseFormat.JSON:
+    if response_format == "json":
         output = {
-            "domain": params.domain,
+            "domain": domain,
             "mode": "full_scan",
             "total": {"value": global_total_val, "relation": global_total_relation},
             "scanned": total_scanned,
@@ -4347,7 +4152,7 @@ async def _wazuh_domain_lookup_full_scan(
             "timezone": "UTC",
             "since": since_str,
             "until": until_str,
-            "agent": params.agent_name or "all agents",
+            "agent": agent_name or "all agents",
             "aggregations": {
                 "top_srcips": [
                     {"ip": ip, "count": c}
@@ -4368,7 +4173,7 @@ async def _wazuh_domain_lookup_full_scan(
 
     #Markdown output
     lines: list[str] = [
-        f"#Wazuh Domain Lookup - {params.domain} (Full Scan)",
+        f"#Wazuh Domain Lookup - {domain} (Full Scan)",
         "",
         f"**Total matches in indexer**: {total_display}",
         f"**Scanned**: {total_scanned:,} docs across {pages} page(s)",
@@ -4376,7 +4181,7 @@ async def _wazuh_domain_lookup_full_scan(
         + ("(all matching alerts retrieved)" if coverage == "complete"
            else f"(hit max_scanned={params.max_scanned:,} limit)"),
         f"**Time window**: {since_str} to {until_str}",
-        f"**Agent**: {params.agent_name or 'all agents'}",
+        f"**Agent**: {agent_name or 'all agents'}",
         "",
     ]
 
@@ -4425,7 +4230,7 @@ async def _wazuh_domain_lookup_full_scan(
 
     if coverage != "complete":
         lines.append(
-            f"---\n**Note:** Results are partial — scan hit the "
+            f"\n**Note:** Results are partial — scan hit the "
             f"`max_scanned={params.max_scanned:,}` limit. "
             f"Increase `max_scanned` (up to 500,000) for full coverage."
         )
@@ -4460,14 +4265,14 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
       exhausted or the ceiling is hit.
 
     Args:
-        params.domain: Domain to search for (e.g. 'tangerangkota.go.id')
-        params.agent_name: Optional agent filter
-        params.since: ISO 8601 start in UTC (default: 365 days ago)
-        params.until: ISO 8601 end in UTC (default: now)
-        params.limit: Max alerts per page in single-page mode (1-10000, default 500)
+        domain: Domain to search for (e.g. 'tangerangkota.go.id')
+        agent_name: Optional agent filter
+        since: ISO 8601 start in UTC (default: 365 days ago)
+        until: ISO 8601 end in UTC (default: now)
+        limit: Max alerts per page in single-page mode (1-10000, default 500)
         params.include_full_log: Include raw log lines (default false — forced false in full-scan mode)
-        params.cursor: Pagination cursor from previous response
-        params.response_format: 'markdown' or 'json'
+        cursor: Pagination cursor from previous response
+        response_format: 'markdown' or 'json'
         params.max_scanned: When set, run full-scan auto-pagination (see above)
         params.keyword: Free-text keyword to further narrow results
 
@@ -4479,12 +4284,12 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
         - "Get the complete picture for this domain over the past 12h — use full-scan"
         - "Show me who's hitting the mail server domain"
     """
-    _audit_log("wazuh_domain_lookup", {"domain": params.domain, "since": params.since})
-    since_str, until_str = _parse_time_window(params.since, params.until)
+    _audit_log("wazuh_domain_lookup", {"domain": domain, "since": since})
+    since_str, until_str = _parse_time_window(since, until)
 
     search_after: Optional[list] = None
-    if params.cursor:
-        decoded = _decode_cursor(params.cursor)
+    if cursor:
+        decoded = _decode_cursor(cursor)
         if decoded:
             search_after = decoded.get("search_after")
 
@@ -4496,16 +4301,16 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
 
     try:
         data = await _wazuh_indexer_domain_search(
-            domain=params.domain,
-            agent_name=params.agent_name,
-            size=params.limit,
+            domain=domain,
+            agent_name=agent_name,
+            size=limit,
             search_after=search_after,
             since=since_str,
             until=until_str,
             include_full_log=params.include_full_log,
             keyword=params.keyword,
         )
-    except (httpx.HTTPStatusError, httpx.TimeoutException, CircuitBreakerOpenError, RuntimeError) as e:
+    except (httpx.HTTPStatusError, httpx.TimeoutException, RuntimeError) as e:
         return _handle_api_error(e, context="wazuh_domain_lookup")
 
     if isinstance(data.get("error"), str):
@@ -4521,7 +4326,7 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
 
     # Build next cursor
     next_cursor = None
-    if hit_list and len(docs) >= params.limit:
+    if hit_list and len(docs) >= limit:
         last_sort = hit_list[-1].get("sort")
         if last_sort:
             next_cursor = _encode_cursor({"search_after": last_sort})
@@ -4542,12 +4347,12 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
         if rule_id:
             rule_counter[f"{rule_id}: {rule_desc}"] += 1
 
-    if params.response_format == ResponseFormat.JSON:
+    if response_format == "json":
         output = {
-            "domain": params.domain,
+            "domain": domain,
             "total": {"value": total_val, "relation": total_relation},
             "count": len(docs),
-            "size": params.limit,
+            "size": limit,
             "next_cursor": next_cursor,
             "timezone": "UTC",
             "since": since_str,
@@ -4571,12 +4376,12 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
     total_display = f"{total_val:,}" + ("+" if total_relation == "gte" else "")
     page_info = f"Page ({len(docs)} of {total_display})"
     lines: list[str] = [
-        f"# Wazuh Domain Lookup — {params.domain}",
+        f"# Wazuh Domain Lookup — {domain}",
         "",
         f"**Total matches**: {total_display}",
         f"**{page_info}**",
         f"**Time window**: {since_str} to {until_str}",
-        f"**Agent**: {params.agent_name or 'all agents'}",
+        f"**Agent**: {agent_name or 'all agents'}",
         "",
         "## Alerts",
         "",
@@ -4631,17 +4436,17 @@ class WazuhCompromisedEmailsAnalysisInput(BaseModel):
     agent_name: ValidAgentName = Field(
         default=None,
         max_length=64,
-        description="Optional agent name filter.",
+        description=_AGENT_NAME_DESC,
     )
     since: Optional[str] = Field(
         default=None,
         max_length=30,
-        description="ISO 8601 start time in UTC. Defaults to 365 days ago.",
+        description=_SINCE_DESC,
     )
     until: Optional[str] = Field(
         default=None,
         max_length=30,
-        description="ISO 8601 end time in UTC. Defaults to now.",
+        description=_UNTIL_DESC,
     )
     top_ips: int = Field(
         default=20,
@@ -4660,9 +4465,9 @@ class WazuhCompromisedEmailsAnalysisInput(BaseModel):
         description="Free-text keyword search to further narrow results. "
                     "Same syntax as blueteam_wazuh_indexer_search.",
     )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="'markdown' for human-readable, 'json' for structured.",
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown",
+        description="_RESPONSE_FORMAT_DESC",
     )
 
     @field_validator("emails")
@@ -4708,12 +4513,12 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
 
     Args:
         params.emails: List of email addresses to analyze (1-50)
-        params.agent_name: Optional agent filter
-        params.since: ISO 8601 start (default: 365 days ago)
-        params.until: ISO 8601 end (default: now)
+        agent_name: Optional agent filter
+        since: ISO 8601 start (default: 365 days ago)
+        until: ISO 8601 end (default: now)
         params.top_ips: Number of top attacker IPs to rank (1-100, default 20)
         params.enrich_with_netra: Query Netra for top IPs (default false)
-        params.response_format: 'markdown' or 'json'
+        response_format: 'markdown' or 'json'
 
     Returns:
         str: Ranked attacker IP list with targeted email counts, plus per-email
@@ -4724,8 +4529,8 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
         - "Take the top 5 emails from the lookup and find who's attacking them"
         - "Enrich the attacker IPs for these compromised accounts through Netra"
     """
-    _audit_log("wazuh_compromised_emails_analysis", {"top_ips": params.top_ips, "since": params.since})
-    since_str, until_str = _parse_time_window(params.since, params.until)
+    _audit_log("wazuh_compromised_emails_analysis", {"top_ips": params.top_ips, "since": since})
+    since_str, until_str = _parse_time_window(since, until)
 
     ip_counter: Counter[str] = Counter()
     ip_to_emails: dict[str, set[str]] = {}  # IP -> set of targeted emails
@@ -4746,7 +4551,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
             while batch_scanned < max_batch_scanned:
                 data = await _wazuh_indexer_multi_email_search(
                     emails=batch,
-                    agent_name=params.agent_name,
+                    agent_name=agent_name,
                     size=page_size,
                     search_after=search_after,
                     since=since_str,
@@ -4791,7 +4596,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
                 else:
                     break
 
-    except (httpx.HTTPStatusError, httpx.TimeoutException, CircuitBreakerOpenError, RuntimeError) as e:
+    except (httpx.HTTPStatusError, httpx.TimeoutException, RuntimeError) as e:
         if total_scanned == 0:
             return _handle_api_error(e, context="wazuh_compromised_emails_analysis")
         logging.getLogger(__name__).warning(
@@ -4833,7 +4638,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
             except (httpx.HTTPStatusError, httpx.TimeoutException, Exception) as e:
                 netra_results[ip] = {"error": str(e)}
 
-    if params.response_format == ResponseFormat.JSON:
+    if response_format == "json":
         attacker_ips = []
         for ip, count in top_ips:
             entry: dict = {
@@ -4873,7 +4678,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
         "",
         f"**Time window**: {since_str} to {until_str}",
         f"**Emails analyzed**: {len(params.emails)}",
-        f"**Agent**: {params.agent_name or 'all agents'}",
+        f"**Agent**: {agent_name or 'all agents'}",
         f"**Alerts scanned**: {total_scanned:,}",
         "",
         "## Top Attacker IPs",
@@ -5018,7 +4823,7 @@ class WazuhAlertTimelineInput(BaseModel):
     agent_name: ValidAgentName = Field(
         default=None,
         max_length=64,
-        description="Optional agent name filter.",
+        description=_AGENT_NAME_DESC,
     )
     rule_groups: ValidRuleGroups = Field(
         default=None,
@@ -5038,8 +4843,8 @@ class WazuhAlertTimelineInput(BaseModel):
                     "blueteam_wazuh_indexer_search — supports +term, -term, OR, *wildcard*, "
                     '\"exact phrase\". Example: \'gambling OR "brute force"\'',
     )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown",
         description="'markdown' for human-readable timeline, 'json' for structured bucket data.",
     )
 
@@ -5079,15 +4884,15 @@ async def wazuh_alert_timeline(params: WazuhAlertTimelineInput) -> str:
     - Top rules, top source IPs, and top agents within that bucket
 
     Args:
-        params.since: Start of time window (default '1h').  Accepts ISO 8601 or relative
+        since: Start of time window (default '1h').  Accepts ISO 8601 or relative
                      expressions ('5m', '1h', '24h', '7d', '30d').
-        params.until: End of time window.  Defaults to now.
+        until: End of time window.  Defaults to now.
         params.bucket: Bucket size — '1m', '5m', '15m', '1h', '6h', '1d', or 'auto'.
-        params.agent_name: Optional agent filter.
+        agent_name: Optional agent filter.
         params.rule_groups: Optional comma-separated rule groups filter.
         params.rule_level_min: Only count alerts at or above this severity.
         params.keyword: Optional free-text keyword filter (e.g. 'gambling OR "brute force"').
-        params.response_format: 'markdown' or 'json'.
+        response_format: 'markdown' or 'json'.
 
     Returns:
         str: Timeline table with per-bucket counts, severity bands, and top indicators.
@@ -5097,8 +4902,8 @@ async def wazuh_alert_timeline(params: WazuhAlertTimelineInput) -> str:
         - "Break down yesterday's brute force alerts by 15-minute intervals"
         - "What's the attack volume trend over the last 7 days?"
     """
-    _audit_log("wazuh_alert_timeline", {"since": params.since, "bucket": params.bucket})
-    since_str, until_str = _parse_time_window(params.since, params.until)
+    _audit_log("wazuh_alert_timeline", {"since": since, "bucket": params.bucket})
+    since_str, until_str = _parse_time_window(since, until)
 
     # Determine bucket interval
     if params.bucket == "auto":
@@ -5116,12 +4921,12 @@ async def wazuh_alert_timeline(params: WazuhAlertTimelineInput) -> str:
             bucket_interval=bucket_interval,
             since=since_str,
             until=until_str,
-            agent_name=params.agent_name,
+            agent_name=agent_name,
             rule_groups=rule_group_list,
             rule_level_min=params.rule_level_min,
             keyword=params.keyword,
         )
-    except (httpx.HTTPStatusError, httpx.TimeoutException, CircuitBreakerOpenError, RuntimeError) as e:
+    except (httpx.HTTPStatusError, httpx.TimeoutException, RuntimeError) as e:
         return _handle_api_error(e, context="wazuh_alert_timeline")
 
     if isinstance(data.get("error"), str):
@@ -5141,7 +4946,7 @@ async def wazuh_alert_timeline(params: WazuhAlertTimelineInput) -> str:
 
     total_alerts = sum(b.get("doc_count", 0) for b in buckets)
 
-    if params.response_format == ResponseFormat.JSON:
+    if response_format == "json":
         return _truncate_if_needed(json.dumps({
             "window": {"since": since_str, "until": until_str},
             "bucket_interval": bucket_interval,
@@ -5240,9 +5045,9 @@ async def wazuh_alert_timeline(params: WazuhAlertTimelineInput) -> str:
         f"- High (≥10): {all_high:,} ({all_high / max(total_alerts, 1) * 100:.0f}%)",
         "",
         "## Query Parameters",
-        f"- Since: `{params.since}`",
+        f"- Since: `{since}`",
         f"- Bucket: `{bucket_interval}`",
-        f"- Agent: {params.agent_name or 'all'}",
+        f"- Agent: {agent_name or 'all'}",
         f"- Rule groups: {params.rule_groups or 'all'}",
         f"- Min level: {params.rule_level_min or 'none'}",
     ])
@@ -5262,7 +5067,7 @@ class WazuhAttackVelocityInput(BaseModel):
     agent_name: ValidAgentName = Field(
         default=None,
         max_length=64,
-        description="Optional agent name filter.",
+        description=_AGENT_NAME_DESC,
     )
     rule_groups: ValidRuleGroups = Field(
         default=None,
@@ -5280,9 +5085,9 @@ class WazuhAttackVelocityInput(BaseModel):
         description="Free-text keyword search to narrow the analysis. Same syntax as "
                     "blueteam_wazuh_indexer_search.",
     )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="'markdown' for human-readable, 'json' for structured.",
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown",
+        description="_RESPONSE_FORMAT_DESC",
     )
 
 
@@ -5319,11 +5124,11 @@ async def wazuh_attack_velocity(params: WazuhAttackVelocityInput = WazuhAttackVe
     Args:
         params.window: Window size — relative expression like '15m', '1h', '6h', '24h'.
                       '1h' compares the last hour against the hour before it.
-        params.agent_name: Optional agent filter.
+        agent_name: Optional agent filter.
         params.rule_groups: Optional comma-separated rule groups filter.
         params.bucket: Bucket granularity within each window. 'auto' picks based on
                       window size.
-        params.response_format: 'markdown' or 'json'.
+        response_format: 'markdown' or 'json'.
 
     Returns:
         str: Velocity report with trend classification, per-bucket comparison table,
@@ -5367,7 +5172,7 @@ async def wazuh_attack_velocity(params: WazuhAttackVelocityInput = WazuhAttackVe
                 bucket_interval=bucket_interval,
                 since=current_since,
                 until=current_until,
-                agent_name=params.agent_name,
+                agent_name=agent_name,
                 rule_groups=rule_group_list,
                 keyword=params.keyword,
             ),
@@ -5375,12 +5180,12 @@ async def wazuh_attack_velocity(params: WazuhAttackVelocityInput = WazuhAttackVe
                 bucket_interval=bucket_interval,
                 since=previous_since,
                 until=previous_until,
-                agent_name=params.agent_name,
+                agent_name=agent_name,
                 rule_groups=rule_group_list,
                 keyword=params.keyword,
             ),
         )
-    except (httpx.HTTPStatusError, httpx.TimeoutException, CircuitBreakerOpenError, RuntimeError) as e:
+    except (httpx.HTTPStatusError, httpx.TimeoutException, RuntimeError) as e:
         return _handle_api_error(e, context="wazuh_attack_velocity")
 
     if isinstance(current_data.get("error"), str):
@@ -5437,7 +5242,7 @@ async def wazuh_attack_velocity(params: WazuhAttackVelocityInput = WazuhAttackVe
             "trend": d_trend,
         })
 
-    if params.response_format == ResponseFormat.JSON:
+    if response_format == "json":
         output = {
             "velocity_pct": round(velocity_pct, 1),
             "trend": trend,
@@ -5493,7 +5298,7 @@ async def wazuh_attack_velocity(params: WazuhAttackVelocityInput = WazuhAttackVe
         "## Query Parameters",
         f"- Window: `{params.window}`",
         f"- Bucket: `{bucket_interval}`",
-        f"- Agent: {params.agent_name or 'all'}",
+        f"- Agent: {agent_name or 'all'}",
         f"- Rule groups: {params.rule_groups or 'all'}",
     ])
 
@@ -5504,39 +5309,23 @@ async def wazuh_attack_velocity(params: WazuhAttackVelocityInput = WazuhAttackVe
 _IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
 _IPV6_RE = re.compile(r"^[\da-fA-F:]+$")
 
-class IPInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    ip: str = Field(..., max_length=45, description="IPv4 or IPv6 address to look up")
-    max_age_days: int = Field(default=90, description="Only return reports from the last N days", ge=1, le=365)
-    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN, description="Output format: 'markdown' (default) or 'json'")
-
-    @field_validator("ip")
-    @classmethod
-    def validate_ip(cls, v: str) -> str:
-        if not v or len(v) > 45:
-            raise ValueError("Invalid IP format or length")
-        if _IPV4_RE.match(v) or _IPV6_RE.match(v):
-            return _validate_public_ip(v)
-        raise ValueError("Invalid IP format")
-
-
 @mcp.tool(
     name="blueteam_lookup_ip_abuseipdb",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
-async def blueteam_lookup_ip_abuseipdb(params: IPInput) -> str:
+async def blueteam_lookup_ip_abuseipdb(ip: ValidPublicIp, max_age_days: int = 90, response_format: Literal["markdown", "json"] = "markdown") -> str:
     """Check an IP address against AbuseIPDB for known malicious activity reports.
     Requires ABUSEIPDB_API_KEY environment variable.
 
     Args:
-        params.ip: IP address to check
-        params.max_age_days: Lookback window in days
-        params.response_format: 'markdown' (default) or 'json'
+        ip: IP address to check
+        max_age_days: Lookback window in days
+        response_format: 'markdown' (default) or 'json'
 
     Returns:
         str: Markdown report (default) or JSON with abuse confidence score, report count, etc.
     """
-    _audit_log("blueteam_lookup_ip_abuseipdb", {"ip": params.ip})
+    _audit_log("blueteam_lookup_ip_abuseipdb", {"ip": ip})
     if not ABUSEIPDB_API_KEY:
         return json.dumps({
             "error": "ABUSEIPDB_API_KEY not set",
@@ -5547,7 +5336,7 @@ async def blueteam_lookup_ip_abuseipdb(params: IPInput) -> str:
         data = await _http_get(
             "https://api.abuseipdb.com/api/v2/check",
             headers={"Key": ABUSEIPDB_API_KEY, "Accept": "application/json"},
-            params={"ipAddress": params.ip, "maxAgeInDays": str(params.max_age_days), "verbose": ""}
+            params={"ipAddress": ip, "maxAgeInDays": str(max_age_days), "verbose": ""}
         )
         d = data.get("data", {})
         result = {
@@ -5562,7 +5351,7 @@ async def blueteam_lookup_ip_abuseipdb(params: IPInput) -> str:
             "is_tor": d.get("isTor"),
             "is_vpn": d.get("isPublic"),
         }
-        if params.response_format == ResponseFormat.JSON:
+        if response_format == "json":
             return json.dumps(result, indent=2)
         # markdown
         score = result["abuse_confidence_score"] or 0
@@ -5589,35 +5378,22 @@ async def blueteam_lookup_ip_abuseipdb(params: IPInput) -> str:
 
 _HASH_RE = re.compile(r"^[a-fA-F0-9]{32,64}$")
 
-class HashInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    hash_value: str = Field(..., max_length=64, description="MD5 (32), SHA1 (40), or SHA256 (64) hash hex")
-    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN, description="Output format: 'markdown' (default) or 'json'")
-
-    @field_validator("hash_value")
-    @classmethod
-    def validate_hash(cls, v: str) -> str:
-        if not _HASH_RE.match(v) or len(v) not in (32, 40, 64):
-            raise ValueError("Hash must be 32 (MD5), 40 (SHA1), or 64 (SHA256) hex chars")
-        return v
-
-
 @mcp.tool(
     name="blueteam_lookup_hash_virustotal",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
-async def blueteam_lookup_hash_virustotal(params: HashInput) -> str:
+async def blueteam_lookup_hash_virustotal(hash: str, response_format: Literal["markdown", "json"] = "markdown") -> str:
     """Check a file hash against VirusTotal to see if it's known malware.
     Requires VIRUSTOTAL_API_KEY environment variable.
 
     Args:
-        params.hash_value: MD5/SHA1/SHA256 of the file
-        params.response_format: 'markdown' (default) or 'json'
+        hash_value: MD5/SHA1/SHA256 of the file
+        response_format: 'markdown' (default) or 'json'
 
     Returns:
         str: Markdown report (default) or JSON with detection ratio, malware names
     """
-    _audit_log("blueteam_lookup_hash_virustotal", {"hash": params.hash_value[:8] + "..."})
+    _audit_log("blueteam_lookup_hash_virustotal", {"hash": hash_value[:8] + "..."})
     if not VIRUSTOTAL_API_KEY:
         return json.dumps({
             "error": "VIRUSTOTAL_API_KEY not set",
@@ -5626,7 +5402,7 @@ async def blueteam_lookup_hash_virustotal(params: HashInput) -> str:
         })
     try:
         data = await _http_get(
-            f"https://www.virustotal.com/api/v3/files/{params.hash_value}",
+            f"https://www.virustotal.com/api/v3/files/{hash_value}",
             headers={"x-apikey": VIRUSTOTAL_API_KEY}
         )
         attrs = data.get("data", {}).get("attributes", {})
@@ -5639,7 +5415,7 @@ async def blueteam_lookup_hash_virustotal(params: HashInput) -> str:
         }
         detection_ratio = f"{stats.get('malicious', 0)}/{sum(stats.values())}"
         result = {
-            "hash": params.hash_value,
+            "hash": hash_value,
             "name": attrs.get("meaningful_name"),
             "type": attrs.get("type_description"),
             "size_bytes": attrs.get("size"),
@@ -5648,13 +5424,13 @@ async def blueteam_lookup_hash_virustotal(params: HashInput) -> str:
             "detections": detection_ratio,
             "malware_names": detections,
         }
-        if params.response_format == ResponseFormat.JSON:
+        if response_format == "json":
             return json.dumps(result, indent=2)
         # markdown
         malicious = stats.get("malicious", 0)
         severity = "🔴 Malicious" if malicious > 0 else "🟢 Clean"
         lines = [
-            f"# VirusTotal Hash Lookup — `{params.hash_value}`",
+            f"# VirusTotal Hash Lookup — `{hash_value}`",
             "",
             f"| Field | Value |",
             f"|-------|-------|",
@@ -5679,48 +5455,33 @@ async def blueteam_lookup_hash_virustotal(params: HashInput) -> str:
         return _handle_api_error(e, context="blueteam_lookup_hash_virustotal")
 
 
-class DomainInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    domain: str = Field(..., max_length=253, description="Domain name to look up, e.g. 'example.com'")
-    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN, description="Output format: 'markdown' (default) or 'json'")
-
-    @field_validator("domain")
-    @classmethod
-    def validate_domain(cls, v: str) -> str:
-        if not v or len(v) > 253:
-            raise ValueError("Invalid domain length")
-        if ".." in v:
-            raise ValueError("Invalid domain format")
-        return v
-
-
 @mcp.tool(
     name="blueteam_lookup_domain_virustotal",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 )
-async def blueteam_lookup_domain_virustotal(params: DomainInput) -> str:
+async def blueteam_lookup_domain_virustotal(domain: str, response_format: Literal["markdown", "json"] = "markdown") -> str:
     """Check a domain against VirusTotal for malicious reputation.
 
     Args:
-        params.domain: Domain to check
-        params.response_format: 'markdown' (default) or 'json'
+        domain: Domain to check
+        response_format: 'markdown' (default) or 'json'
 
     Returns:
         str: Markdown report (default) or JSON with reputation score and detection details
     """
-    _audit_log("blueteam_lookup_domain_virustotal", {"domain": params.domain})
+    _audit_log("blueteam_lookup_domain_virustotal", {"domain": domain})
     if not VIRUSTOTAL_API_KEY:
         return json.dumps({"error": "VIRUSTOTAL_API_KEY not set. See blueteam_lookup_hash_virustotal for setup."})
     try:
         data = await _http_get(
-            f"https://www.virustotal.com/api/v3/domains/{params.domain}",
+            f"https://www.virustotal.com/api/v3/domains/{domain}",
             headers={"x-apikey": VIRUSTOTAL_API_KEY}
         )
         attrs = data.get("data", {}).get("attributes", {})
         stats = attrs.get("last_analysis_stats", {})
         detection_ratio = f"{stats.get('malicious', 0)}/{sum(stats.values())}"
         result = {
-            "domain": params.domain,
+            "domain": domain,
             "reputation": attrs.get("reputation"),
             "categories": attrs.get("categories", {}),
             "detections": detection_ratio,
@@ -5728,13 +5489,13 @@ async def blueteam_lookup_domain_virustotal(params: DomainInput) -> str:
             "creation_date": attrs.get("creation_date"),
             "whois": (attrs.get("whois", "") or "")[:500],
         }
-        if params.response_format == ResponseFormat.JSON:
+        if response_format == "json":
             return json.dumps(result, indent=2)
         # markdown
         malicious = stats.get("malicious", 0)
         severity = "🔴 Malicious" if malicious > 0 else ("🟠 Suspicious" if (attrs.get("reputation") or 0) < 0 else "🟢 Clean")
         lines = [
-            f"# VirusTotal Domain Lookup — `{params.domain}`",
+            f"# VirusTotal Domain Lookup — `{domain}`",
             "",
             f"| Field | Value |",
             f"|-------|-------|",
@@ -5796,7 +5557,7 @@ async def blueteam_fail2ban_jail_status(params: JailInput) -> str:
     if not shutil.which("fail2ban-client"):
         return _tool_not_found("fail2ban")
     r = _run(["fail2ban-client", "status", params.jail])
-    return _redact_alert_data(r["stdout"] or r["stderr"], bypass=params.bypass_redaction)
+    return _redact_alert_data(r["stdout"] or r["stderr"], bypass=bypass_redaction)
 
 
 class UnbanInput(BaseModel):
@@ -5825,7 +5586,7 @@ async def blueteam_fail2ban_unban(params: UnbanInput) -> str:
 
     Args:
         params.jail: Jail name
-        params.ip: IP address to unban
+        ip: IP address to unban
 
     Returns:
         str: Result of unban operation
@@ -5834,9 +5595,9 @@ async def blueteam_fail2ban_unban(params: UnbanInput) -> str:
         return json.dumps({"error": "Rate limit exceeded"})
     if not shutil.which("fail2ban-client"):
         return _tool_not_found("fail2ban")
-    r = _run(["fail2ban-client", "set", params.jail, "unbanip", params.ip])
+    r = _run(["fail2ban-client", "set", params.jail, "unbanip", ip])
     out = r["stdout"] or r["stderr"]
-    _audit_log("blueteam_fail2ban_unban", {"jail": params.jail, "ip": params.ip}, out[:200])
+    _audit_log("blueteam_fail2ban_unban", {"jail": params.jail, "ip": ip}, out[:200])
     return out
 
 
@@ -5897,7 +5658,7 @@ async def blueteam_hash_file(params: HashFileInput) -> str:
             "modified": datetime.fromtimestamp(p.stat().st_mtime).isoformat(),
         }, indent=2)
         _audit_log("blueteam_hash_file", {"path": params.path, "algorithm": algo}, result[:200])
-        return _redact_alert_data(result, bypass=params.bypass_redaction)
+        return _redact_alert_data(result, bypass=bypass_redaction)
     except PermissionError:
         return json.dumps({"error": f"Permission denied reading {params.path}"})
     except Exception as e:
@@ -5977,7 +5738,7 @@ async def blueteam_rootkit_scan(params: RootkitInput) -> str:
     else:
         return json.dumps({"error": f"Unknown tool '{tool}'. Use 'rkhunter' or 'chkrootkit'"})
 
-    return _redact_alert_data(r["stdout"] or r["stderr"], bypass=params.bypass_redaction)
+    return _redact_alert_data(r["stdout"] or r["stderr"], bypass=bypass_redaction)
 
 
 # SYSTEM HARDENING
@@ -6287,7 +6048,7 @@ async def _wazuh_indexer_post(body: dict, index_pattern: Optional[str] = None) -
     """Post a raw OpenSearch query body to the Wazuh Indexer.
 
     All aggregation tools (Tier 1 & Tier 2) funnel through this single helper,
-    which wraps the HTTP call with the ``_cb_wazuh_indexer`` circuit breaker.
+    which wraps the HTTP call with the direct HTTP call.
     """
     if index_pattern is None:
         index_pattern = _WAZUH_INDEX_PATTERNS["alerts"]
@@ -6307,14 +6068,14 @@ async def _wazuh_indexer_post(body: dict, index_pattern: Optional[str] = None) -
         return resp.json()
 
     try:
-        return await _cb_wazuh_indexer.call(_do_post)
+        return await _do_post()
     except httpx.HTTPStatusError as e:
         return {"error": f"Indexer API error: {e.response.status_code}", "detail": e.response.text[:500]}
     except Exception as e:
         return {"error": str(e)}
 
 
-# Tier 1: wazuh_alert_aggregate_analysis — full-period statistics (size: 0 -> summarizes a whole period with no document limit)
+# Tier 1: wazuh_alert_aggregate_analysis - full period statistics (size: 0 -> summarizes a whole period with no document limit)
 class AggregateAnalysisInput(BaseModel):
     """Input model for wazuh_alert_aggregate_analysis — zero-doc statistical analysis."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
@@ -6366,8 +6127,8 @@ class AggregateAnalysisInput(BaseModel):
         le=50,
         description="Top-N bucket size for terms aggregations (default 10, max 50).",
     )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown",
         description="'markdown' for human-readable stats, 'json' for structured data.",
     )
 
@@ -6745,14 +6506,14 @@ async def wazuh_alert_aggregate_analysis(params: AggregateAnalysisInput) -> str:
 
     Args:
         params.mode: Analysis mode (default 'summary').
-        params.since: Start of time window (default '24h').
-        params.until: End of time window (default: now).
-        params.agent_name: Optional agent filter.
+        since: Start of time window (default '24h').
+        until: End of time window (default: now).
+        agent_name: Optional agent filter.
         params.rule_groups: Optional comma-separated rule groups (e.g. 'authentication_failure').
         params.rule_level_min: Minimum rule level (e.g. 8).
         params.keyword: Optional free-text keyword filter.
         params.top_n: Top-N bucket size for terms aggregations (default 10).
-        params.response_format: 'markdown' (default) or 'json'.
+        response_format: 'markdown' (default) or 'json'.
 
     Returns:
         str: Structured statistical report — no raw documents.
@@ -6768,8 +6529,8 @@ async def wazuh_alert_aggregate_analysis(params: AggregateAnalysisInput) -> str:
         - All modes go through the Wazuh Indexer circuit breaker
         - Timeout/connection failures surface actionable error messages per mode
     """
-    _audit_log("wazuh_alert_aggregate_analysis", {"mode": params.mode, "since": params.since})
-    since_str, until_str = _parse_time_window(params.since, params.until)
+    _audit_log("wazuh_alert_aggregate_analysis", {"mode": params.mode, "since": since})
+    since_str, until_str = _parse_time_window(since, until)
 
     rule_group_list: Optional[list[str]] = None
     if params.rule_groups:
@@ -6778,7 +6539,7 @@ async def wazuh_alert_aggregate_analysis(params: AggregateAnalysisInput) -> str:
     filters = _build_filter_clauses(
         since_str=since_str,
         until_str=until_str,
-        agent_name=params.agent_name,
+        agent_name=agent_name,
         rule_groups=rule_group_list,
         rule_level_min=params.rule_level_min,
         keyword=params.keyword,
@@ -6820,7 +6581,7 @@ async def wazuh_alert_aggregate_analysis(params: AggregateAnalysisInput) -> str:
         else:
             results_by_mode[mode_name] = result
 
-    if params.response_format == ResponseFormat.JSON:
+    if response_format == "json":
         return _truncate_if_needed(json.dumps({
             "window": {"since": since_str, "until": until_str},
             "mode": params.mode,
@@ -6850,8 +6611,8 @@ class DslQueryInput(BaseModel):
         description="OpenSearch index pattern (default 'wazuh-alerts-*'). "
                     "Also accepts 'wazuh-events-*', 'wazuh-states-vulnerabilities-*'.",
     )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.JSON,
+    response_format: Literal["markdown", "json"] = Field(
+        default="json",
         description="'json' (default, machine-readable) or 'markdown'.",
     )
 
@@ -6935,7 +6696,7 @@ async def wazuh_alert_dsl_query(params: DslQueryInput) -> str:
         params.query_json: Raw OpenSearch DSL JSON. MUST include ``"size": 0``
                           and an ``"aggs"`` (or ``"aggregations"``) block.
         params.index_pattern: Index pattern (default 'wazuh-alerts-*').
-        params.response_format: 'json' (default) or 'markdown'.
+        response_format: 'json' (default) or 'markdown'.
 
     Returns:
         str: OpenSearch aggregation response (JSON by default, markdown on request).
@@ -6959,10 +6720,10 @@ async def wazuh_alert_dsl_query(params: DslQueryInput) -> str:
             json.loads(params.query_json),
             index_pattern=params.index_pattern,
         )
-    except (httpx.HTTPStatusError, httpx.TimeoutException, CircuitBreakerOpenError, RuntimeError) as e:
+    except (httpx.HTTPStatusError, httpx.TimeoutException, RuntimeError) as e:
         return _handle_api_error(e, context="wazuh_alert_dsl_query")
 
-    if params.response_format == ResponseFormat.MARKDOWN:
+    if response_format == "markdown":
         if isinstance(data.get("error"), str):
             return f"# DSL Query Error\n\n**Error**: {data['error']}\n\n**Detail**: {data.get('detail', 'N/A')}"
         aggs = data.get("aggregations", data.get("aggs", {}))
@@ -7020,8 +6781,8 @@ class FocusedCrawlInput(BaseModel):
         description="Comma-separated additional _source fields to retrieve beyond defaults. "
                     "Example: 'data.url,data.domain,data.user_agent'.",
     )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown",
         description="'markdown' (default) for human-readable alert summaries, 'json' for structured data.",
     )
 
@@ -7087,14 +6848,14 @@ async def wazuh_alert_focused_crawl(params: FocusedCrawlInput = FocusedCrawlInpu
     Args:
         params.src_ip: Specific source IP identified as a hot spot.
         params.rule_id: Specific rule ID (e.g. '5763') identified as a top offender.
-        params.agent_name: Filter to a specific agent.
-        params.since: Start of time window (default '24h').
-        params.until: End of time window (default: now).
+        agent_name: Filter to a specific agent.
+        since: Start of time window (default '24h').
+        until: End of time window (default: now).
         params.sample_size: Alert documents to retrieve (default 50, max 200).
         params.include_full_log: Include raw log lines (PII-redacted).
-        params.bypass_redaction: Skip PII masking for audit (if BLUETEAM_REDACT_PII allows).
+        bypass_redaction: Skip PII masking for audit (if BLUETEAM_REDACT_PII allows).
         params.fields: Comma-separated extra _source fields to include.
-        params.response_format: 'markdown' (default) or 'json'.
+        response_format: 'markdown' (default) or 'json'.
 
     Returns:
         str: Representative alert documents with full context, PII-redacted.
@@ -7111,7 +6872,7 @@ async def wazuh_alert_focused_crawl(params: FocusedCrawlInput = FocusedCrawlInpu
         - PII redaction applied automatically (bypass with bypass_redaction=True)
     """
     _audit_log("wazuh_alert_focused_crawl", {"src_ip": params.src_ip, "rule_id": params.rule_id, "sample_size": params.sample_size})
-    since_str, until_str = _parse_time_window(params.since, params.until)
+    since_str, until_str = _parse_time_window(since, until)
 
     # Build _source fields: defaults + user-specified extras
     source_fields = [
@@ -7137,14 +6898,14 @@ async def wazuh_alert_focused_crawl(params: FocusedCrawlInput = FocusedCrawlInpu
     try:
         data = await _wazuh_indexer_search(
             index_pattern=_WAZUH_INDEX_PATTERNS["alerts"],
-            agent_name=params.agent_name,
+            agent_name=agent_name,
             size=params.sample_size,
             srcip=params.src_ip,
             since=since_str,
             until=until_str,
             fields=source_fields,
         )
-    except (httpx.HTTPStatusError, httpx.TimeoutException, CircuitBreakerOpenError, RuntimeError) as e:
+    except (httpx.HTTPStatusError, httpx.TimeoutException, RuntimeError) as e:
         return _handle_api_error(e, context="wazuh_alert_focused_crawl")
 
     if isinstance(data.get("error"), str):
@@ -7155,7 +6916,7 @@ async def wazuh_alert_focused_crawl(params: FocusedCrawlInput = FocusedCrawlInpu
     hit_list = hits.get("hits", [])
 
     # Apply PII redaction to all document bodies
-    docs = [_redact_alert_data(h.get("_source", h), bypass=params.bypass_redaction) for h in hit_list]
+    docs = [_redact_alert_data(h.get("_source", h), bypass=bypass_redaction) for h in hit_list]
 
     # Build next_cursor for further pagination within the same slice
     next_cursor = None
@@ -7180,13 +6941,13 @@ async def wazuh_alert_focused_crawl(params: FocusedCrawlInput = FocusedCrawlInpu
             band = "high" if lvl >= 10 else ("medium" if lvl >= 5 else "low")
             level_counts[band] = level_counts.get(band, 0) + 1
 
-    if params.response_format == ResponseFormat.JSON:
+    if response_format == "json":
         return _truncate_if_needed(json.dumps({
             "window": {"since": since_str, "until": until_str},
             "filter": {
                 "src_ip": params.src_ip,
                 "rule_id": params.rule_id,
-                "agent_name": params.agent_name,
+                "agent_name": agent_name,
             },
             "total": {"value": total.get("value", 0), "relation": total.get("relation", "eq")},
             "count": len(docs),
@@ -7211,8 +6972,8 @@ async def wazuh_alert_focused_crawl(params: FocusedCrawlInput = FocusedCrawlInpu
         lines.append(f"| Source IP | `{params.src_ip}` |")
     if params.rule_id:
         lines.append(f"| Rule ID | `{params.rule_id}` |")
-    if params.agent_name:
-        lines.append(f"| Agent | `{params.agent_name}` |")
+    if agent_name:
+        lines.append(f"| Agent | `{agent_name}` |")
     lines.extend([
         f"| Total matching | {total_val} ({total.get('relation', 'eq')}) |",
         f"| Retrieved | {len(docs)} |",
@@ -7323,8 +7084,8 @@ class ThreeSumCorrelationInput(BaseModel):
         le=5.0,
         description="Minimum Z-score to flag a bucket as anomalous in Engine B. Default: 2.5.",
     )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown",
         description="Output format: 'markdown' (default, human-readable) or 'json' (machine-readable).",
     )
     categories_map: Optional[dict[str, dict[str, Any]]] = Field(
@@ -7773,7 +7534,7 @@ async def three_sum_correlation(data: ThreeSumCorrelationInput) -> str:
         logger.info("[3SUM-EVAL] Evaluation finished — %d ms", round(elapsed_ms))
         return json.dumps(result, indent=2)
 
-    except CircuitBreakerOpenError:
+    except Exception:
         return json.dumps({
             "error": "Wazuh Indexer is temporarily unavailable (circuit breaker open)",
             "detail": "The Indexer has been unresponsive. Retry after the circuit breaker recovery timeout (~60s).",

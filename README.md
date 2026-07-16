@@ -11,7 +11,7 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
 
 ## Architecture
 
-`blue_team_server.py` is a **single, unified MCP server** with 47 tools spanning host forensics, Wazuh SIEM, and multi-source threat intelligence. It supports two transports:
+`blue_team_server.py` is a **single, unified MCP server** with 48 tools spanning host forensics, Wazuh SIEM, threat intelligence, and 3-Sum APT correlation engine. It supports two transports:
 
 | Transport | Use case | MCP client connection |
 |---|---|---|
@@ -21,7 +21,7 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
 ```
                           ┌──────────────────────────────────┐
                           │     blue_team_server.py          │
-                          │     47 tools · 1 file · 2 transports  │
+                          │     48 tools · 1 file · 2 transports  │
                           │                                  │
                           │  ┌────────────────────────────┐  │
                           │  │ Host Forensics (26 tools)  │  │
@@ -35,7 +35,7 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
                           │  │ • System health            │  │
                           │  └────────────────────────────┘  │
                           │  ┌────────────────────────────┐  │
-                          │  │ Wazuh SIEM (10 tools)      │  │
+                          │  │ Wazuh SIEM (14 tools)     │  │
                           │  │ • Agent inventory & status │  │
                           │  │ • Security alerts          │  │
                           │  │ • Manager logs             │  │
@@ -43,9 +43,10 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
                           │  │ • Email/domain compromise  │  │
                           │  │ • Alert timeline           │  │
                           │  │ • Attack velocity          │  │
+                          │  │ • 3-Sum APT correlation    │  │
                           │  └────────────────────────────┘  │
                           │  ┌────────────────────────────┐  │
-                          │  │ Threat Intel (7 tools)     │  │
+                          │  │ Threat Intel (8 tools)     │  │
                           │  │ • AbuseIPDB IP reputation  │  │
                           │  │ • VirusTotal hash & domain │  │
                           │  │ • CrowdSec CTI (2 tools)   │  │
@@ -83,7 +84,7 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
 
 | File | Tools | When to use |
 |---|---|---|
-| `blue_team_server.py` | **All 47 tools** | **Recommended** — full capabilities, circuit breaker, credential stripping, PII redaction |
+| `blue_team_server.py` | **All 48 tools** | **Recommended** — full capabilities, credential stripping, PII redaction |
 
 ---
 
@@ -214,40 +215,37 @@ Per `SKILLS.md` §3.1, CrowdSec CTI responses are cached in-process with configu
 - **Error isolation**: per-IP failure does not affect sibling lookups
 - **Latency**: ~5× speedup vs serial iteration
 
-### Circuit Breaker (External API Resilience)
+### External API Resilience
 
-Ported from the Wazuh-MCP-Server resilience pattern. A three-state circuit breaker prevents cascading failures when upstream APIs are unreachable — the LLM sees actionable errors instead of retrying indefinitely against a dead backend.
+All external API calls (CrowdSec CTI, Wazuh Manager, Wazuh Indexer, Argus) use a simple try/except pattern with specific exception handling — no circuit breaker state machine needed for a local MCP server.
 
-**State machine:**
+```python
+try:
+    data = await _do_request()
+except httpx.HTTPStatusError as e:
+    return {"error": f"API error: {e.response.status_code}"}
+except httpx.TimeoutException:
+    return {"error": "Request timed out"}
 ```
-CLOSED ──5 consecutive failures──▶ OPEN ──60s timeout──▶ HALF_OPEN
-  ▲                                 ▲                      │
-  │                                 │                 probe fails?
-  │                                 └──────────────────────┘ yes
-  │                                                        │
-  └────────── probe succeeds ──────────────────────────────┘ no
-```
 
-**Per-service breakers:**
-
-| Breaker | Guards | Threshold | Recovery | Applied at |
-|---------|--------|-----------|----------|------------|
-| `_cb_crowdsec` | CrowdSec CTI API (`cti.api.crowdsec.net`) | 5 failures | 60s | `_crowdsec_request()` HTTP GET |
-| `_cb_wazuh_indexer` | Wazuh Indexer / OpenSearch | 5 failures | 60s | `_wazuh_indexer_search()` HTTP POST |
-
-**Key properties:**
-- **Async-safe**: `asyncio.Lock` protects state transitions under concurrent load
-- **Cache-aware**: CrowdSec cache hits skip the circuit breaker entirely (no API call → no failure counted)
-- **Self-healing**: HALF_OPEN probe on success → CLOSED with all counters reset
-- **Actionable errors**: `CircuitBreakerOpenError` includes remaining timeout so the LLM sees a retry hint
+**Per-service caching** (CrowdSec CTI only): successful responses are cached in-memory with a configurable TTL (`CROWDSEC_CACHE_TTL`, default 900s). Cache hits skip the HTTP call entirely — no exception handling needed. Error responses are never cached.
 
 ### Credential & Secret Stripping (Output Sanitization)
 
 Ported from the Wazuh-MCP-Server output sanitization pattern. Before any Wazuh alert or traffic capture data reaches the LLM context, `_redact_alert_data()` strips credentials, API keys, and secret material from `full_log` and other text fields.
 
-**Applied automatically** to ALL tool outputs that may contain sensitive data — Wazuh alerts, log readers, user lists, SSH keys, cron jobs, process lists, system health, and network captures. Controlled by `BLUETEAM_REDACT_PII` (default: `true`) and `BLUETEAM_REDACT_EMAILS` (default: `true`) with a per-call `bypass_redaction` parameter on every tool for audit investigations.
+**Applied automatically** to ALL tool outputs that may contain sensitive data — Wazuh alerts, log readers, user lists, SSH keys, cron jobs, process lists, system health, and network captures. Six-layer pipeline with per-layer env var control:
 
-**Stripping rules (15 regex patterns, applied before PII masking):**
+- Layer 1 (MANDATORY): Credential stripping (15 regex patterns, never bypassable)
+- Layer 2: Email redaction (`BLUETEAM_REDACT_EMAILS`, default `true`)
+- Layer 3: Internal IP masking (`BLUETEAM_REDACT_PII`, default `true`)
+- Layer 4: Domain/hostname masking (`BLUETEAM_REDACT_DOMAINS`, default `true`)
+- Layer 5: Log location masking (`BLUETEAM_REDACT_LOCATIONS`, default `true`)
+- Layer 6: User-agent truncation (`BLUETEAM_REDACT_UAS`, default `true`)
+
+Per-call override: `bypass_redaction=True` skips all optional Layers 2-6.
+
+**Stripping rules (15 credential regex patterns + 4 PII/mask layers, applied in order):**
 
 | Category | Patterns detected | Replacement |
 |----------|------------------|-------------|
@@ -261,8 +259,11 @@ Ported from the Wazuh-MCP-Server output sanitization pattern. Before any Wazuh a
 | AI API keys | Anthropic (`sk-ant-...`), OpenAI (`sk-proj-...`) | `<AI_API_KEY_REDACTED>` |
 | Messaging | Slack (`xoxb-...`, `xoxp-...`, etc.) | `<SLACK_TOKEN_REDACTED>` |
 | Passwords | `password=`, `passwd=`, `pwd=`, `secret=` params | `password=<PASSWORD_REDACTED>` |
+| **Layer 4 — Domains** | `data.domain`, standalone hostnames in `full_log` | Subdomain masked (`e-***i.tangerangkota.go.id`), parent+TLD visible |
+| **Layer 5 — Locations** | `location` field (file paths) | `.../access_log [h:a3f8c2]` (leaf + forensic hash) |
+| **Layer 6 — User agents** | `data.user_agent`, UA strings in `full_log` | Truncated to 80 chars (OS/browser preserved) |
 
-The credential stripping runs **before** PII masking (email/RFC1918 IP redaction) inside `_redact_alert_data()`. Both layers are independently controlled by the same `BLUETEAM_REDACT_PII` guard. The original alert data on disk is never modified.
+The credential stripping (Layer 1) runs **before** all other masking inside `_redact_alert_data()`. All six layers are independently controlled by their `BLUETEAM_REDACT_*` env var. The original alert data on disk is never modified.
 
 ### GreyNoise Community — Free, No API Key
 
@@ -337,9 +338,12 @@ All environment variables accepted by the suite. Variables marked **[unified]** 
 | `BLUETEAM_RATE_LIMIT` | `0` (disabled) | Max tool calls per minute |
 | `BLUETEAM_ALLOWED_PATHS` | `/var:/etc:/home:/opt:/usr` | Colon-separated path allowlist for file tools |
 | `BLUETEAM_CAPTURE_DIR` | `/tmp` | Output directory for `blueteam_capture_traffic` pcap files |
-| `BLUETEAM_REDACT_PII` | `true` | Strip credentials and mask internal IPs from alert payloads |
+| `BLUETEAM_REDACT_PII` | `true` | Mask internal IPs (RFC1918, loopback, IPv6 ::1) |
 | `BLUETEAM_REDACT_EMAILS` | `true` | Hash email local-parts in alert payloads (domain preserved) |
-| `BLUETEAM_REDACT_SALT` | (hostname-derived) | Salt for deterministic forensic email hashing |
+| `BLUETEAM_REDACT_DOMAINS` | `true` | Mask subdomains in `data.domain` and `full_log` |
+| `BLUETEAM_REDACT_LOCATIONS` | `true` | Strip directory tree from `location` field |
+| `BLUETEAM_REDACT_UAS` | `true` | Truncate `data.user_agent` to 80 chars |
+| `BLUETEAM_REDACT_SALT` | (hostname-derived) | Salt for deterministic forensic email/ path hashing |
 
 ---
 
@@ -429,7 +433,7 @@ Then point Claude Desktop at it:
 
 Replace `192.168.153.5` with the IP reachable from your workstation (`192.168.153.5` for NAT, `172.16.101.5` for LAB).
 
-Restart Claude Desktop. You should see all 47 blue-team-mcp tools available.
+Restart Claude Desktop. You should see all 48 blue-team-mcp tools available.
 
 ### 4. Remote Service Deployment (systemd)
 
@@ -493,7 +497,7 @@ All tools below are registered on `blue_team_server.py`. Tools not requiring a s
 | `blueteam_capture_traffic` | Live packet capture via tcpdump |
 
 ### Wazuh SIEM
-*All thirteen tools support cursor-based pagination — see [Cursor-Based Pagination](#cursor-based-pagination-bulk-data-without-hard-caps). `blueteam_wazuh_indexer_search`, `wazuh_domain_lookup`, and `wazuh_alert_focused_crawl` also support **auto-pagination** via the `max_scanned` parameter. `blueteam_wazuh_indexer_search` additionally supports **forensic mode** (`include_all_docs=True`) when `BLUETEAM_ALLOW_UNTRUNCATED=true`.*
+*All fourteen tools support cursor-based pagination — see [Cursor-Based Pagination](#cursor-based-pagination-bulk-data-without-hard-caps). `blueteam_wazuh_indexer_search`, `wazuh_domain_lookup`, and `wazuh_alert_focused_crawl` also support **auto-pagination** via the `max_scanned` parameter. `blueteam_wazuh_indexer_search` additionally supports **forensic mode** (`include_all_docs=True`) when `BLUETEAM_ALLOW_UNTRUNCATED=true`.*
 
 | Tool | Description |
 |------|-------------|
@@ -510,6 +514,7 @@ All tools below are registered on `blue_team_server.py`. Tools not requiring a s
 | `wazuh_compromised_emails_analysis` | Correlate compromised emails with attacker IPs, optional Netra enrichment (auto-paginates per batch) |
 | `wazuh_alert_timeline` | Time-bucketed alert aggregation using OpenSearch `date_histogram` — covers ALL matching alerts |
 | `wazuh_attack_velocity` | Compare two time windows to detect attack acceleration/deceleration — covers ALL matching alerts |
+| `three_sum_correlation` | **3-Sum APT Detection Engine**: Advanced correlation applying the 3-Sum logical concept to Wazuh telemetry. Engine A (Multi-IoC Risk Thresholding) finds IPs appearing in 3 alert categories, sums risk scores, flags ≥10. Engine B (Volumetric Z-Score) detects simultaneous volumetric anomalies across 3 sources when all Z ≥ 2.5 in the same minute. Opt-in enrichments: `use_geo` (GeoLocation hints), `use_domain` (domain hints), `use_mitre` (MITRE ATT&CK tactic refinement). Category B defaults include `spam`/`postfix` groups. Returns structured JSON with per-engine triggers and summary. |
 
 ### Threat Intelligence
 | Tool | Description |
@@ -693,7 +698,7 @@ export BLUETEAM_RATE_LIMIT=60
 
 | File | Role |
 |---|---|
-| `blue_team_server.py` | **Primary** — all 47 tools, both transports (stdio / Streamable HTTP) |
+| `blue_team_server.py` | **Primary** — all 48 tools, both transports (stdio / Streamable HTTP) |
 
 ### Legacy Naming Debt
 

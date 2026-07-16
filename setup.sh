@@ -1,8 +1,5 @@
 #!/usr/bin/env bash
 # Blue Team MCP Server Setup Script
-# Run this on your DEFENDER HOST (Ubuntu/Debian recommended)
-# Usage: sudo bash setup.sh
-# Programmer : NAuliajati (csirt[at]tangerangkota[.]go[.]id)
 set -e
 
 INSTALL_DIR="/opt/blue-team-mcp"
@@ -60,8 +57,6 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
   echo "[4/7] Creating config file at $CONFIG_FILE..."
   cat > "$CONFIG_FILE" << 'CONFIGEOF'
 # Blue Team MCP - Environment Variables
-# Edit this file with your API keys and settings. Do not commit to git.
-# The wrapper sources this file before starting the server.
 
 # Threat intelligence (optional)
 # export ABUSEIPDB_API_KEY="your_key"
@@ -104,36 +99,21 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 # export CROWDSEC_CACHE_TTL="900"              # CrowdSec CTI in-memory cache TTL in seconds (default 15 min)
 
 # Forensic Mode (ADMIN GATE — off by default)
-# Set to "true" to unlock bypass_character_limit and include_all_docs.
-# WARNING: enables unbounded response payloads. Pair with conservative max_scanned.
 # export BLUETEAM_ALLOW_UNTRUNCATED="false"
 
 # Data masking (see SECURITY.md §4 for the three-layer model)
-#
-# Layer 1 — CREDENTIAL STRIPPING: ALWAYS active, never configurable.
-#   Bearer tokens, API keys, JWTs, passwords etc. are stripped before
-#   any data reaches the LLM.  There is no legitimate use case for
-#   sending credentials to an AI model.
-#
-# Layer 2 — Email redaction (BLUETEAM_REDACT_EMAILS, default: true):
-#   Masks the local part of email addresses (preserving first/last char
-#   + forensic hash), keeps the FULL domain visible for threat intel.
-#   Set to "false" when SOC analysts need to identify specific
-#   compromised accounts during incident investigation.
 # export BLUETEAM_REDACT_EMAILS="true"
-#
-# Layer 3 — Internal IP masking (BLUETEAM_REDACT_PII, default: true):
-#   Masks RFC1918 addresses (10.x, 172.16-31.x, 192.168.x).
-#   PUBLIC ATTACKER IPs AND DOMAINS ARE NEVER MASKED — they are IoCs.
+# 
 # export BLUETEAM_REDACT_PII="true"
+# 
+# export BLUETEAM_REDACT_DOMAINS="true"
+# 
+# export BLUETEAM_REDACT_LOCATIONS="true"
+# 
+# export BLUETEAM_REDACT_UAS="true"
 #
-# Per-call audit bypass: every tool accepts bypass_redaction=True to skip
-# Layer 2+3 for a single call. Credential stripping (Layer 1) is NEVER
-# bypassable. Use for SOC investigations that need raw internal context.
 
-# Forensic email hashing salt (only used when BLUETEAM_REDACT_EMAILS=true)
-# Change between deployments to prevent cross-deployment correlation.
-# Defaults to hostname-derived if unset.
+# Forensic email/path hashing salt (used when BLUETEAM_REDACT_EMAILS or
 # export BLUETEAM_REDACT_SALT="change-me-per-deployment"
 
 # Server identity (optional — use lowercase to avoid LLM casing mismatches)
@@ -160,7 +140,6 @@ echo "[5/7] Creating MCP server wrapper scripts..."
 cat > /usr/local/bin/mcp-server-blueteam << 'EOF'
 #!/usr/bin/env bash
 # Wrapper - Claude Desktop calls this via SSH (MAESTRO-compliant)
-# Sources config.env if present, then runs the server
 [[ -f /opt/blue-team-mcp/config.env ]] && source /opt/blue-team-mcp/config.env
 export ABUSEIPDB_API_KEY="${ABUSEIPDB_API_KEY:-}"
 export VIRUSTOTAL_API_KEY="${VIRUSTOTAL_API_KEY:-}"
@@ -174,6 +153,9 @@ export BLUETEAM_AUDIT_LOG="${BLUETEAM_AUDIT_LOG:-}"
 export BLUETEAM_RATE_LIMIT="${BLUETEAM_RATE_LIMIT:-0}"
 export BLUETEAM_REDACT_PII="${BLUETEAM_REDACT_PII:-true}"
 export BLUETEAM_REDACT_EMAILS="${BLUETEAM_REDACT_EMAILS:-true}"
+export BLUETEAM_REDACT_DOMAINS="${BLUETEAM_REDACT_DOMAINS:-true}"
+export BLUETEAM_REDACT_LOCATIONS="${BLUETEAM_REDACT_LOCATIONS:-true}"
+export BLUETEAM_REDACT_UAS="${BLUETEAM_REDACT_UAS:-true}"
 export BLUETEAM_ALLOW_UNTRUNCATED="${BLUETEAM_ALLOW_UNTRUNCATED:-false}"
 export BLUETEAM_ALLOWED_PATHS="${BLUETEAM_ALLOWED_PATHS:-/var:/etc:/home:/opt:/usr}"
 export BLUETEAM_CAPTURE_DIR="${BLUETEAM_CAPTURE_DIR:-/tmp}"
@@ -199,8 +181,6 @@ EOF
 chmod +x /usr/local/bin/mcp-server-blueteam
 
 # DEPRECATED standalone wrappers — redirect to the unified server.
-# The standalone CrowdSec and GreyNoise files have been removed;
-# All 48 tools (including CrowdSec + GreyNoise) live in blue_team_server.py.
 for legacy in mcp-server-crowdsec mcp-server-greynoise; do
   cat > "/usr/local/bin/$legacy" << 'EOF'
 #!/usr/bin/env bash
