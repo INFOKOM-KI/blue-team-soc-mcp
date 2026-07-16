@@ -1620,8 +1620,8 @@ async def crowdsec_ip_reputation_bulk(params: CrowdsecIpReputationBulkInput) -> 
 
     Args:
         params (CrowdsecIpReputationBulkInput): Validated parameters containing:
-            - ips (list[str]): 1-10 IP addresses
-            - response_format ('markdown' | 'json'): Output format (default: markdown)
+            - params.ips (list[str]): 1-10 IP addresses
+            - params.response_format ('markdown' | 'json'): Output format (default: markdown)
 
     Returns:
         str: Per-IP summary. Markdown format is a bullet list; JSON format is an array
@@ -1636,9 +1636,9 @@ async def crowdsec_ip_reputation_bulk(params: CrowdsecIpReputationBulkInput) -> 
         - Failure for one IP does not abort the entire batch — per-IP errors are
           reported inline in the results rather than stopping the process.
     """
-    _audit_log("crowdsec_ip_reputation_bulk", {"count": len(ips)})
+    _audit_log("crowdsec_ip_reputation_bulk", {"count": len(params.ips)})
     results: list[dict[str, Any]] = []
-    for ip in ips:
+    for ip in params.ips:
         try:
             raw = await _crowdsec_request(f"/v2/smoke/{ip}")
             results.append(
@@ -1652,7 +1652,7 @@ async def crowdsec_ip_reputation_bulk(params: CrowdsecIpReputationBulkInput) -> 
         except (httpx.HTTPStatusError, httpx.TimeoutException, RuntimeError) as e:
             results.append({"ip": ip, "error": _handle_api_error(e, context=ip)})
 
-    if response_format == "json":
+    if params.response_format == "json":
         result = json.dumps(results, indent=2, ensure_ascii=False)
     else:
         lines = ["# CrowdSec Bulk Reputation Lookup", ""]
@@ -2462,10 +2462,10 @@ async def blueteam_read_auth_log(params: LogInput) -> str:
 
     Args:
         params.lines (int): How many tail lines to read (default 200, max 2000)
-        params.grep (str, optional): Filter to lines containing this pattern
+        params.grep (str, optional): Filter to params.lines containing this pattern
 
     Returns:
-        str: Matching log lines or error JSON
+        str: Matching log params.lines or error JSON
     """
     _audit_log("blueteam_read_auth_log", {"lines": params.lines})
     log_path = "/var/log/auth.log"
@@ -2475,13 +2475,13 @@ async def blueteam_read_auth_log(params: LogInput) -> str:
         if params.grep:
             cmd += ["--grep", params.grep]
         r = _run(cmd)
-        return _redact_alert_data(r["stdout"] or r["stderr"], bypass=bypass_redaction)
+        return _redact_alert_data(r["stdout"] or r["stderr"], bypass=params.bypass_redaction)
 
     content = _tail_file(log_path, params.lines)
     if params.grep:
         safe_grep = _sanitize_regex(params.grep)
-        lines = [l for l in content.splitlines() if re.search(safe_grep, l, re.IGNORECASE)]
-        return "\n".join(lines) if lines else f"No lines matched filter: {params.grep}"
+        params.lines = [l for l in content.splitlines() if re.search(safe_grep, l, re.IGNORECASE)]
+        return "\n".join(params.lines) if params.lines else f"No params.lines matched filter: {params.grep}"
     return content
 
 @mcp.tool(
@@ -2504,9 +2504,9 @@ async def blueteam_read_syslog(params: LogInput) -> str:
             content = _tail_file(path, params.lines)
             if params.grep:
                 safe_grep = _sanitize_regex(params.grep)
-                lines = [l for l in content.splitlines() if re.search(safe_grep, l, re.IGNORECASE)]
-                return _redact_alert_data("\n".join(lines, bypass=bypass_redaction) if lines else f"No matches for: {params.grep}")
-            return _redact_alert_data(content, bypass=bypass_redaction)
+                params.lines = [l for l in content.splitlines() if re.search(safe_grep, l, re.IGNORECASE)]
+                return _redact_alert_data("\n".join(lines, bypass=params.bypass_redaction) if lines else f"No matches for: {params.grep}")
+            return _redact_alert_data(content, bypass=params.bypass_redaction)
     # Fallback to journalctl
     cmd = ["journalctl", "-n", str(params.lines), "--no-pager"]
     if params.grep:
@@ -2536,7 +2536,7 @@ async def blueteam_read_web_log(params: WebLogInput) -> str:
         params.grep: Optional filter
 
     Returns:
-        str: Log lines
+        str: Log params.lines
     """
     _audit_log("blueteam_read_web_log", {"lines": params.lines})
     paths = {
@@ -2553,16 +2553,16 @@ async def blueteam_read_web_log(params: WebLogInput) -> str:
     if server not in paths:
         return json.dumps({"error": f"Unknown server '{params.server}'. Use 'nginx' or 'apache'."})
     log_type = params.log_type.lower()
-    if log_type not in paths[server]:
+    if params.log_type not in paths[server]:
         return json.dumps({"error": f"Unknown log type '{params.log_type}'. Use 'access' or 'error'."})
 
-    params.path = paths[server][log_type]
+    params.path = paths[server][params.log_type]
     content = _tail_file(params.path, params.lines)
     if params.grep:
         safe_grep = _sanitize_regex(params.grep)
-        lines = [l for l in content.splitlines() if re.search(safe_grep, l, re.IGNORECASE)]
-        return _redact_alert_data("\n".join(lines, bypass=bypass_redaction) if lines else f"No matches for: {params.grep}")
-    return _redact_alert_data(content, bypass=bypass_redaction)
+        params.lines = [l for l in content.splitlines() if re.search(safe_grep, l, re.IGNORECASE)]
+        return _redact_alert_data("\n".join(params.lines, bypass=bypass_redaction) if params.lines else f"No matches for: {params.grep}")
+    return _redact_alert_data(content, bypass=params.bypass_redaction)
 
 class JournalInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
@@ -2597,7 +2597,7 @@ async def blueteam_journalctl(params: JournalInput) -> str:
     if params.grep:
         cmd += ["--grep", params.grep]
     r = _run(cmd)
-    return _redact_alert_data(r["stdout"] or r["stderr"], bypass=bypass_redaction)
+    return _redact_alert_data(r["stdout"] or r["stderr"], bypass=params.bypass_redaction)
 
 # NETWORK MONITORING
 @mcp.tool(
@@ -2651,7 +2651,7 @@ class CaptureInput(BaseModel):
 )
 async def blueteam_capture_traffic(params: CaptureInput) -> str:
     """Capture live network traffic using tcpdump. Requires root or CAP_NET_RAW.
-    Read-only for packet inspection; writes pcap files when output_file is set.
+    Read-only for packet inspection; writes pcap files when params.output_file is set.
     Makes network I/O (openWorldHint).
 
     Args:
@@ -2693,7 +2693,7 @@ async def blueteam_capture_traffic(params: CaptureInput) -> str:
         # Redact internal RFC1918 IPs from stdout text output (PRD FR-17, AGENTS.md §3.3).
         # Connection metadata contains internal endpoint IPs; mask them without altering
         # the packet-capture file itself (which is forensic evidence and always unredacted).
-        result = _redact_alert_data(result, bypass=bypass_redaction)
+        result = _redact_alert_data(result, bypass=params.bypass_redaction)
     _audit_log("blueteam_capture_traffic", {"interface": params.interface, "count": params.count}, result[:200])
     return result
 
@@ -3572,24 +3572,24 @@ async def _wazuh_indexer_search_full_scan(
 )
 async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhIndexerSearchInput()) -> str:
     """Query Wazuh Indexer (OpenSearch) for alerts/events with cursor pagination.
-    Supports filtering by agent_name, params.srcip/s (source IP), keyword, or all simultaneously.
+    Supports filtering by params.agent_name, params.srcip/s (source IP), keyword, or all simultaneously.
     Requires WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD (port 9200).
 
     **Three modes**:
 
-    - **Single-page** (default, ``max_scanned`` not set): Returns one page per call.
+    - **Single-page** (default, ``params.max_scanned`` not set): Returns one page per call.
       Pass the returned ``next_cursor`` back as the ``params.cursor`` parameter to fetch
       the next page. ``next_cursor`` is null when all results are exhausted.
-    - **Full-scan aggregate** (set ``max_scanned``): Auto-paginates across ALL
+    - **Full-scan aggregate** (set ``params.max_scanned``): Auto-paginates across ALL
       matching pages and returns aggregated summary (top IPs, top rules) with 50
       sample documents.
-    - **Full-scan forensic** (``max_scanned`` + ``include_all_docs=True``): Returns
+    - **Full-scan forensic** (``params.max_scanned`` + ``include_all_docs=True``): Returns
       ALL scanned documents alongside aggregations. Requires
       ``BLUETEAM_ALLOW_UNTRUNCATED=true`` on the server. Pair with
       ``bypass_character_limit=True`` to avoid the 100K-character response cap.
 
     Args:
-        agent_name: Optional agent name filter (e.g. HYDRA-DC)
+        params.agent_name: Optional agent name filter (e.g. HYDRA-DC)
         params.srcip: Optional single source IP filter (e.g. '180.254.78.145')
         srcips: Optional list of source IPs to match ANY of (max 25)
                        (e.g. ['114.10.116.20', '51.159.125.199'])
@@ -3597,14 +3597,14 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhI
         params.since: Optional ISO 8601 start time in UTC (e.g. '2026-07-05T18:30:00Z')
         params.until: Optional ISO 8601 end time in UTC (e.g. '2026-07-05T19:00:00Z')
         params.index_type: alerts (default), events, or vulnerabilities
-        limit: Max documents per page in single-page mode (default 500, max 10000)
+        params.limit: Max documents per page in single-page mode (default 500, max 10000)
         params.cursor: next_cursor from previous response (omit for first page)
         params.max_scanned: When set, run full-scan auto-pagination (max 1,000,000)
         params.include_all_docs: When True, return all documents in full-scan mode
         params.bypass_character_limit: When True, skip 100K-char response cap
 
     Returns:
-        str: In 'json' mode (default): JSON with documents, total, size, count, next_cursor,
+        str: In 'json' mode (default): JSON with documents, total, params.size, count, next_cursor,
              and timezone. Metadata includes ``applied_size`` when ``_WAZUH_INDEXER_MAX_SIZE``
              clamped the per-page document count.
     """
@@ -3628,8 +3628,8 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhI
 
     data = await _wazuh_indexer_search(
         index_pattern=index_pattern,
-        agent_name=agent_name,
-        size=limit,
+        agent_name=params.agent_name,
+        size=params.limit,
         search_after=search_after,
         srcip=params.srcip,
         since=params.since,
@@ -3650,7 +3650,7 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhI
     # Build next cursor from the last document's sort values
     next_cursor = None
     hit_list = hits.get("hits", [])
-    if hit_list and len(docs) >= limit:
+    if hit_list and len(docs) >= params.limit:
         last_sort = hit_list[-1].get("sort")
         if last_sort:
             next_cursor = _encode_cursor({"search_after": last_sort})
@@ -3658,7 +3658,7 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhI
     meta: dict = {
         "total": {"value": total_val, "relation": total_relation},
         "count": len(docs),
-        "size": limit,
+        "size": params.limit,
         "next_cursor": next_cursor,
         "timezone": "UTC",
         "documents": docs,
@@ -3674,7 +3674,7 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhI
         meta["until"] = params.until
 
     if params.response_format == "json":
-        meta["documents"] = _redact_alert_data(meta["documents"], bypass=bypass_redaction)
+        meta["documents"] = _redact_alert_data(meta["documents"], bypass=params.bypass_redaction)
         return _truncate_if_needed(
             json.dumps(meta, indent=2),
             bypass=params.bypass_character_limit,
@@ -3684,7 +3684,7 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhI
     lines = [
         f"# Wazuh Indexer Search Results",
         f"",
-        f"**Total**: {total_val} ({total_relation}) | **Returned**: {len(docs)} | **Page size**: {limit}",
+        f"**Total**: {total_val} ({total_relation}) | **Returned**: {len(docs)} | **Page params.size**: {limit}",
         f"**Index**: {params.index_type} | **Timezone**: UTC",
     ]
     if params.since or params.until:
@@ -3713,7 +3713,7 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhI
     if data.get("applied_size") is not None:
         lines.append(f"")
         lines.append(
-            f"**Note:** Requested page size {data['requested_size']} was clamped to "
+            f"**Note:** Requested page params.size {data['requested_size']} was clamped to "
             f"{data['applied_size']} by `WAZUH_INDEXER_MAX_SIZE`. "
             f"Raise this env var on the server for larger pages."
         )
@@ -3814,16 +3814,16 @@ async def wazuh_email_lookup(params: WazuhEmailLookupInput) -> str:
 
     Querying the full year requires scanning many documents.  The internal scanner
     pages through alerts using ``search_after`` cursors params.until either the Indexer
-    is exhausted or ``max_scanned`` documents have been processed.
+    is exhausted or ``params.max_scanned`` documents have been processed.
 
     Args:
-        agent_name: Optional agent to filter (e.g. 'mailbox-new')
+        params.agent_name: Optional agent to filter (e.g. 'mailbox-new')
         params.since: ISO 8601 start (default: 365 days ago)
         params.until: ISO 8601 end (default: now)
         params.top_n: How many top emails to return (1-500, default 100)
         params.rule_groups: Comma-separated groups filter
         params.max_scanned: Hard cap on documents scanned (1000-200000, default 50000)
-        response_format: 'markdown' or 'json'
+        params.response_format: 'markdown' or 'json'
 
     Returns:
         str: Ranked table of email addresses with counts, unique IPs,
@@ -3853,7 +3853,7 @@ async def wazuh_email_lookup(params: WazuhEmailLookupInput) -> str:
     try:
         while total_scanned < params.max_scanned:
             data = await _wazuh_indexer_email_search(
-                agent_name=agent_name,
+                agent_name=params.agent_name,
                 size=page_size,
                 search_after=search_after,
                 since=since_str,
@@ -3931,7 +3931,7 @@ async def wazuh_email_lookup(params: WazuhEmailLookupInput) -> str:
     )
     high_freq = sum(1 for _, c in email_counter.items() if c >= 10)
 
-    if response_format == "json":
+    if params.response_format == "json":
         results = []
         for email, count in top_emails:
             results.append({
@@ -3971,7 +3971,7 @@ async def wazuh_email_lookup(params: WazuhEmailLookupInput) -> str:
         f"**Time window**: {since_str} to {until_str}",
         f"**Documents scanned**: {total_scanned:,}",
         f"**Unique emails found**: {total_unique:,}",
-        f"**Agent**: {agent_name or 'all agents'}",
+        f"**Agent**: {params.agent_name or 'all agents'}",
         f"**Rule groups**: {params.rule_groups or 'all'}",
         "",
         "## Top Email Addresses",
@@ -4255,24 +4255,24 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
 
     **Two modes**:
 
-    - **Single-page** (default, ``max_scanned`` not set): Returns one page of
-      results with a ``next_cursor``.  Call repeatedly with the cursor to manually
+    - **Single-page** (default, ``params.max_scanned`` not set): Returns one page of
+      results with a ``next_cursor``.  Call repeatedly with the params.cursor to manually
       iterate through all pages.
-    - **Full-scan** (set ``max_scanned`` to an integer ≥1000): Auto-paginates
+    - **Full-scan** (set ``params.max_scanned`` to an integer ≥1000): Auto-paginates
       internally across ALL matching pages and returns an aggregated summary
-      (global top IPs, top rule groups, top rules).  Set ``max_scanned`` high
+      (global top IPs, top rule groups, top rules).  Set ``params.max_scanned`` high
       enough to cover the time window — the scan stops when the indexer is
       exhausted or the ceiling is hit.
 
     Args:
         params.domain: Domain to search for (e.g. 'tangerangkota.go.id')
-        agent_name: Optional agent filter
+        params.agent_name: Optional agent filter
         params.since: ISO 8601 start in UTC (default: 365 days ago)
         params.until: ISO 8601 end in UTC (default: now)
-        limit: Max alerts per page in single-page mode (1-10000, default 500)
+        params.limit: Max alerts per page in single-page mode (1-10000, default 500)
         params.include_full_log: Include raw log lines (default false — forced false in full-scan mode)
-        cursor: Pagination cursor from previous response
-        response_format: 'markdown' or 'json'
+        params.cursor: Pagination params.cursor from previous response
+        params.response_format: 'markdown' or 'json'
         params.max_scanned: When set, run full-scan auto-pagination (see above)
         params.keyword: Free-text keyword to further narrow results
 
@@ -4288,8 +4288,8 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
     since_str, until_str = _parse_time_window(params.since, params.until)
 
     search_after: Optional[list] = None
-    if cursor:
-        decoded = _decode_cursor(cursor)
+    if params.cursor:
+        decoded = _decode_cursor(params.cursor)
         if decoded:
             search_after = decoded.get("search_after")
 
@@ -4302,8 +4302,8 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
     try:
         data = await _wazuh_indexer_domain_search(
             domain=params.domain,
-            agent_name=agent_name,
-            size=limit,
+            agent_name=params.agent_name,
+            size=params.limit,
             search_after=search_after,
             since=since_str,
             until=until_str,
@@ -4326,7 +4326,7 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
 
     # Build next cursor
     next_cursor = None
-    if hit_list and len(docs) >= limit:
+    if hit_list and len(docs) >= params.limit:
         last_sort = hit_list[-1].get("sort")
         if last_sort:
             next_cursor = _encode_cursor({"search_after": last_sort})
@@ -4347,12 +4347,12 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
         if rule_id:
             rule_counter[f"{rule_id}: {rule_desc}"] += 1
 
-    if response_format == "json":
+    if params.response_format == "json":
         output = {
             "domain": params.domain,
             "total": {"value": total_val, "relation": total_relation},
             "count": len(docs),
-            "size": limit,
+            "size": params.limit,
             "next_cursor": next_cursor,
             "timezone": "UTC",
             "since": since_str,
@@ -4381,7 +4381,7 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
         f"**Total matches**: {total_display}",
         f"**{page_info}**",
         f"**Time window**: {since_str} to {until_str}",
-        f"**Agent**: {agent_name or 'all agents'}",
+        f"**Agent**: {params.agent_name or 'all agents'}",
         "",
         "## Alerts",
         "",
@@ -4416,7 +4416,7 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
         lines.append("")
 
     if next_cursor:
-        lines.append(f"\n**Next cursor**: `{next_cursor}`")
+        lines.append(f"\n**Next params.cursor**: `{next_cursor}`")
     else:
         lines.append("\n**No more pages** - all results returned.")
 
@@ -4509,31 +4509,31 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
 
     Netra enrichment is **disabled by default** because it adds latency and consumes
     Netra API quota.  Set ``enrich_with_netra=true`` to enable it (max 10 IPs
-    enriched regardless of ``top_ips``).
+    enriched regardless of ``params.top_ips``).
 
     Args:
         params.emails: List of email addresses to analyze (1-50)
-        agent_name: Optional agent filter
+        params.agent_name: Optional agent filter
         params.since: ISO 8601 start (default: 365 days ago)
         params.until: ISO 8601 end (default: now)
         params.top_ips: Number of top attacker IPs to rank (1-100, default 20)
         params.enrich_with_netra: Query Netra for top IPs (default false)
-        response_format: 'markdown' or 'json'
+        params.response_format: 'markdown' or 'json'
 
     Returns:
         str: Ranked attacker IP list with targeted email counts, plus per-email
-        breakdown.  If enrich_with_netra is true, Netra threat scores are included
+        breakdown.  If params.enrich_with_netra is true, Netra threat scores are included
         for the top 10 IPs.
 
     Example usage:
-        - "Take the top 5 emails from the lookup and find who's attacking them"
+        - "Take the top 5 params.emails from the lookup and find who's attacking them"
         - "Enrich the attacker IPs for these compromised accounts through Netra"
     """
     _audit_log("wazuh_compromised_emails_analysis", {"top_ips": params.top_ips, "since": params.since})
     since_str, until_str = _parse_time_window(params.since, params.until)
 
     ip_counter: Counter[str] = Counter()
-    ip_to_emails: dict[str, set[str]] = {}  # IP -> set of targeted emails
+    ip_to_emails: dict[str, set[str]] = {}  # IP -> set of targeted params.emails
     email_to_ips: dict[str, Counter[str]] = {}  # email -> IP counter
     email_alert_counts: Counter[str] = Counter()  # email -> total alert count
     total_scanned = 0
@@ -4551,7 +4551,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
             while batch_scanned < max_batch_scanned:
                 data = await _wazuh_indexer_multi_email_search(
                     emails=batch,
-                    agent_name=agent_name,
+                    agent_name=params.agent_name,
                     size=page_size,
                     search_after=search_after,
                     since=since_str,
@@ -4608,8 +4608,8 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
     # Optional Netra enrichment for top IPs (max 10)
     netra_results: dict[str, dict] = {}
     if params.enrich_with_netra:
-        enrich_count = min(len(top_ips), 10)
-        for params.ip, _ in top_ips[:enrich_count]:
+        enrich_count = min(len(params.top_ips), 10)
+        for params.ip, _ in params.top_ips[:enrich_count]:
             try:
                 raw = await _netra_request(f"/analysis/{params.ip}")
                 data = raw.get("data", {})
@@ -4638,9 +4638,9 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
             except (httpx.HTTPStatusError, httpx.TimeoutException, Exception) as e:
                 netra_results[params.ip] = {"error": str(e)}
 
-    if response_format == "json":
+    if params.response_format == "json":
         attacker_ips = []
-        for params.ip, count in top_ips:
+        for params.ip, count in params.top_ips:
             entry: dict = {
                 "ip": params.ip,
                 "alert_count": count,
@@ -4678,7 +4678,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
         "",
         f"**Time window**: {since_str} to {until_str}",
         f"**Emails analyzed**: {len(params.emails)}",
-        f"**Agent**: {agent_name or 'all agents'}",
+        f"**Agent**: {params.agent_name or 'all agents'}",
         f"**Alerts scanned**: {total_scanned:,}",
         "",
         "## Top Attacker IPs",
@@ -4691,7 +4691,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
         lines.append(
             "|---|----|------------|-----------------|-------------|-------------|---------|"
         )
-        for i, (params.ip, count) in enumerate(top_ips, 1):
+        for i, (params.ip, count) in enumerate(params.top_ips, 1):
             targeted = len(ip_to_emails.get(params.ip, set()))
             nr = netra_results.get(params.ip, {})
             score = nr.get("threat_score", "-")
@@ -4707,7 +4707,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
         lines.append(
             "|---|----|------------|-----------------|"
         )
-        for i, (params.ip, count) in enumerate(top_ips, 1):
+        for i, (params.ip, count) in enumerate(params.top_ips, 1):
             targeted = len(ip_to_emails.get(params.ip, set()))
             lines.append(f"| {i} | {_escape_md_table(params.ip)} | {count:,} | {targeted} |")
 
@@ -4875,27 +4875,27 @@ async def wazuh_alert_timeline(params: WazuhAlertTimelineInput) -> str:
     """Return a time-bucketed breakdown of Wazuh alerts using OpenSearch date_histogram.
 
     Instead of fetching individual alert documents, this tool asks the Indexer to
-    bucket alert counts by time interval (per minute, per 15 minutes, per hour, etc.)
+    params.bucket alert counts by time interval (per minute, per 15 minutes, per hour, etc.)
     directly on the server — fast, even across millions of documents.
 
-    Each bucket includes:
+    Each params.bucket includes:
     - Total alert count
     - Count by severity band (low ≤4, medium 5-9, high ≥10)
-    - Top rules, top source IPs, and top agents within that bucket
+    - Top rules, top source IPs, and top agents within that params.bucket
 
     Args:
         params.since: Start of time window (default '1h').  Accepts ISO 8601 or relative
                      expressions ('5m', '1h', '24h', '7d', '30d').
         params.until: End of time window.  Defaults to now.
         params.bucket: Bucket size — '1m', '5m', '15m', '1h', '6h', '1d', or 'auto'.
-        agent_name: Optional agent filter.
+        params.agent_name: Optional agent filter.
         params.rule_groups: Optional comma-separated rule groups filter.
         params.rule_level_min: Only count alerts at or above this severity.
         params.keyword: Optional free-text keyword filter (e.g. 'gambling OR "brute force"').
-        response_format: 'markdown' or 'json'.
+        params.response_format: 'markdown' or 'json'.
 
     Returns:
-        str: Timeline table with per-bucket counts, severity bands, and top indicators.
+        str: Timeline table with per-params.bucket counts, severity bands, and top indicators.
 
     Example usage:
         - "Show me the alert timeline for the last hour"
@@ -4921,7 +4921,7 @@ async def wazuh_alert_timeline(params: WazuhAlertTimelineInput) -> str:
             bucket_interval=bucket_interval,
             since=since_str,
             until=until_str,
-            agent_name=agent_name,
+            agent_name=params.agent_name,
             rule_groups=rule_group_list,
             rule_level_min=params.rule_level_min,
             keyword=params.keyword,
@@ -4946,7 +4946,7 @@ async def wazuh_alert_timeline(params: WazuhAlertTimelineInput) -> str:
 
     total_alerts = sum(b.get("doc_count", 0) for b in buckets)
 
-    if response_format == "json":
+    if params.response_format == "json":
         return _truncate_if_needed(json.dumps({
             "window": {"since": since_str, "until": until_str},
             "bucket_interval": bucket_interval,
@@ -5047,7 +5047,7 @@ async def wazuh_alert_timeline(params: WazuhAlertTimelineInput) -> str:
         "## Query Parameters",
         f"- Since: `{params.since}`",
         f"- Bucket: `{bucket_interval}`",
-        f"- Agent: {agent_name or 'all'}",
+        f"- Agent: {params.agent_name or 'all'}",
         f"- Rule groups: {params.rule_groups or 'all'}",
         f"- Min level: {params.rule_level_min or 'none'}",
     ])
@@ -5124,11 +5124,11 @@ async def wazuh_attack_velocity(params: WazuhAttackVelocityInput = WazuhAttackVe
     Args:
         params.window: Window size — relative expression like '15m', '1h', '6h', '24h'.
                       '1h' compares the last hour against the hour before it.
-        agent_name: Optional agent filter.
+        params.agent_name: Optional agent filter.
         params.rule_groups: Optional comma-separated rule groups filter.
-        params.bucket: Bucket granularity within each window. 'auto' picks based on
-                      window size.
-        response_format: 'markdown' or 'json'.
+        params.bucket: Bucket granularity within each params.window. 'auto' picks based on
+                      params.window size.
+        params.response_format: 'markdown' or 'json'.
 
     Returns:
         str: Velocity report with trend classification, per-bucket comparison table,
@@ -5172,7 +5172,7 @@ async def wazuh_attack_velocity(params: WazuhAttackVelocityInput = WazuhAttackVe
                 bucket_interval=bucket_interval,
                 since=current_since,
                 until=current_until,
-                agent_name=agent_name,
+                agent_name=params.agent_name,
                 rule_groups=rule_group_list,
                 keyword=params.keyword,
             ),
@@ -5180,7 +5180,7 @@ async def wazuh_attack_velocity(params: WazuhAttackVelocityInput = WazuhAttackVe
                 bucket_interval=bucket_interval,
                 since=previous_since,
                 until=previous_until,
-                agent_name=agent_name,
+                agent_name=params.agent_name,
                 rule_groups=rule_group_list,
                 keyword=params.keyword,
             ),
@@ -5242,7 +5242,7 @@ async def wazuh_attack_velocity(params: WazuhAttackVelocityInput = WazuhAttackVe
             "trend": d_trend,
         })
 
-    if response_format == "json":
+    if params.response_format == "json":
         output = {
             "velocity_pct": round(velocity_pct, 1),
             "trend": trend,
@@ -5259,8 +5259,8 @@ async def wazuh_attack_velocity(params: WazuhAttackVelocityInput = WazuhAttackVe
     lines: list[str] = [
         f"# Attack Velocity — Last {window_str} vs Previous {window_str}",
         "",
-        f"**Current window**: {current_since} → {current_until}  ({total_current:,} alerts)",
-        f"**Previous window**: {previous_since} → {previous_until}  ({total_previous:,} alerts)",
+        f"**Current params.window**: {current_since} → {current_until}  ({total_current:,} alerts)",
+        f"**Previous params.window**: {previous_since} → {previous_until}  ({total_previous:,} alerts)",
         f"**Velocity**: {trend_icon} {velocity_pct:+.0f}% — **{trend}**",
         "",
         "| Bucket | Prev | Current | Delta | Trend |",
@@ -5298,7 +5298,7 @@ async def wazuh_attack_velocity(params: WazuhAttackVelocityInput = WazuhAttackVe
         "## Query Parameters",
         f"- Window: `{params.window}`",
         f"- Bucket: `{bucket_interval}`",
-        f"- Agent: {agent_name or 'all'}",
+        f"- Agent: {params.agent_name or 'all'}",
         f"- Rule groups: {params.rule_groups or 'all'}",
     ])
 
@@ -5557,7 +5557,7 @@ async def blueteam_fail2ban_jail_status(params: JailInput) -> str:
     if not shutil.which("fail2ban-client"):
         return _tool_not_found("fail2ban")
     r = _run(["fail2ban-client", "status", params.jail])
-    return _redact_alert_data(r["stdout"] or r["stderr"], bypass=bypass_redaction)
+    return _redact_alert_data(r["stdout"] or r["stderr"], bypass=params.bypass_redaction)
 
 
 class UnbanInput(BaseModel):
@@ -5623,7 +5623,7 @@ async def blueteam_hash_file(params: HashFileInput) -> str:
         params.algorithm: Hash algorithm
 
     Returns:
-        str: JSON with file params.path, size, hash algorithm, and hash value
+        str: JSON with file params.path, size, hash params.algorithm, and hash value
     """
     algo_map = {
         "md5": hashlib.md5,
@@ -5658,7 +5658,7 @@ async def blueteam_hash_file(params: HashFileInput) -> str:
             "modified": datetime.fromtimestamp(p.stat().st_mtime).isoformat(),
         }, indent=2)
         _audit_log("blueteam_hash_file", {"path": params.path, "algorithm": algo}, result[:200])
-        return _redact_alert_data(result, bypass=bypass_redaction)
+        return _redact_alert_data(result, bypass=params.bypass_redaction)
     except PermissionError:
         return json.dumps({"error": f"Permission denied reading {params.path}"})
     except Exception as e:
@@ -5727,18 +5727,18 @@ async def blueteam_rootkit_scan(params: RootkitInput) -> str:
     """
     _audit_log("blueteam_rootkit_scan", {"scanner": params.scanner})
     tool = params.tool.lower()
-    if tool == "rkhunter":
+    if params.tool == "rkhunter":
         if not shutil.which("rkhunter"):
             return _tool_not_found("rkhunter")
         r = _run(["rkhunter", "--check", "--skip-keypress", "--nocolors"], timeout=120)
-    elif tool == "chkrootkit":
+    elif params.tool == "chkrootkit":
         if not shutil.which("chkrootkit"):
             return _tool_not_found("chkrootkit")
         r = _run(["chkrootkit"], timeout=120)
     else:
-        return json.dumps({"error": f"Unknown tool '{tool}'. Use 'rkhunter' or 'chkrootkit'"})
+        return json.dumps({"error": f"Unknown params.tool '{params.tool}'. Use 'rkhunter' or 'chkrootkit'"})
 
-    return _redact_alert_data(r["stdout"] or r["stderr"], bypass=bypass_redaction)
+    return _redact_alert_data(r["stdout"] or r["stderr"], bypass=params.bypass_redaction)
 
 
 # SYSTEM HARDENING
@@ -6508,12 +6508,12 @@ async def wazuh_alert_aggregate_analysis(params: AggregateAnalysisInput) -> str:
         params.mode: Analysis params.mode (default 'summary').
         params.since: Start of time window (default '24h').
         params.until: End of time window (default: now).
-        agent_name: Optional agent filter.
+        params.agent_name: Optional agent filter.
         params.rule_groups: Optional comma-separated rule groups (e.g. 'authentication_failure').
         params.rule_level_min: Minimum rule level (e.g. 8).
         params.keyword: Optional free-text keyword filter.
         params.top_n: Top-N bucket size for terms aggregations (default 10).
-        response_format: 'markdown' (default) or 'json'.
+        params.response_format: 'markdown' (default) or 'json'.
 
     Returns:
         str: Structured statistical report — no raw documents.
@@ -6539,7 +6539,7 @@ async def wazuh_alert_aggregate_analysis(params: AggregateAnalysisInput) -> str:
     filters = _build_filter_clauses(
         since_str=since_str,
         until_str=until_str,
-        agent_name=agent_name,
+        agent_name=params.agent_name,
         rule_groups=rule_group_list,
         rule_level_min=params.rule_level_min,
         keyword=params.keyword,
@@ -6581,7 +6581,7 @@ async def wazuh_alert_aggregate_analysis(params: AggregateAnalysisInput) -> str:
         else:
             results_by_mode[mode_name] = result
 
-    if response_format == "json":
+    if params.response_format == "json":
         return _truncate_if_needed(json.dumps({
             "window": {"since": since_str, "until": until_str},
             "mode": params.mode,
@@ -6696,7 +6696,7 @@ async def wazuh_alert_dsl_query(params: DslQueryInput) -> str:
         params.query_json: Raw OpenSearch DSL JSON. MUST include ``"size": 0``
                           and an ``"aggs"`` (or ``"aggregations"``) block.
         params.index_pattern: Index pattern (default 'wazuh-alerts-*').
-        response_format: 'json' (default) or 'markdown'.
+        params.response_format: 'json' (default) or 'markdown'.
 
     Returns:
         str: OpenSearch aggregation response (JSON by default, markdown on request).
@@ -6723,7 +6723,7 @@ async def wazuh_alert_dsl_query(params: DslQueryInput) -> str:
     except (httpx.HTTPStatusError, httpx.TimeoutException, RuntimeError) as e:
         return _handle_api_error(e, context="wazuh_alert_dsl_query")
 
-    if response_format == "markdown":
+    if params.response_format == "markdown":
         if isinstance(data.get("error"), str):
             return f"# DSL Query Error\n\n**Error**: {data['error']}\n\n**Detail**: {data.get('detail', 'N/A')}"
         aggs = data.get("aggregations", data.get("aggs", {}))
@@ -6848,14 +6848,14 @@ async def wazuh_alert_focused_crawl(params: FocusedCrawlInput = FocusedCrawlInpu
     Args:
         params.src_ip: Specific source IP identified as a hot spot.
         params.rule_id: Specific rule ID (e.g. '5763') identified as a top offender.
-        agent_name: Filter to a specific agent.
+        params.agent_name: Filter to a specific agent.
         params.since: Start of time window (default '24h').
         params.until: End of time window (default: now).
         params.sample_size: Alert documents to retrieve (default 50, max 200).
         params.include_full_log: Include raw log lines (PII-redacted).
-        bypass_redaction: Skip PII masking for audit (if BLUETEAM_REDACT_PII allows).
+        params.bypass_redaction: Skip PII masking for audit (if BLUETEAM_REDACT_PII allows).
         params.fields: Comma-separated extra _source fields to include.
-        response_format: 'markdown' (default) or 'json'.
+        params.response_format: 'markdown' (default) or 'json'.
 
     Returns:
         str: Representative alert documents with full context, PII-redacted.
@@ -6898,7 +6898,7 @@ async def wazuh_alert_focused_crawl(params: FocusedCrawlInput = FocusedCrawlInpu
     try:
         data = await _wazuh_indexer_search(
             index_pattern=_WAZUH_INDEX_PATTERNS["alerts"],
-            agent_name=agent_name,
+            agent_name=params.agent_name,
             size=params.sample_size,
             srcip=params.src_ip,
             since=since_str,
@@ -6916,7 +6916,7 @@ async def wazuh_alert_focused_crawl(params: FocusedCrawlInput = FocusedCrawlInpu
     hit_list = hits.get("hits", [])
 
     # Apply PII redaction to all document bodies
-    docs = [_redact_alert_data(h.get("_source", h), bypass=bypass_redaction) for h in hit_list]
+    docs = [_redact_alert_data(h.get("_source", h), bypass=params.bypass_redaction) for h in hit_list]
 
     # Build next_cursor for further pagination within the same slice
     next_cursor = None
@@ -6941,7 +6941,7 @@ async def wazuh_alert_focused_crawl(params: FocusedCrawlInput = FocusedCrawlInpu
             band = "high" if lvl >= 10 else ("medium" if lvl >= 5 else "low")
             level_counts[band] = level_counts.get(band, 0) + 1
 
-    if response_format == "json":
+    if params.response_format == "json":
         return _truncate_if_needed(json.dumps({
             "window": {"since": since_str, "until": until_str},
             "filter": {
@@ -6972,8 +6972,8 @@ async def wazuh_alert_focused_crawl(params: FocusedCrawlInput = FocusedCrawlInpu
         lines.append(f"| Source IP | `{params.src_ip}` |")
     if params.rule_id:
         lines.append(f"| Rule ID | `{params.rule_id}` |")
-    if agent_name:
-        lines.append(f"| Agent | `{agent_name}` |")
+    if params.agent_name:
+        lines.append(f"| Agent | `{params.agent_name}` |")
     lines.extend([
         f"| Total matching | {total_val} ({total.get('relation', 'eq')}) |",
         f"| Retrieved | {len(docs)} |",
