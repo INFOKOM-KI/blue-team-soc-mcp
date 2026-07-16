@@ -717,3 +717,14 @@ qualifier, while the other Wazuh tools use `blueteam_wazuh_`:
 Per CLAUDE.md Hard Rule 1, these names are frozen to avoid breaking active
 client workflows. A future major version may introduce the `blueteam_wazuh_`
 aliases alongside a deprecation window for the short names.
+
+## Development Guardrails
+
+Before deploying, run the automated regression linter:
+
+```bash
+python3 check_guardrails.py        # 5 checks: unbound locals, params. misuse, import order, closures
+python3 check_guardrails.py --strict  # CI mode: non-zero exit on any warning
+```
+
+See `CLAUDE.md` §5 for the full pre-merge checklist.

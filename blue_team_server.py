@@ -1586,7 +1586,7 @@ async def crowdsec_ip_reputation(params: CrowdsecIpReputationInput) -> str:
 
     if params.response_format == "json":
         output = {
-            "ip": ip,
+            "ip": params.ip,
             "reputation": raw.get("reputation", "unknown"),
             "as_name": raw.get("as_name"),
             "ip_range_score": raw.get("ip_range_score"),
@@ -2561,7 +2561,7 @@ async def blueteam_read_web_log(params: WebLogInput) -> str:
     if params.grep:
         safe_grep = _sanitize_regex(params.grep)
         params.lines = [l for l in content.splitlines() if re.search(safe_grep, l, re.IGNORECASE)]
-        return _redact_alert_data("\n".join(params.lines, bypass=bypass_redaction) if params.lines else f"No matches for: {params.grep}")
+        return _redact_alert_data("\n".join(params.lines, bypass=params.bypass_redaction) if params.lines else f"No matches for: {params.grep}")
     return _redact_alert_data(content, bypass=params.bypass_redaction)
 
 class JournalInput(BaseModel):
@@ -4141,7 +4141,7 @@ async def _wazuh_domain_lookup_full_scan(
         + ("+" if global_total_relation == "gte" else "")
     )
 
-    if response_format == "json":
+    if params.response_format == "json":
         output = {
             "domain": params.domain,
             "mode": "full_scan",
@@ -4152,7 +4152,7 @@ async def _wazuh_domain_lookup_full_scan(
             "timezone": "UTC",
             "since": since_str,
             "until": until_str,
-            "agent": agent_name or "all agents",
+            "agent": params.agent_name or "all agents",
             "aggregations": {
                 "top_srcips": [
                     {"ip": ip, "count": c}
@@ -4173,7 +4173,7 @@ async def _wazuh_domain_lookup_full_scan(
 
     #Markdown output
     lines: list[str] = [
-        f"#Wazuh Domain Lookup - {domain} (Full Scan)",
+        f"#Wazuh Domain Lookup - {params.domain} (Full Scan)",
         "",
         f"**Total matches in indexer**: {total_display}",
         f"**Scanned**: {total_scanned:,} docs across {pages} page(s)",
@@ -4181,7 +4181,7 @@ async def _wazuh_domain_lookup_full_scan(
         + ("(all matching alerts retrieved)" if coverage == "complete"
            else f"(hit max_scanned={params.max_scanned:,} limit)"),
         f"**Time window**: {since_str} to {until_str}",
-        f"**Agent**: {agent_name or 'all agents'}",
+        f"**Agent**: {params.agent_name or 'all agents'}",
         "",
     ]
 

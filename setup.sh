@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Blue Team MCP Server Setup Script
+# Blue Team Wazuh MCP Server Setup Script
 set -e
 
 INSTALL_DIR="/opt/blue-team-mcp"
 SERVICE_USER="blueteam-mcp"
 
 echo "=============================================="
-echo "  Blue Team MCP Server - Setup"
+echo "  Blue Team Wazuh MCP Server - Setup"
 echo "=============================================="
 
 # Root check
