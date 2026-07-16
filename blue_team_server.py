@@ -3422,7 +3422,7 @@ async def _wazuh_indexer_search_full_scan(
             since=since,
             until=until,
             keyword=params.keyword,
-            srcips=srcips,
+            srcips=params.srcips,
             fields=params.fields,
             rule_groups=params.rule_groups,
         )
@@ -3635,7 +3635,7 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhI
         since=params.since,
         until=params.until,
         keyword=params.keyword,
-        srcips=srcips,
+        srcips=params.srcips,
         fields=params.fields,
         rule_groups=params.rule_groups,
     )
@@ -3955,7 +3955,7 @@ async def wazuh_email_lookup(params: WazuhEmailLookupInput) -> str:
                 "emails_with_10plus_appearances": high_freq,
             },
             "query": {
-                "agent_name": agent_name,
+                "agent_name": params.agent_name,
                 "rule_groups": params.rule_groups,
                 "since": since_str,
                 "until": until_str,
@@ -6947,7 +6947,7 @@ async def wazuh_alert_focused_crawl(params: FocusedCrawlInput = FocusedCrawlInpu
             "filter": {
                 "src_ip": params.src_ip,
                 "rule_id": params.rule_id,
-                "agent_name": agent_name,
+                "agent_name": params.agent_name,
             },
             "total": {"value": total.get("value", 0), "relation": total.get("relation", "eq")},
             "count": len(docs),
