@@ -3841,7 +3841,7 @@ async def wazuh_email_lookup(params: WazuhEmailLookupInput) -> str:
         rule_group_list = [g.strip() for g in params.rule_groups.split(",") if g.strip()]
 
     email_counter: Counter[str] = Counter()
-    email_srcips: dict[str, set[str]] = {}    # email -> set of params.srcip
+    email_srcips: dict[str, set[str]] = {}    # email -> set of srcip
     email_rules: dict[str, set[str]] = {}     # email -> set of "rule_id: description"
     email_groups: dict[str, set[str]] = {}    # email -> set of rule groups
     email_first_seen: dict[str, str] = {}     # email -> earliest timestamp
@@ -3878,7 +3878,7 @@ async def wazuh_email_lookup(params: WazuhEmailLookupInput) -> str:
             for doc in docs:
                 emails = _extract_emails_from_doc(doc)
                 ts = doc.get("@timestamp", "")
-                params.srcip = (doc.get("data") or {}).get("srcip", "")
+                srcip = (doc.get("data") or {}).get("srcip", "")
                 rule = doc.get("rule") or {}
                 rule_id = rule.get("id", "")
                 rule_desc = rule.get("description", "")
@@ -3886,8 +3886,8 @@ async def wazuh_email_lookup(params: WazuhEmailLookupInput) -> str:
 
                 for email in emails:
                     email_counter[email] += 1
-                    if params.srcip:
-                        email_srcips.setdefault(email, set()).add(params.srcip)
+                    if srcip:
+                        email_srcips.setdefault(email, set()).add(srcip)
                     if rule_id:
                         email_rules.setdefault(email, set()).add(f"{rule_id}: {rule_desc}")
                     for g in groups:
@@ -4570,7 +4570,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
                     break
 
                 for doc in docs:
-                    params.srcip = (doc.get("data") or {}).get("srcip", "")
+                    srcip = (doc.get("data") or {}).get("srcip", "")
                     # Also extract emails from this doc for association
                     doc_emails = _extract_emails_from_doc(doc)
                     # Intersect with our target list
@@ -4578,11 +4578,11 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
                     if not matched:
                         continue
 
-                    if params.srcip:
-                        ip_counter[params.srcip] += 1
-                        ip_to_emails.setdefault(params.srcip, set()).update(matched)
+                    if srcip:
+                        ip_counter[srcip] += 1
+                        ip_to_emails.setdefault(srcip, set()).update(matched)
                         for email in matched:
-                            email_to_ips.setdefault(email, Counter())[params.srcip] += 1
+                            email_to_ips.setdefault(email, Counter())[srcip] += 1
                             email_alert_counts[email] += 1
 
                 batch_scanned += len(docs)
