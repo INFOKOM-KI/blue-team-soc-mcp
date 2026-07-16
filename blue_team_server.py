@@ -1586,7 +1586,7 @@ async def crowdsec_ip_reputation(params: CrowdsecIpReputationInput) -> str:
 
     if params.response_format == "json":
         output = {
-            "ip": params.ip,
+            "ip": ip,
             "reputation": raw.get("reputation", "unknown"),
             "as_name": raw.get("as_name"),
             "ip_range_score": raw.get("ip_range_score"),
@@ -3415,7 +3415,7 @@ async def _wazuh_indexer_search_full_scan(
     async def _fetch_page(ps: int, sa):
         return await _wazuh_indexer_search(
             index_pattern=index_pattern,
-            agent_name=agent_name,
+            agent_name=params.agent_name,
             size=ps,
             search_after=sa,
             srcip=srcip,
@@ -4095,8 +4095,8 @@ async def _wazuh_domain_lookup_full_scan(
 
     async def _fetch_page(ps: int, sa):
         return await _wazuh_indexer_domain_search(
-            domain=domain,
-            agent_name=agent_name,
+            domain=params.domain,
+            agent_name=params.agent_name,
             size=ps,
             search_after=sa,
             since=since_str,
@@ -4143,7 +4143,7 @@ async def _wazuh_domain_lookup_full_scan(
 
     if response_format == "json":
         output = {
-            "domain": domain,
+            "domain": params.domain,
             "mode": "full_scan",
             "total": {"value": global_total_val, "relation": global_total_relation},
             "scanned": total_scanned,
@@ -4360,7 +4360,7 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
             "alerts": docs,
             "aggregations": {
                 "top_srcips": [
-                    {"ip": params.ip, "count": c} for params.ip, c in srcip_counter.most_common(20)
+                    {"ip": ip, "count": c} for params.ip, c in srcip_counter.most_common(20)
                 ],
                 "top_rule_groups": [
                     {"group": g, "count": c} for g, c in rule_group_counter.most_common(20)
@@ -4404,7 +4404,7 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
         lines.append("| IP | Alert Count |")
         lines.append("|----|-------------|")
         for params.ip, c in srcip_counter.most_common(20):
-            lines.append(f"| {_escape_md_table(params.ip)} | {c:,} |")
+            lines.append(f"| {_escape_md_table(ip)} | {c:,} |")
         lines.append("")
 
     if rule_group_counter:
@@ -4609,9 +4609,9 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
     netra_results: dict[str, dict] = {}
     if params.enrich_with_netra:
         enrich_count = min(len(params.top_ips), 10)
-        for params.ip, _ in params.top_ips[:enrich_count]:
+        for ip, _ in params.top_ips[:enrich_count]:
             try:
-                raw = await _netra_request(f"/analysis/{params.ip}")
+                raw = await _netra_request(f"/analysis/{ip}")
                 data = raw.get("data", {})
                 results = data.get("results", {})
                 ts = results.get("threat_score", {})
@@ -4619,7 +4619,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
                 vt = results.get("virustotal", {})
                 ab = results.get("abuseipdb", {})
                 geo = results.get("ipapi", {})
-                netra_results[params.ip] = {
+                netra_results[ip] = {
                     "threat_score": ts.get("score"),
                     "threat_level": ts.get("level"),
                     "breakdown": ts.get("breakdown"),
@@ -4636,19 +4636,19 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
                 # Rate-limit courtesy: 1s delay between Netra calls
                 await asyncio.sleep(1)
             except (httpx.HTTPStatusError, httpx.TimeoutException, Exception) as e:
-                netra_results[params.ip] = {"error": str(e)}
+                netra_results[ip] = {"error": str(e)}
 
     if params.response_format == "json":
         attacker_ips = []
-        for params.ip, count in params.top_ips:
+        for ip, count in params.top_ips:
             entry: dict = {
-                "ip": params.ip,
+                "ip": ip,
                 "alert_count": count,
-                "targeted_emails": sorted(ip_to_emails.get(params.ip, set())),
-                "targeted_email_count": len(ip_to_emails.get(params.ip, set())),
+                "targeted_emails": sorted(ip_to_emails.get(ip, set())),
+                "targeted_email_count": len(ip_to_emails.get(ip, set())),
             }
-            if params.ip in netra_results:
-                entry["netra"] = netra_results[params.ip]
+            if ip in netra_results:
+                entry["netra"] = netra_results[ip]
             attacker_ips.append(entry)
 
         per_email: dict[str, dict] = {}
@@ -4657,8 +4657,8 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
             per_email[email] = {
                 "total_alerts": email_alert_counts.get(email, 0),
                 "attacker_ips": [
-                    {"ip": params.ip, "count": c}
-                    for params.ip, c in ips_for_email.most_common(20)
+                    {"ip": ip, "count": c}
+                    for ip, c in ips_for_email.most_common(20)
                 ],
             }
 
@@ -4691,14 +4691,14 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
         lines.append(
             "|---|----|------------|-----------------|-------------|-------------|---------|"
         )
-        for i, (params.ip, count) in enumerate(params.top_ips, 1):
-            targeted = len(ip_to_emails.get(params.ip, set()))
+        for i, (ip, count) in enumerate(params.top_ips, 1):
+            targeted = len(ip_to_emails.get(ip, set()))
             nr = netra_results.get(params.ip, {})
             score = nr.get("threat_score", "-")
             level = nr.get("threat_level", "-")
             country = nr.get("country_name") or nr.get("country") or "-"
             lines.append(
-                f"| {i} | {_escape_md_table(params.ip)} | {count:,} | {targeted} | {score} | {_escape_md_table(str(level))} | {_escape_md_table(str(country))} |"
+                f"| {i} | {_escape_md_table(ip)} | {count:,} | {targeted} | {score} | {_escape_md_table(str(level))} | {_escape_md_table(str(country))} |"
             )
     else:
         lines.append(
@@ -4707,9 +4707,9 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
         lines.append(
             "|---|----|------------|-----------------|"
         )
-        for i, (params.ip, count) in enumerate(params.top_ips, 1):
-            targeted = len(ip_to_emails.get(params.ip, set()))
-            lines.append(f"| {i} | {_escape_md_table(params.ip)} | {count:,} | {targeted} |")
+        for i, (ip, count) in enumerate(params.top_ips, 1):
+            targeted = len(ip_to_emails.get(ip, set()))
+            lines.append(f"| {i} | {_escape_md_table(ip)} | {count:,} | {targeted} |")
 
     lines.append("")
     lines.append("## Per-Email Summary")
@@ -4721,9 +4721,9 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
         if ips_for_email:
             lines.append("| IP | Count | Netra Level |")
             lines.append("|----|-------|-------------|")
-            for params.ip, c in ips_for_email.most_common(10):
+            for ip, c in ips_for_email.most_common(10):
                 level = (netra_results.get(params.ip) or {}).get("threat_level", "-")
-                lines.append(f"| {_escape_md_table(params.ip)} | {c:,} | {_escape_md_table(str(level))} |")
+                lines.append(f"| {_escape_md_table(ip)} | {c:,} | {_escape_md_table(str(level))} |")
         else:
             lines.append("_No attacker IPs found for this email._")
         lines.append("")
