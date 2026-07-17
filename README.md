@@ -723,7 +723,7 @@ aliases alongside a deprecation window for the short names.
 Before deploying, run the automated regression linter:
 
 ```bash
-python3 check_guardrails.py        # 5 checks: unbound locals, params. misuse, import order, closures
+python3 check_guardrails.py        # 6 checks: unbound locals, params. misuse, import order, closures, drift, overaggressive
 python3 check_guardrails.py --strict  # CI mode: non-zero exit on any warning
 ```
 
