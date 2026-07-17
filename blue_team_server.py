@@ -2504,8 +2504,8 @@ async def blueteam_read_syslog(params: LogInput) -> str:
             content = _tail_file(path, params.lines)
             if params.grep:
                 safe_grep = _sanitize_regex(params.grep)
-                params.lines = [l for l in content.splitlines() if re.search(safe_grep, l, re.IGNORECASE)]
-                return _redact_alert_data("\n".join(lines, bypass=params.bypass_redaction) if lines else f"No matches for: {params.grep}")
+                lines = [l for l in content.splitlines() if re.search(safe_grep, l, re.IGNORECASE)]
+                return _redact_alert_data("\n".join(lines), bypass=params.bypass_redaction) if lines else f"No matches for: {params.grep}"
             return _redact_alert_data(content, bypass=params.bypass_redaction)
     # Fallback to journalctl
     cmd = ["journalctl", "-n", str(params.lines), "--no-pager"]
@@ -3684,7 +3684,7 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhI
     lines = [
         f"# Wazuh Indexer Search Results",
         f"",
-        f"**Total**: {total_val} ({total_relation}) | **Returned**: {len(docs)} | **Page params.size**: {limit}",
+        f"**Total**: {total_val} ({total_relation}) | **Returned**: {len(docs)} | **Page params.size**: {params.limit}",
         f"**Index**: {params.index_type} | **Timezone**: UTC",
     ]
     if params.since or params.until:
@@ -3700,12 +3700,12 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhI
         agent = str((d.get("agent") or {}).get("name", ""))[:25]
         rule_id = str((d.get("rule") or {}).get("id", ""))
         level = str((d.get("rule") or {}).get("level", ""))
-        params.srcip = str(
+        srcip = str(
             (d.get("data") or {}).get("srcip")
             or d.get("srcip", "")
         )[:18]
         desc = str((d.get("rule") or {}).get("description", ""))[:60]
-        lines.append(f"| {i} | {_escape_md_table(ts)} | {_escape_md_table(agent)} | {_escape_md_table(rule_id)} | {_escape_md_table(level)} | {_escape_md_table(params.srcip)} | {_escape_md_table(desc)} |")
+        lines.append(f"| {i} | {_escape_md_table(ts)} | {_escape_md_table(agent)} | {_escape_md_table(rule_id)} | {_escape_md_table(level)} | {_escape_md_table(srcip)} | {_escape_md_table(desc)} |")
     if len(docs) > 100:
         lines.append(f"")
         lines.append(f"_(showing first 100 of {len(docs)} documents — set response_format=json for full output)_")
@@ -6591,20 +6591,66 @@ async def wazuh_alert_aggregate_analysis(params: AggregateAnalysisInput) -> str:
 
 
 # Tier 2: wazuh_alert_dsl_query - power user escape hatch (size: 0 enforced)
+
+def _check_no_scripts(obj: Any, path: str = "") -> None:
+    """Reject scripted aggregations — shared by DslQueryInput validators."""
+    if isinstance(obj, dict):
+        if "script" in obj and path:
+            raise ValueError(
+                f"Script found at '{path}' — scripted aggregations are not "
+                "supported in this tool for security and performance reasons."
+            )
+        for k, val in obj.items():
+            _check_no_scripts(val, f"{path}.{k}" if path else k)
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj):
+            _check_no_scripts(item, f"{path}[{i}]")
+
+
 class DslQueryInput(BaseModel):
-    """Input model for wazuh_alert_dsl_query — raw OpenSearch DSL, aggregation-only."""
+    """Input model for wazuh_alert_dsl_query — structured OpenSearch DSL, aggregation-only.
+
+    Two input paths (mutually exclusive):
+    1. **Structured (preferred)**: pass ``aggs`` (and optionally ``query``) as native JSON
+       objects. Pydantic validates the shape; the server serializes to the OpenSearch wire
+       format. No JSON-in-JSON escaping — safe for LLM callers.
+    2. **Raw string (deprecated)**: pass ``query_json`` as a pre-serialized DSL string.
+       Requires correct double-escaping for nested quotes. Use only for backward compat.
+    """
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
-    query_json: str = Field(
-        ...,
+    # --- Structured path (preferred) ---
+    aggs: Optional[dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "OpenSearch aggregation tree as a native JSON object. "
+            "Example: {\"by_agent\": {\"terms\": {\"field\": \"agent.name\", \"size\": 50}}}. "
+            "Pass this (not query_json) for all new queries — the server serializes to the "
+            "wire format, eliminating the JSON-in-JSON escaping trap."
+        ),
+    )
+    query: Optional[dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Optional query filter dict (same shape as OpenSearch query DSL). "
+            "Example: {\"bool\": {\"must\": [{\"range\": {\"@timestamp\": {\"gte\": \"now-6h\"}}}]}}. "
+            "Only valid when ``aggs`` is set."
+        ),
+    )
+
+    # --- Raw string path (deprecated — backward compat only) ---
+    query_json: Optional[str] = Field(
+        default=None,
         min_length=5,
         max_length=10240,
         description=(
-            "Raw OpenSearch DSL JSON payload. MUST use 'size': 0 (aggregation-only). "
-            "Any query requesting document hits (size > 0) will be rejected. "
-            "Docs: https://opensearch.org/docs/latest/aggregations/"
+            "[DEPRECATED] Raw OpenSearch DSL JSON string. Prefer ``aggs`` + ``query`` instead. "
+            "MUST use 'size': 0 (aggregation-only). "
+            "When using this path, Painless script quotes require quadruple backslash escaping "
+            "(\\\\\") to survive JSON-in-JSON double-serialization — see SKILLS.md §14.11."
         ),
     )
+
     index_pattern: str = Field(
         default="wazuh-alerts-*",
         max_length=128,
@@ -6616,10 +6662,39 @@ class DslQueryInput(BaseModel):
         description="'json' (default, machine-readable) or 'markdown'.",
     )
 
+    @model_validator(mode="after")
+    def require_exactly_one_input_path(self):
+        """Mutually exclusive: structured (aggs) or raw (query_json), not both, not neither."""
+        has_aggs = self.aggs is not None
+        has_query_json = self.query_json is not None
+        if has_aggs and has_query_json:
+            raise ValueError(
+                "Pass either 'aggs' (structured, preferred) or 'query_json' (raw, deprecated), not both."
+            )
+        if not has_aggs and not has_query_json:
+            raise ValueError(
+                "Either 'aggs' (structured, preferred) or 'query_json' (raw, deprecated) is required."
+            )
+        if self.query is not None and not has_aggs:
+            raise ValueError("'query' is only valid when 'aggs' is set, not with 'query_json'.")
+        return self
+
+    @field_validator("aggs")
+    @classmethod
+    def validate_aggs(cls, v: Optional[dict]) -> Optional[dict]:
+        """Reject scripted aggregations in the structured path."""
+        if v is not None:
+            if not v:
+                raise ValueError("'aggs' must contain at least one aggregation.")
+            _check_no_scripts(v, "aggs")
+        return v
+
     @field_validator("query_json")
     @classmethod
-    def validate_dsl(cls, v: str) -> str:
-        """Parse the JSON and enforce size: 0 — no document hits allowed."""
+    def validate_dsl(cls, v: Optional[str]) -> Optional[str]:
+        """Parse the JSON and enforce size: 0 — no document hits allowed. Deprecated path."""
+        if v is None:
+            return v
         try:
             parsed = json.loads(v)
         except json.JSONDecodeError as e:
@@ -6640,20 +6715,6 @@ class DslQueryInput(BaseModel):
                 "query_json must contain 'aggs' or 'aggregations' key. "
                 "This tool is for aggregation queries only."
             )
-
-        # Reject scripted aggregations that could be expensive
-        def _check_no_scripts(obj: Any, path: str = "") -> None:
-            if isinstance(obj, dict):
-                if "script" in obj and path:
-                    raise ValueError(
-                        f"Script found at '{path}' — scripted aggregations are not "
-                        "supported in this tool for security and performance reasons."
-                    )
-                for k, val in obj.items():
-                    _check_no_scripts(val, f"{path}.{k}" if path else k)
-            elif isinstance(obj, list):
-                for i, item in enumerate(obj):
-                    _check_no_scripts(item, f"{path}[{i}]")
 
         _check_no_scripts(parsed)
         return v
@@ -6688,23 +6749,34 @@ async def wazuh_alert_dsl_query(params: DslQueryInput) -> str:
     DSL must use ``"size": 0`` — raw document retrieval is rejected at validation
     time. Scripted aggregations are also blocked for security.
 
+    **Two input paths** (mutually exclusive):
+    - **Structured (preferred)**: pass ``params.aggs`` (and optionally ``params.query``)
+      as native JSON objects. The server serializes to the OpenSearch wire format —
+      no JSON-in-JSON escaping required. Safe for LLM callers.
+    - **Raw string (deprecated)**: pass ``params.query_json`` as a pre-serialized DSL
+      string. Requires correct double-escaping for nested quotes — see SKILLS.md §14.11.
+
     Use this when you need a specific OpenSearch aggregation (percentiles,
     geo_distance, nested, reverse_nested, etc.) that the built-in tools
     do not expose.
 
     Args:
-        params.query_json: Raw OpenSearch DSL JSON. MUST include ``"size": 0``
-                          and an ``"aggs"`` (or ``"aggregations"``) block.
+        params.aggs: OpenSearch aggregation tree as a native dict (preferred path).
+        params.query: Optional query filter dict (only with ``aggs``).
+        params.query_json: [DEPRECATED] Raw OpenSearch DSL JSON string.
         params.index_pattern: Index pattern (default 'wazuh-alerts-*').
         params.response_format: 'json' (default) or 'markdown'.
 
     Returns:
         str: OpenSearch aggregation response (JSON by default, markdown on request).
 
-    Example usage:
-        - "Compute percentile latency distribution across all alert documents"
-        - "Group alerts by geo_point and return top regions"
-        - "Nested aggregation: alerts per agent, then per rule within each agent"
+    Example usage (structured path):
+        - aggs={"by_agent": {"terms": {"field": "agent.name", "size": 50}}}
+        - aggs={"hourly": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1h"}}},
+          query={"bool": {"must": [{"range": {"@timestamp": {"gte": "now-24h"}}}]}}
+
+    Example usage (deprecated raw path):
+        - query_json='{"size":0,"aggs":{"by_agent":{"terms":{"field":"agent.name"}}}}'
 
     Error Handling:
         - Invalid JSON → rejected at Pydantic validation
@@ -6715,9 +6787,20 @@ async def wazuh_alert_dsl_query(params: DslQueryInput) -> str:
     Docs: https://opensearch.org/docs/latest/aggregations/
     """
     _audit_log("wazuh_alert_dsl_query", {"index": params.index_pattern})
+
+    # Build the DSL body — structured path (preferred) or raw path (deprecated)
+    if params.aggs is not None:
+        body: dict[str, Any] = {"size": 0, "aggs": params.aggs}
+        if params.query is not None:
+            body["query"] = params.query
+    else:
+        logger.warning("wazuh_alert_dsl_query: query_json (raw string) path is deprecated. "
+                       "Use 'aggs' + 'query' dicts instead to avoid JSON-in-JSON escaping issues.")
+        body = json.loads(params.query_json)  # type: ignore[arg-type]
+
     try:
         data = await _wazuh_indexer_post(
-            json.loads(params.query_json),
+            body,
             index_pattern=params.index_pattern,
         )
     except (httpx.HTTPStatusError, httpx.TimeoutException, RuntimeError) as e:
