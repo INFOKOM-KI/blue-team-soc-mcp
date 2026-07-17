@@ -6909,8 +6909,8 @@ class FocusedCrawlInput(BaseModel):
                 return None
             parts = [p.strip() for p in v.split(",") if p.strip()]
             for p in parts:
-                if not re.match(r"^[a-zA-Z0-9_.]+$", p):
-                    raise ValueError(f"Invalid field name: '{p}'. Use only alphanumeric, dots, underscores.")
+                if not re.match(r"^[a-zA-Z0-9_@.\-]+$", p):
+                    raise ValueError(f"Invalid field name: '{p}'. Use only alphanumeric, dots, underscores, @, hyphens.")
         return v
 
 
