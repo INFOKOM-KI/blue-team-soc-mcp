@@ -6593,11 +6593,11 @@ async def wazuh_alert_aggregate_analysis(params: AggregateAnalysisInput) -> str:
 # Tier 2: wazuh_alert_dsl_query - power user escape hatch (size: 0 enforced)
 
 def _check_no_scripts(obj: Any, path: str = "") -> None:
-    """Reject scripted aggregations — shared by DslQueryInput validators."""
+    """Reject scripted aggregations - shared by DslQueryInput validators."""
     if isinstance(obj, dict):
         if "script" in obj and path:
             raise ValueError(
-                f"Script found at '{path}' — scripted aggregations are not "
+                f"Script found at '{path}' - scripted aggregations are not "
                 "supported in this tool for security and performance reasons."
             )
         for k, val in obj.items():
@@ -6608,7 +6608,7 @@ def _check_no_scripts(obj: Any, path: str = "") -> None:
 
 
 class DslQueryInput(BaseModel):
-    """Input model for wazuh_alert_dsl_query — structured OpenSearch DSL, aggregation-only.
+    """Input model for wazuh_alert_dsl_query - structured OpenSearch DSL, aggregation-only.
 
     Two input paths (mutually exclusive):
     1. **Structured (preferred)**: pass ``aggs`` (and optionally ``query``) as native JSON
@@ -6619,7 +6619,7 @@ class DslQueryInput(BaseModel):
     """
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
-    # --- Structured path (preferred) ---
+    # Structured path (preferred)
     aggs: Optional[dict[str, Any]] = Field(
         default=None,
         description=(
@@ -6638,7 +6638,7 @@ class DslQueryInput(BaseModel):
         ),
     )
 
-    # --- Raw string path (deprecated — backward compat only) ---
+    # Raw string path (deprecated — backward compat only)
     query_json: Optional[str] = Field(
         default=None,
         min_length=5,
