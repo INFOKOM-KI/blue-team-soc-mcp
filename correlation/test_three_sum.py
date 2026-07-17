@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Self-contained assert-based tests for the inlined 3-Sum engine.
-Run:  python3 correlation/test_three_sum.py
+Run: python3 correlation/test_three_sum.py
 No test framework required - pure assert checks.
 Imports directly from blue_team_server.py.
 """

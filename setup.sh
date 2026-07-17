@@ -101,6 +101,12 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 # Forensic Mode (ADMIN GATE — off by default)
 # export BLUETEAM_ALLOW_UNTRUNCATED="false"
 
+# Sangfor Blocklist Integration (optional — set SANGFOR_BLOCKLIST_TOKEN to enable sangfor_blocklist_* tools)
+# export SANGFOR_BLOCKLIST_URL="http://172.16.9.148:8088/blocklist"
+# export SANGFOR_BLOCKLIST_TOKEN="your_sangfor_bearer_token"
+# export SANGFOR_BLOCKLIST_TIMEOUT="15"
+# export SANGFOR_BLOCKLIST_VERIFY_SSL="false"   # set to "true" for production / trusted CA
+
 # Data masking (see SECURITY.md §4 for the three-layer model)
 # export BLUETEAM_REDACT_EMAILS="true"
 # 
@@ -136,7 +142,7 @@ fi
 # Wrapper scripts
 echo "[5/7] Creating MCP server wrapper scripts..."
 
-# Main wrapper: mcp-server-blueteam (all 48 tools)
+# Main wrapper: mcp-server-blueteam (all 50 tools)
 cat > /usr/local/bin/mcp-server-blueteam << 'EOF'
 #!/usr/bin/env bash
 # Wrapper - Claude Desktop calls this via SSH (MAESTRO-compliant)
@@ -149,6 +155,10 @@ export NETRA_VERIFY_SSL="${NETRA_VERIFY_SSL:-false}"
 export ARGUS_API_KEY="${ARGUS_API_KEY:-}"
 export ARGUS_BASE_URL="${ARGUS_BASE_URL:-}"
 export ARGUS_VERIFY_SSL="${ARGUS_VERIFY_SSL:-false}"
+export SANGFOR_BLOCKLIST_URL="${SANGFOR_BLOCKLIST_URL:-}"
+export SANGFOR_BLOCKLIST_TOKEN="${SANGFOR_BLOCKLIST_TOKEN:-}"
+export SANGFOR_BLOCKLIST_TIMEOUT="${SANGFOR_BLOCKLIST_TIMEOUT:-15}"
+export SANGFOR_BLOCKLIST_VERIFY_SSL="${SANGFOR_BLOCKLIST_VERIFY_SSL:-false}"
 export BLUETEAM_AUDIT_LOG="${BLUETEAM_AUDIT_LOG:-}"
 export BLUETEAM_RATE_LIMIT="${BLUETEAM_RATE_LIMIT:-0}"
 export BLUETEAM_REDACT_PII="${BLUETEAM_REDACT_PII:-true}"
@@ -223,7 +233,7 @@ echo "  GreyNoise Community needs no key — greynoise_ip_context works immediat
 echo ""
 echo "Wrapper entry points installed:"
 echo ""
-echo "  mcp-server-blueteam    — All 48 tools (Wazuh, threat intel, host forensics, 3-Sum correlation)"
+echo "  mcp-server-blueteam    — All 50 tools (Wazuh, threat intel, host forensics, Sangfor blocklist, 3-Sum correlation)"
 echo "  mcp-server-crowdsec    — DEPRECATED — redirects to mcp-server-blueteam"
 echo "  mcp-server-greynoise   — DEPRECATED — redirects to mcp-server-blueteam"
 echo ""

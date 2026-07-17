@@ -11,7 +11,7 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
 
 ## Architecture
 
-`blue_team_server.py` is a **single, unified MCP server** with 48 tools spanning host forensics, Wazuh SIEM, threat intelligence, and 3-Sum APT correlation engine. It supports two transports:
+`blue_team_server.py` is a **single, unified MCP server** with 50 tools spanning host forensics, Wazuh SIEM, threat intelligence, Sangfor blocklist integration, and 3-Sum APT correlation engine. It supports two transports:
 
 | Transport | Use case | MCP client connection |
 |---|---|---|
@@ -21,7 +21,7 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
 ```
                           ┌──────────────────────────────────┐
                           │     blue_team_server.py          │
-                          │     48 tools · 1 file · 2 transports  │
+                          │     50 tools · 1 file · 2 transports  │
                           │                                  │
                           │  ┌────────────────────────────┐  │
                           │  │ Host Forensics (26 tools)  │  │
@@ -84,7 +84,7 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
 
 | File | Tools | When to use |
 |---|---|---|
-| `blue_team_server.py` | **All 48 tools** | **Recommended** — full capabilities, credential stripping, PII redaction |
+| `blue_team_server.py` | **All 50 tools** | **Recommended** — full capabilities, credential stripping, PII redaction |
 
 ---
 
@@ -433,7 +433,7 @@ Then point Claude Desktop at it:
 
 Replace `192.168.153.5` with the IP reachable from your workstation (`192.168.153.5` for NAT, `172.16.101.5` for LAB).
 
-Restart Claude Desktop. You should see all 48 blue-team-mcp tools available.
+Restart Claude Desktop. You should see all 50 blue-team-mcp tools available.
 
 ### 4. Remote Service Deployment (systemd)
 
@@ -698,7 +698,7 @@ export BLUETEAM_RATE_LIMIT=60
 
 | File | Role |
 |---|---|
-| `blue_team_server.py` | **Primary** — all 48 tools, both transports (stdio / Streamable HTTP) |
+| `blue_team_server.py` | **Primary** — all 50 tools, both transports (stdio / Streamable HTTP) |
 
 ### Legacy Naming Debt
 

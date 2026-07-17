@@ -143,6 +143,12 @@ ARGUS_BASE_URL = os.environ.get("ARGUS_BASE_URL", "").rstrip("/")
 ARGUS_API_KEY_ENV = "ARGUS_API_KEY"
 ARGUS_VERIFY_SSL = os.environ.get("ARGUS_VERIFY_SSL", "false").lower() in ("1", "true", "yes")
 
+# Sangfor Blocklist (optional — set SANGFOR_BLOCKLIST_TOKEN to enable sangfor_blocklist_* tools)
+SANGFOR_BLOCKLIST_URL = os.environ.get("SANGFOR_BLOCKLIST_URL", "").rstrip("/")
+SANGFOR_BLOCKLIST_TOKEN = os.environ.get("SANGFOR_BLOCKLIST_TOKEN", "")
+SANGFOR_BLOCKLIST_TIMEOUT = float(os.environ.get("SANGFOR_BLOCKLIST_TIMEOUT", "15"))
+SANGFOR_BLOCKLIST_VERIFY_SSL = os.environ.get("SANGFOR_BLOCKLIST_VERIFY_SSL", "false").lower() in ("1", "true", "yes")
+
 # Shared HTTP / response config
 HTTP_TIMEOUT = 30.0
 CHARACTER_LIMIT = int(os.environ.get("BLUETEAM_CHARACTER_LIMIT", "100000"))
@@ -7097,6 +7103,370 @@ async def wazuh_alert_focused_crawl(params: FocusedCrawlInput = FocusedCrawlInpu
     return _truncate_if_needed("\n".join(lines))
 
 
+# Tier 4: sangfor_blocklist_* - Sangfor firewall blocklist integration
+class SangforBlocklistCheckInput(BaseModel):
+    """Input model for sangfor_blocklist_check - single IP blocklist lookup."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    ip_address: str = Field(
+        ...,
+        max_length=45,
+        description="IPv4 or IPv6 address to check against the Sangfor blocklist.",
+    )
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown",
+        description="'markdown' (default, human-readable) or 'json'.",
+    )
+
+    @field_validator("ip_address")
+    @classmethod
+    def validate_ip(cls, v: str) -> str:
+        try:
+            ipaddress.ip_address(v.strip())
+        except ValueError:
+            raise ValueError(f"'{v}' is not a valid IPv4 or IPv6 address")
+        return v.strip()
+
+
+class SangforBlocklistListInput(BaseModel):
+    """Input model for sangfor_blocklist_list — paginated blocklist listing."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    date_start: str = Field(
+        default="24h",
+        max_length=30,
+        description="Start of time window - ISO 8601 (e.g. '2026-07-15T00:00:00') or relative ('24h', '7d').",
+    )
+    date_end: str = Field(
+        default="now",
+        max_length=30,
+        description="End of time window - ISO 8601 or 'now' for current time.",
+    )
+    limit: int = Field(
+        default=100,
+        ge=1,
+        le=1000,
+        description="Max entries per page (1-1000, default 100).",
+    )
+    offset: int = Field(
+        default=0,
+        ge=0,
+        description="Pagination offset (0-based).",
+    )
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown",
+        description="'markdown' (default, human-readable) or 'json'.",
+    )
+
+
+# Blockmode -> severity mapping per operational ground truth (TangerangKota-CSIRT)
+_BLOCKMODE_SEVERITY: dict[str, str] = {
+    "30m": "Temporary / Low Priority",
+    "1h": "Temporary / Low Priority",
+    "2h": "Temporary / Low Priority",
+    "3d": "Active Mitigation / Medium Priority",
+    "7d": "Active Mitigation / Medium Priority",
+    "permanent": "Hard Block / High Priority",
+}
+
+
+def _get_sangfor_token() -> str:
+    """Read Sangfor blocklist API token from environment."""
+    if not SANGFOR_BLOCKLIST_TOKEN:
+        raise RuntimeError(
+            "SANGFOR_BLOCKLIST_TOKEN is not set. "
+            "Set your Sangfor API bearer token before using sangfor_blocklist_* tools."
+        )
+    if not SANGFOR_BLOCKLIST_URL:
+        raise RuntimeError(
+            "SANGFOR_BLOCKLIST_URL is not set. "
+            "Set the Sangfor blocklist API endpoint before using sangfor_blocklist_* tools."
+        )
+    return SANGFOR_BLOCKLIST_TOKEN
+
+
+def _blockmode_severity(blockmode: str) -> str:
+    """Map raw blockmode value to human-readable severity label."""
+    return _BLOCKMODE_SEVERITY.get(blockmode, f"Unknown ({blockmode})")
+
+
+def _format_sangfor_entry_markdown(entry: dict) -> str:
+    """Render a single Sangfor blocklist entry as a markdown line item."""
+    ip = entry.get("ip_address", "?")
+    isp = entry.get("isp", "?")
+    loc = entry.get("location", "?")
+    mode = entry.get("blockmode", "?")
+    severity = _blockmode_severity(mode)
+    wazuh_s = entry.get("wazuh_score", 0)
+    tip_s = entry.get("tip_score", 0)
+    overall = entry.get("overall_score", 0)
+    created = entry.get("created_at", "?")[:19]
+    return (
+        f"| `{ip}` | {isp} | {loc} | `{mode}` ({severity}) | "
+        f"W:{wazuh_s} T:{tip_s} → **{overall}** | {created} |"
+    )
+
+
+@mcp.tool(
+    name="sangfor_blocklist_check",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def sangfor_blocklist_check(params: SangforBlocklistCheckInput) -> str:
+    """Check if a single IP address is currently blocked by the Sangfor firewall.
+
+    Queries the Sangfor blocklist API for a specific IP. Returns the block record
+    if found (with severity, scores, and block duration), or a NOT_BLOCKED status
+    with a recommendation for manual IS analyst review.
+
+    This tool is **informational only** — it never initiates or modifies firewall
+    rules. When an IP is not on the list, it surfaces a MANUAL_IS_REVIEW action
+    flag for the human analyst.
+
+    Args:
+        params.ip_address: IPv4 or IPv6 address to check.
+        params.response_format: 'markdown' (default) or 'json'.
+
+    Returns:
+        str: Blocklist status with IP details, scores, severity, and action flag.
+
+    Example usage:
+        - "Check if 180.254.78.145 is blocked by Sangfor"
+        - "Verify blocklist status of a high-score 3-Sum correlation IP"
+
+    Error Handling:
+        - Invalid IP → rejected at Pydantic validation
+        - Missing SANGFOR_BLOCKLIST_TOKEN → clear RuntimeError
+        - HTTP errors → surfaced through standard error handling
+    """
+    _audit_log("sangfor_blocklist_check", {"ip": params.ip_address})
+    ip = params.ip_address.strip()
+
+    try:
+        token = _get_sangfor_token()
+    except RuntimeError as e:
+        return json.dumps({"error": str(e)})
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "accept": "application/json",
+        "User-Agent": "blue-team-mcp/1.0.0 (TangerangKota-CSIRT)",
+    }
+
+    # Query the blocklist with a narrow window - API requires date range
+    now = datetime.now(timezone.utc)
+    date_end = now.strftime("%Y-%m-%d %H:%M:%S")
+    date_start = (now - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+    payload = {"date_start": date_start, "date_end": date_end, "limit": 5000, "offset": 0}
+
+    try:
+        client = await _get_client("sangfor", verify=SANGFOR_BLOCKLIST_VERIFY_SSL, max_keepalive=2, max_connections=10)
+        resp = await client.post(
+            SANGFOR_BLOCKLIST_URL,
+            headers=headers,
+            json=payload,
+            timeout=httpx.Timeout(SANGFOR_BLOCKLIST_TIMEOUT),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except httpx.HTTPStatusError as e:
+        return _handle_api_error(e, context="sangfor_blocklist_check")
+    except httpx.TimeoutException:
+        return json.dumps({"error": f"Sangfor API timed out after {SANGFOR_BLOCKLIST_TIMEOUT}s", "ip": ip})
+    except Exception as e:
+        return json.dumps({"error": f"Sangfor API request failed: {e}", "ip": ip})
+
+    # Search for the IP in the response array
+    if not isinstance(data, list):
+        return json.dumps({"error": "Unexpected API response format", "ip": ip, "raw_type": type(data).__name__})
+
+    match = None
+    for entry in data:
+        if isinstance(entry, dict) and entry.get("ip_address", "").strip() == ip:
+            match = entry
+            break
+
+    if params.response_format == "json":
+        if match:
+            match["status"] = "BLOCKED"
+            match["severity"] = _blockmode_severity(match.get("blockmode", ""))
+            match["action"] = "NO_ACTION_NEEDED"
+            return _truncate_if_needed(json.dumps(match, indent=2, default=str))
+        return json.dumps({
+            "ip_address": ip,
+            "status": "NOT_BLOCKED",
+            "severity": "N/A",
+            "action": "MANUAL_IS_REVIEW",
+            "recommendation": "IP not found in Sangfor blocklist — IS analyst should evaluate for manual blocking.",
+        }, indent=2)
+
+    # Markdown format
+    if match:
+        lines = [
+            "# Sangfor Blocklist -  IP Found (BLOCKED)",
+            "",
+            f"**IP**: `{ip}`",
+            f"**Status**: 🔴 **BLOCKED** — no action needed",
+            f"**ISP**: {match.get('isp', '?')}",
+            f"**Location**: {match.get('location', '?')}",
+            f"**Block Mode**: `{match.get('blockmode', '?')}` — {_blockmode_severity(match.get('blockmode', ''))}",
+            "",
+            "| Score Type | Value |",
+            "|-----------|-------|",
+            f"| Wazuh Score | {match.get('wazuh_score', '?')} |",
+            f"| TIP Score | {match.get('tip_score', '?')} |",
+            f"| **Overall Score** | **{match.get('overall_score', '?')}** |",
+            "",
+            f"**Created**: {match.get('created_at', '?')}",
+        ]
+        if match.get("updated_at"):
+            lines.append(f"**Updated**: {match['updated_at']}")
+        return "\n".join(lines)
+
+    return (
+        f"# Sangfor Blocklist — IP NOT FOUND\n\n"
+        f"**IP**: `{ip}`\n"
+        f"**Status**: 🟢 **NOT BLOCKED**\n\n"
+        f"**Action Required**: `MANUAL_IS_REVIEW`\n"
+        f"**Recommendation**: This IP is not on the Sangfor blocklist. "
+        f"The IS analyst should evaluate the threat context (3-Sum scores, CrowdSec reputation) "
+        f"and decide whether to add a manual block.\n"
+    )
+
+
+@mcp.tool(
+    name="sangfor_blocklist_list",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def sangfor_blocklist_list(params: SangforBlocklistListInput) -> str:
+    """List all IPs currently blocked by the Sangfor firewall in a time window.
+
+    Returns a paginated list of blocked IPs with scores, severity mapping,
+    and geolocation. Use this for situational awareness, threat hunting,
+    and cross-referencing with 3-Sum correlation output.
+
+    Args:
+        params.date_start: Start of window — ISO 8601 or relative ('24h', '7d'). Default '24h'.
+        params.date_end: End of window — ISO 8601 or 'now'. Default 'now'.
+        params.limit: Max entries per page (1-1000, default 100).
+        params.offset: Pagination offset (0-based, default 0).
+        params.response_format: 'markdown' (default, human-readable) or 'json'.
+
+    Returns:
+        str: Paginated blocklist entries with next_offset cursor.
+
+    Example usage:
+        - "List all IPs blocked by Sangfor in the last 24 hours"
+        - "Show the last 7 days of Sangfor blocks for threat hunting"
+
+    Error Handling:
+        - Invalid time expressions -> rejected at Pydantic validation
+        - Missing SANGFOR_BLOCKLIST_TOKEN -> clear RuntimeError
+        - HTTP errors → surfaced through standard error handling
+    """
+    _audit_log("sangfor_blocklist_list", {"date_start": params.date_start, "limit": params.limit, "offset": params.offset})
+
+    try:
+        token = _get_sangfor_token()
+    except RuntimeError as e:
+        return json.dumps({"error": str(e)})
+
+    # Resolve time window
+    since_parsed, until_parsed = _parse_time_window(params.date_start, params.date_end)
+    date_start = since_parsed.replace("T", " ").replace("Z", "")[:19] if since_parsed else ""
+    date_end = until_parsed.replace("T", " ").replace("Z", "")[:19] if until_parsed else ""
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "accept": "application/json",
+        "User-Agent": "blue-team-mcp/1.0.0 (TangerangKota-CSIRT)",
+    }
+    payload = {"date_start": date_start, "date_end": date_end, "limit": params.limit, "offset": params.offset}
+
+    try:
+        client = await _get_client("sangfor", verify=SANGFOR_BLOCKLIST_VERIFY_SSL, max_keepalive=2, max_connections=10)
+        resp = await client.post(
+            SANGFOR_BLOCKLIST_URL,
+            headers=headers,
+            json=payload,
+            timeout=httpx.Timeout(SANGFOR_BLOCKLIST_TIMEOUT),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except httpx.HTTPStatusError as e:
+        return _handle_api_error(e, context="sangfor_blocklist_list")
+    except httpx.TimeoutException:
+        return json.dumps({"error": f"Sangfor API timed out after {SANGFOR_BLOCKLIST_TIMEOUT}s"})
+    except Exception as e:
+        return json.dumps({"error": f"Sangfor API request failed: {e}"})
+
+    if not isinstance(data, list):
+        return json.dumps({"error": "Unexpected API response format", "raw_type": type(data).__name__})
+
+    entries = data
+    next_offset = params.offset + params.limit if len(entries) >= params.limit else None
+
+    # Enrich each entry with severity mapping
+    for entry in entries:
+        if isinstance(entry, dict):
+            entry["severity"] = _blockmode_severity(entry.get("blockmode", ""))
+
+    if params.response_format == "json":
+        return _truncate_if_needed(json.dumps({
+            "window": {"date_start": date_start, "date_end": date_end},
+            "pagination": {"limit": params.limit, "offset": params.offset, "next_offset": next_offset},
+            "count": len(entries),
+            "entries": entries,
+        }, indent=2, default=str))
+
+    # Markdown format
+    severity_counts: dict[str, int] = {}
+    for e in entries:
+        sev = e.get("severity", "Unknown") if isinstance(e, dict) else "Unknown"
+        severity_counts[sev] = severity_counts.get(sev, 0) + 1
+
+    lines = [
+        "# Sangfor Blocklist",
+        "",
+        f"**Window**: {date_start} → {date_end}",
+        f"**Returned**: {len(entries)} entries (offset {params.offset})",
+        "",
+        "## Severity Distribution",
+        "",
+        "| Severity | Count |",
+        "|----------|-------|",
+    ]
+    for sev, count in sorted(severity_counts.items()):
+        lines.append(f"| {sev} | {count} |")
+    lines.extend([
+        "",
+        "## Blocked IPs",
+        "",
+        "| IP | ISP | Location | Block Mode | Scores (W/T→Overall) | Created |",
+        "|----|-----|----------|------------|----------------------|--------|",
+    ])
+    for entry in entries:
+        if isinstance(entry, dict):
+            lines.append(_format_sangfor_entry_markdown(entry))
+
+    if next_offset is not None:
+        lines.append("")
+        lines.append(f"**next_offset**: `{next_offset}` — pass as `offset` parameter for the next page.")
+
+    return "\n".join(lines)
+
+
 # 3 Sum Threat Detection Correlation Tool
 class ThreeSumCorrelationInput(BaseModel):
     """Evaluate 3-Sum threat detection across Wazuh alert categories.
@@ -7675,7 +8045,7 @@ logger.info(
 def _build_arg_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser with multi-transport support."""
     parser = argparse.ArgumentParser(
-        description="blue_team_mcp — Unified blue-team MCP server (TangerangKota-CSIRT)"
+        description="blue_team_mcp - Unified blue-team MCP server (TangerangKota-CSIRT)"
     )
     parser.add_argument(
         "--transport",
