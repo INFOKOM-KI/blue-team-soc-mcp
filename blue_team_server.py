@@ -1542,9 +1542,10 @@ class CrowdsecIpReputationBulkInput(BaseModel):
 
     ips: list[str] = Field(
         ...,
-        description="List of public IP addresses to check (max 10 per call to avoid rate limits).",
+        description="List of public IP addresses to check (max 25 per call). "
+                    "Runs concurrently — 25 IPs resolve in ~3s.",
         min_length=1,
-        max_length=10,
+        max_length=25,
     )
     response_format: Literal["markdown", "json"] = Field(
         default="markdown",
