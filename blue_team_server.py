@@ -5703,7 +5703,10 @@ class WazuhIndexerSearchInput(BaseModel):
         """
         if isinstance(data, str):
             import json as _json
-            data = _json.loads(data)
+            try:
+                data = _json.loads(data)
+            except _json.JSONDecodeError as e:
+                raise ValueError(f"Invalid JSON: {e.msg} at position {e.pos}. Check commas and braces.")
         if not isinstance(data, dict):
             return data
         alias_map: dict[str, str] = {
@@ -9279,7 +9282,10 @@ class DslQueryInput(BaseModel):
         """Auto-parse JSON-string params — MCP clients sometimes send args as raw JSON strings."""
         if isinstance(data, str):
             import json as _json
-            data = _json.loads(data)
+            try:
+                data = _json.loads(data)
+            except _json.JSONDecodeError as e:
+                raise ValueError(f"Invalid JSON: {e.msg} at position {e.pos}. Check commas and braces.")
         return data
 
     # Structured path (preferred)
