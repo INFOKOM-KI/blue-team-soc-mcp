@@ -3199,7 +3199,7 @@ async def blueteam_wazuh_alert_summarize(params: AlertSummarizeInput) -> str:
             f"`{since_iso}` -> `{until_iso}`.")
 
     # IoC extraction
-    rule_counts: dict[str, int] = {}
+    rule_counts: Counter[str] = Counter()
     rule_descriptions: dict[str, str] = {}
     rule_timestamps: dict[str, list[str]] = {}
     domains: set[str] = set()
@@ -5697,7 +5697,13 @@ class WazuhIndexerSearchInput(BaseModel):
         alias populates the field.  This validator removes the alias, keeping
         the canonical name, so the call succeeds regardless of which form(s)
         the LLM sends.
+
+        Also auto-parses JSON-string input — MCP clients may send complex
+        args as raw JSON strings instead of native objects.
         """
+        if isinstance(data, str):
+            import json as _json
+            data = _json.loads(data)
         if not isinstance(data, dict):
             return data
         alias_map: dict[str, str] = {
@@ -9266,6 +9272,15 @@ class DslQueryInput(BaseModel):
        Requires correct double-escaping for nested quotes. Use only for backward compat.
     """
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_string_params(cls, data: Any) -> Any:
+        """Auto-parse JSON-string params — MCP clients sometimes send args as raw JSON strings."""
+        if isinstance(data, str):
+            import json as _json
+            data = _json.loads(data)
+        return data
 
     # Structured path (preferred)
     aggs: Optional[dict[str, Any]] = Field(
