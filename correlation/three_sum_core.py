@@ -165,7 +165,7 @@ def format_evaluation_dict(
             summary_parts.append("Engine-B: no simultaneous anomalies")
     result["summary"] = " | ".join(summary_parts) if summary_parts else "No evaluation data"
 
-    # ── F-4: Unified cross-engine scoring ──
+    # ── F-4: Unified cross-engine scoring ── (AUL Adjust)
     ea_triggered = bool(engine_a_results and engine_a_results[0])
     eb_triggered = bool(engine_b_result and engine_b_result.get("simultaneous_triggers"))
 
