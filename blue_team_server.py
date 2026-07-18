@@ -1684,20 +1684,17 @@ async def crowdsec_ip_reputation_bulk(params: CrowdsecIpReputationBulkInput) -> 
           reported inline in the results rather than stopping the process.
     """
     _audit_log("crowdsec_ip_reputation_bulk", {"count": len(params.ips)})
-    results: list[dict[str, Any]] = []
-    for ip in params.ips:
+
+    async def _lookup_one(ip: str) -> dict[str, Any]:
         try:
             raw = await _crowdsec_request(f"/v2/smoke/{ip}")
-            results.append(
-                {
-                    "ip": ip,
-                    "reputation": raw.get("reputation", "unknown"),
+            return {"ip": ip, "reputation": raw.get("reputation", "unknown"),
                     "behaviors": raw.get("behaviors", []),
-                    "cves": raw.get("cves", []),
-                }
-            )
+                    "cves": raw.get("cves", [])}
         except (httpx.HTTPStatusError, httpx.TimeoutException, RuntimeError) as e:
-            results.append({"ip": ip, "error": _handle_api_error(e, context=ip)})
+            return {"ip": ip, "error": _handle_api_error(e, context=ip)}
+
+    results: list[dict[str, Any]] = await asyncio.gather(*[_lookup_one(ip) for ip in params.ips])
 
     if params.response_format == "json":
         result = json.dumps(results, indent=2, ensure_ascii=False)
@@ -6445,7 +6442,7 @@ class WazuhEmailLookupInput(BaseModel):
         default=50000,
         description="Maximum number of alert documents to scan internally. "
                     "Higher values give more accurate counts but take longer.",
-        ge=1000,
+        ge=100,
         le=200000,
     )
     response_format: Literal["markdown", "json"] = Field(
