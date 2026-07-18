@@ -189,9 +189,9 @@ async def _get_client(
     return _clients[name]
 
 
-async def _api_call(method: str, url: str, *, client_name: str = "http", **kw) -> httpx.Response:
+async def _api_call(method: str, url: str, *, client_name: str = "http", verify: bool = True, **kw) -> httpx.Response:
     """Unified async HTTP helper. Returns raw response — caller calls .json() or .text."""
-    client = await _get_client(client_name)
+    client = await _get_client(client_name, verify=verify)
     resp = await getattr(client, method.lower())(url, **kw)
     resp.raise_for_status()
     return resp
@@ -846,7 +846,7 @@ async def _wazuh_get_token() -> Optional[str]:
         return _wazuh_token
     try:
         url = f"{WAZUH_API_URL}/security/user/authenticate?raw=true"
-        resp = await _api_call("post", url, client_name="wazuh",
+        resp = await _api_call("post", url, client_name="wazuh", verify=WAZUH_API_VERIFY_SSL,
                                 auth=(WAZUH_API_USER, WAZUH_API_PASSWORD))
         _wazuh_token = resp.text.strip().strip('"')
         _wazuh_token_expiry = now + _WAZUH_TOKEN_TTL
@@ -879,7 +879,7 @@ async def _wazuh_api_get(path: str, params: Dict[str, str] = None) -> Dict:
         }
     url = f"{WAZUH_API_URL}{path}"
     try:
-        resp = await _api_call("get", url, client_name="wazuh",
+        resp = await _api_call("get", url, client_name="wazuh", verify=WAZUH_API_VERIFY_SSL,
                                 headers={"Authorization": f"Bearer {token}"},
                                 params=params or {})
         return resp.json()
@@ -1023,7 +1023,7 @@ async def _wazuh_indexer_search(
         body["search_after"] = search_after
 
     try:
-        resp = await _api_call("post", url, client_name="indexer",
+        resp = await _api_call("post", url, client_name="indexer", verify=WAZUH_INDEXER_VERIFY_SSL,
                                 auth=(WAZUH_INDEXER_USER, WAZUH_INDEXER_PASSWORD),
                                 json=body,
                                 headers={"Content-Type": "application/json"})
@@ -2237,7 +2237,7 @@ async def _argus_request(path: str, payload: dict) -> dict[str, Any]:
     }
     url = f"{ARGUS_BASE_URL}{path}"
 
-    resp = await _api_call("post", url, client_name="argus",
+    resp = await _api_call("post", url, client_name="argus", verify=ARGUS_VERIFY_SSL,
                             headers=headers, json=payload)
     return resp.json()
 
@@ -2563,6 +2563,7 @@ class WebLogInput(BaseModel):
     log_type: str = Field(default="access", description="Log type: 'access' or 'error'")
     lines: int = Field(default=200, ge=1, le=MAX_LOG_LINES)
     grep: Optional[str] = Field(default=None, max_length=MAX_GREP_PATTERN_LENGTH, description="Optional filter pattern")
+    path: Optional[str] = Field(default=None, max_length=256, description="Override log path. Auto-resolved from server+log_type if omitted.")
     bypass_redaction: bool = Field(default=False, description="When true, skip PII/credential redaction for audit investigations")
 
 @mcp.tool(
@@ -2599,12 +2600,12 @@ async def blueteam_read_web_log(params: WebLogInput) -> str:
     if params.log_type not in paths[server]:
         return json.dumps({"error": f"Unknown log type '{params.log_type}'. Use 'access' or 'error'."})
 
-    params.path = paths[server][params.log_type]
-    content = _tail_file(params.path, params.lines)
+    log_path = params.path if params.path else paths[server][params.log_type]
+    content = _tail_file(log_path, params.lines)
     if params.grep:
         safe_grep = _sanitize_regex(params.grep)
-        params.lines = [l for l in content.splitlines() if re.search(safe_grep, l, re.IGNORECASE)]
-        return _redact_alert_data("\n".join(params.lines, bypass=params.bypass_redaction) if params.lines else f"No matches for: {params.grep}")
+        filtered = [l for l in content.splitlines() if re.search(safe_grep, l, re.IGNORECASE)]
+        return _redact_alert_data("\n".join(filtered) if filtered else f"No matches for: {params.grep}", bypass=params.bypass_redaction)
     return _redact_alert_data(content, bypass=params.bypass_redaction)
 
 class JournalInput(BaseModel):
@@ -2838,7 +2839,7 @@ async def blueteam_wazuh_manager_logs(log_type: str = "alerts", limit: int = 50,
     """
     _audit_log("blueteam_wazuh_manager_logs", {})
     valid = ("alerts", "api", "cluster", "integrations")
-    if params.log_type not in valid:
+    if log_type not in valid:
         return json.dumps({"error": f"log_type must be one of: {valid}"})
 
     offset = 0
@@ -2851,7 +2852,7 @@ async def blueteam_wazuh_manager_logs(log_type: str = "alerts", limit: int = 50,
     # Auto-cap here so LLM clients pass large values without triggering API errors.
     wazuh_safe_limit = min(limit, 500)
     api_params = {"offset": str(offset), "limit": str(wazuh_safe_limit), "pretty": "true"}
-    tag = _WAZUH_LOG_TAG.get(params.log_type)
+    tag = _WAZUH_LOG_TAG.get(log_type)
     if tag:
         api_params["tag"] = tag
     # Never send "type" - Wazuh 4.x only accepts "tag"; "type" causes 400 ERROR
@@ -8710,7 +8711,7 @@ async def _wazuh_indexer_post(body: dict, index_pattern: Optional[str] = None) -
     url = f"{WAZUH_INDEXER_URL}/{index_pattern}/_search"
 
     try:
-        resp = await _api_call("post", url, client_name="indexer",
+        resp = await _api_call("post", url, client_name="indexer", verify=WAZUH_INDEXER_VERIFY_SSL,
                                 auth=(WAZUH_INDEXER_USER, WAZUH_INDEXER_PASSWORD),
                                 json=body, headers={"Content-Type": "application/json"})
         return resp.json()
