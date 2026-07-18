@@ -295,6 +295,74 @@ _RESPONSE_FORMAT_DESC = "Output format: 'markdown' (default) or 'json'."
 _SINCE_DESC = "ISO 8601 start time in UTC. Defaults to 365 days ago."
 _UNTIL_DESC = "ISO 8601 end time in UTC. Defaults to now."
 _AGENT_NAME_DESC = "Optional agent name filter."
+_AGENT_NAME_SAFE_RE = re.compile(r"^[a-zA-Z0-9_\-\.]+$")
+
+# Practical email regex for extraction from log fields — covers >99% of real addresses
+# Handles dots-in-local-part, plus-sign aliases, and multi-level TLDs
+_EMAIL_RE = re.compile(
+    r'[a-zA-Z0-9.!#$%&\'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?'
+    r'(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}'
+)
+
+# Shared keyword search fields - used across all Wazuh Indexer query helpers.
+# Each tuple is (field_name, boost). boost=0 means the field is searched
+# but does not influence score ranking.
+_KEYWORD_SEARCH_FIELDS: list[tuple[str, int]] = [
+    ("full_log", 3),
+    ("rule.description", 2),
+    ("rule.info", 2),
+    ("data.srcip", 2),
+    ("data.srcip2", 2),
+    ("srcip", 2),
+    ("data.url", 0),
+    ("data.domain", 0),
+    ("data.user_agent", 0),
+    ("data.referrer", 0),
+]
+
+def _validate_keyword_field(v: Optional[str]) -> Optional[str]:
+    """Shared keyword validator — strip, reject null bytes / control chars."""
+    if v is not None:
+        v = v.strip()
+        if not v:
+            return None
+        if len(v) > 1024:
+            raise ValueError("keyword too long (max 1024)")
+        if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", v):
+            raise ValueError("keyword contains invalid control characters")
+    return v
+
+def _validate_agent_name_field(v: Optional[str]) -> Optional[str]:
+    """Shared agent_name validator — strip, length-check, safe-chars-only."""
+    if v is not None:
+        v = v.strip()
+        if not v:
+            return None
+        if len(v) > 64:
+            raise ValueError("agent_name too long (max 64)")
+        if not _AGENT_NAME_SAFE_RE.match(v):
+            raise ValueError("agent_name: use only letters, numbers, hyphen, underscore, dot")
+    return v
+
+
+def _validate_rule_groups_field(v: Optional[str]) -> Optional[str]:
+    """Shared rule_groups validator — comma-split, strip, safe-chars-only."""
+    if v is not None:
+        v = v.strip()
+        if not v:
+            return None
+        for g in v.split(","):
+            g = g.strip()
+            if not g:
+                raise ValueError("Empty rule group name in comma-separated list")
+            if not _AGENT_NAME_SAFE_RE.match(g):
+                raise ValueError(f"Invalid rule group name: '{g}'")
+    return v
+
+# Annotated types for reusable field validation (replaces per-model validators)
+ValidKeyword = Annotated[Optional[str], AfterValidator(_validate_keyword_field)]
+ValidAgentName = Annotated[Optional[str], AfterValidator(_validate_agent_name_field)]
+ValidRuleGroups = Annotated[Optional[str], AfterValidator(_validate_rule_groups_field)]
 
 
 def _is_private_or_reserved(ip: str) -> bool:
@@ -5611,74 +5679,6 @@ _WAZUH_INDEX_PATTERNS = {
 }
 
 # Agent name: alphanumeric, hyphen, underscore, dot only (prevents injection)
-_AGENT_NAME_SAFE_RE = re.compile(r"^[a-zA-Z0-9_\-\.]+$")
-
-# Practical email regex for extraction from log fields — covers >99% of real addresses
-# Handles dots-in-local-part, plus-sign aliases, and multi-level TLDs
-_EMAIL_RE = re.compile(
-    r'[a-zA-Z0-9.!#$%&\'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?'
-    r'(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}'
-)
-
-# Shared keyword search fields - used across all Wazuh Indexer query helpers.
-# Each tuple is (field_name, boost). boost=0 means the field is searched
-# but does not influence score ranking.
-_KEYWORD_SEARCH_FIELDS: list[tuple[str, int]] = [
-    ("full_log", 3),
-    ("rule.description", 2),
-    ("rule.info", 2),
-    ("data.srcip", 2),
-    ("data.srcip2", 2),
-    ("srcip", 2),
-    ("data.url", 0),
-    ("data.domain", 0),
-    ("data.user_agent", 0),
-    ("data.referrer", 0),
-]
-
-def _validate_keyword_field(v: Optional[str]) -> Optional[str]:
-    """Shared keyword validator — strip, reject null bytes / control chars."""
-    if v is not None:
-        v = v.strip()
-        if not v:
-            return None
-        if len(v) > 1024:
-            raise ValueError("keyword too long (max 1024)")
-        if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", v):
-            raise ValueError("keyword contains invalid control characters")
-    return v
-
-def _validate_agent_name_field(v: Optional[str]) -> Optional[str]:
-    """Shared agent_name validator — strip, length-check, safe-chars-only."""
-    if v is not None:
-        v = v.strip()
-        if not v:
-            return None
-        if len(v) > 64:
-            raise ValueError("agent_name too long (max 64)")
-        if not _AGENT_NAME_SAFE_RE.match(v):
-            raise ValueError("agent_name: use only letters, numbers, hyphen, underscore, dot")
-    return v
-
-
-def _validate_rule_groups_field(v: Optional[str]) -> Optional[str]:
-    """Shared rule_groups validator — comma-split, strip, safe-chars-only."""
-    if v is not None:
-        v = v.strip()
-        if not v:
-            return None
-        for g in v.split(","):
-            g = g.strip()
-            if not g:
-                raise ValueError("Empty rule group name in comma-separated list")
-            if not _AGENT_NAME_SAFE_RE.match(g):
-                raise ValueError(f"Invalid rule group name: '{g}'")
-    return v
-
-# Annotated types for reusable field validation (replaces per-model validators)
-ValidKeyword = Annotated[Optional[str], AfterValidator(_validate_keyword_field)]
-ValidAgentName = Annotated[Optional[str], AfterValidator(_validate_agent_name_field)]
-ValidRuleGroups = Annotated[Optional[str], AfterValidator(_validate_rule_groups_field)]
 class WazuhIndexerSearchInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid", populate_by_name=True)
 
