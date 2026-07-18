@@ -11,7 +11,7 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
 
 ## Architecture
 
-`blue_team_server.py` is a **single, unified MCP server** with 50 tools spanning host forensics, Wazuh SIEM, threat intelligence, Sangfor blocklist integration, and 3-Sum APT correlation engine. It supports two transports:
+`blue_team_server.py` is a **single, unified MCP server** with 60 tools spanning host forensics, Wazuh SIEM, threat intelligence, Sangfor blocklist integration, alert enrichment, and 3-Sum APT correlation engine. It supports two transports:
 
 | Transport | Use case | MCP client connection |
 |---|---|---|
@@ -21,7 +21,7 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
 ```
                           ┌──────────────────────────────────┐
                           │     blue_team_server.py          │
-                          │     50 tools · 1 file · 2 transports  │
+                          │     60 tools · 1 file · 2 transports  │
                           │                                  │
                           │  ┌────────────────────────────┐  │
                           │  │ Host Forensics (26 tools)  │  │
@@ -84,7 +84,7 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
 
 | File | Tools | When to use |
 |---|---|---|
-| `blue_team_server.py` | **All 50 tools** | **Recommended** — full capabilities, credential stripping, PII redaction |
+| `blue_team_server.py` | **All 60 tools** | **Recommended** — full capabilities, credential stripping, PII redaction |
 
 ---
 
@@ -315,9 +315,9 @@ All environment variables accepted by the suite. Variables marked **[unified]** 
 | `CROWDSEC_API_KEY` | (empty) | CrowdSec CTI API key (required for CrowdSec tools) |
 | `ABUSEIPDB_API_KEY` | (empty) | AbuseIPDB API key |
 | `VIRUSTOTAL_API_KEY` | (empty) | VirusTotal API key |
-| `NETRA_API_KEY` | (empty) | Netra Threat Intelligence API key |
-| `ARGUS_API_KEY` | (empty) | Argus Threat Intelligence API key (TangerangKota-CSIRT) |
-| `ARGUS_BASE_URL` | (empty) | Argus Threat Intelligence API base URL |
+| `NETRA_API_KEY` | (empty) | Netra Threat Intelligence API key (Contact us : TangerangKota-CSIRT) |
+| `ARGUS_API_KEY` | (empty) | Argus Threat Intelligence API key (Contact us : TangerangKota-CSIRT) |
+| `ARGUS_BASE_URL` | (empty) | Argus Threat Intelligence API base URL (Contact us : TangerangKota-CSIRT) |
 | `NETRA_VERIFY_SSL` | `false` | TLS certificate verification for Netra API (set `true` for production) |
 
 ### Transport & Deployment
@@ -514,7 +514,21 @@ All tools below are registered on `blue_team_server.py`. Tools not requiring a s
 | `wazuh_compromised_emails_analysis` | Correlate compromised emails with attacker IPs, optional Netra enrichment (auto-paginates per batch) |
 | `wazuh_alert_timeline` | Time-bucketed alert aggregation using OpenSearch `date_histogram` — covers ALL matching alerts |
 | `wazuh_attack_velocity` | Compare two time windows to detect attack acceleration/deceleration — covers ALL matching alerts |
-| `three_sum_correlation` | **3-Sum APT Detection Engine**: Advanced correlation applying the 3-Sum logical concept to Wazuh telemetry. Engine A (Multi-IoC Risk Thresholding) finds IPs appearing in 3 alert categories, sums risk scores, flags ≥10. Engine B (Volumetric Z-Score) detects simultaneous volumetric anomalies across 3 sources when all Z ≥ 2.5 in the same minute. Opt-in enrichments: `use_geo` (GeoLocation hints), `use_domain` (domain hints), `use_mitre` (MITRE ATT&CK tactic refinement). Category B defaults include `spam`/`postfix` groups. Returns structured JSON with per-engine triggers and summary. |
+| `three_sum_correlation` | **3-Sum APT Detection Engine**: Engine A (intersection scoring) + Engine B (volumetric Z-score) + **unified cross-engine scoring**. Auto-scaled bucket intervals, account lockout counter, `follow_up="curated_report"` for auto-enriching trigger IPs. Category B defaults include `spam`/`postfix`. |
+
+### Alert Enrichment & Analysis (Sprint 2-4)
+| Tool | Description |
+|------|-------------|
+| `blueteam_wazuh_alert_summarize` | 🆕 **F-1** — IoC extraction + rule grouping + unusual UA flagging → compact digest |
+| `blueteam_beacon_detect` | 🆕 **F-2** — Inter-arrival time analysis, CV-based beacon scoring, period estimation |
+| `blueteam_attack_chain` | 🆕 **F-3** — Rule-to-rule transition graphs, kill-chain pattern matching (5 chains) |
+| `blueteam_threat_card` | 🆕 **F-5** — Single-call threat report: alerts + CrowdSec/GreyNoise + MITRE + actions |
+| `blueteam_wazuh_alert_compare` | 🆕 **F-6** — Side-by-side IP comparison via 0-doc aggregations with verdict |
+| `blueteam_wazuh_geo_distribution` | 🆕 **G-2** — Country-level attack ranking (size:0, no docs fetched) |
+| `blueteam_curated_threat_report` | 🆕 **G-3** — One-call filter→aggregate→enrich→report pipeline. 29 filter dims, 4 intel sources, compare/dedup/decay/deep modes |
+| `blueteam_baseline_profile` | 🆕 — μ/σ/Z-score statistical baselining. "Is 4,821 alerts normal?" |
+| `blueteam_calendar_heatmap` | 🆕 — Day×hour periodicity detection (30+ day windows, ASCII heatmap) |
+| `blueteam_investigation_history` | 🆕 — JSONL-based IP verdict persistence. "Did we analyze this IP before?" |
 
 ### Threat Intelligence
 | Tool | Description |
@@ -698,7 +712,7 @@ export BLUETEAM_RATE_LIMIT=60
 
 | File | Role |
 |---|---|
-| `blue_team_server.py` | **Primary** — all 50 tools, both transports (stdio / Streamable HTTP) |
+| `blue_team_server.py` | **Primary** — all 60 tools, both transports (stdio / Streamable HTTP) |
 
 ### Legacy Naming Debt
 

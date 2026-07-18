@@ -86,6 +86,7 @@ def evaluate_engine_b(
     source_2_label: str = "access_anomaly",
     source_3_label: str = "c2_exfil",
     z_score_threshold: float = DEFAULT_Z_THRESHOLD,
+    account_lockouts_total: int = 0,
 ) -> Dict[str, Any]:
     source_stats = {}
     for buckets, label in [
@@ -113,7 +114,7 @@ def evaluate_engine_b(
             ts = source_1_buckets[i].get("key_as_string", f"bucket_{i}")
             simultaneous.append({"at": ts, "z_scores": zs})
     return {"evaluated": True, "sources": source_stats,
-            "simultaneous_triggers": simultaneous, "account_lockouts_total": 0}
+            "simultaneous_triggers": simultaneous, "account_lockouts_total": account_lockouts_total}
 
 
 def format_evaluation_dict(
@@ -163,6 +164,55 @@ def format_evaluation_dict(
         else:
             summary_parts.append("Engine-B: no simultaneous anomalies")
     result["summary"] = " | ".join(summary_parts) if summary_parts else "No evaluation data"
+
+    # ── F-4: Unified cross-engine scoring ──
+    ea_triggered = bool(engine_a_results and engine_a_results[0])
+    eb_triggered = bool(engine_b_result and engine_b_result.get("simultaneous_triggers"))
+
+    # Extract Engine A max score and Engine B max Z
+    ea_max_score = 0.0
+    if engine_a_results:
+        triggers, _ = engine_a_results
+        ea_max_score = max((t.get("total_score", 0) for t in triggers), default=0.0)
+    eb_max_z = 0.0
+    if engine_b_result:
+        for s in engine_b_result.get("sources", {}).values():
+            eb_max_z = max(eb_max_z, s.get("max_z", 0.0))
+
+    # Overlap bonus: Engine A trigger IPs active during Engine B spike windows
+    overlap_bonus = 0.0
+    if ea_triggered and eb_triggered:
+        overlap_bonus = 0.3  # both engines independently flagged activity
+
+    # Compute unified score (0.0–1.3, clamped to 1.0)
+    ea_component = 0.5 if ea_triggered else 0.0
+    eb_component = 0.5 if eb_triggered else 0.0
+    unified_score = min(1.0, round(ea_component + eb_component + overlap_bonus, 2))
+
+    severity = (
+        "CRITICAL" if unified_score >= 1.0 else
+        "HIGH" if unified_score >= 0.5 else
+        "MEDIUM" if unified_score >= 0.3 else
+        "LOW"
+    )
+
+    result["unified"] = {
+        "score": unified_score,
+        "severity": severity,
+        "components": {
+            "engine_a_triggered": ea_triggered,
+            "engine_b_triggered": eb_triggered,
+            "overlap_bonus": overlap_bonus > 0,
+        },
+        "details": {
+            "engine_a_max_score": ea_max_score,
+            "engine_b_max_z": round(eb_max_z, 1),
+        },
+    }
+    if unified_score >= 0.5:
+        summary_parts.append(f"Unified: {severity} ({unified_score})")
+        result["summary"] = " | ".join(summary_parts)
+
     return result
 
 

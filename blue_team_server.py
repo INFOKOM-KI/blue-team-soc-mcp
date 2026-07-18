@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Blue Team MCP Server
+Programmer : NAuliajati (csirt[at]tangerangkota[.]go[.]id)
+© TangerangKota-CSIRT
+
+Blue Team Wazuh MCP Server
 A defensive security MCP server for Claude Desktop and Compatible with any MCP Host. 
 Mirroring the Kali mcp-kali-server setup but for blue team / defenders / SOC.
 
@@ -58,7 +61,7 @@ from pydantic import BaseModel, ConfigDict, Field, AliasChoices, field_validator
 from pydantic import AfterValidator
 from typing import Annotated
 
-# 3-Sum Correlation Engine
+# 3 Sum Correlation Engine
 from correlation.three_sum_core import (
     evaluate_engine_a, evaluate_engine_b, format_evaluation_dict,
     normalize_srcip_to_cidr,
@@ -164,19 +167,7 @@ if BLUETEAM_ALLOW_UNTRUNCATED:
 _WAZUH_TOKEN_TTL = 300  # seconds — cache Wazuh JWT for 5 min
 
 # Private / reserved IP ranges — threat-intel tools are for public IPs only
-_PRIVATE_NETWORKS = [
-    ipaddress.ip_network(net)
-    for net in (
-        "10.0.0.0/8",
-        "172.16.0.0/12",
-        "192.168.0.0/16",
-        "127.0.0.0/8",
-        "169.254.0.0/16",
-        "::1/128",
-        "fc00::/7",
-        "fe80::/10",
-    )
-]
+_PRIVATE_NETWORKS: list = []  # kept for import compatibility — functionality replaced by ipaddress.is_private
 
 # Shared HTTP clients by name - lazy-init, pooled per SSL trust domain
 _clients: dict[str, httpx.AsyncClient] = {}
@@ -196,6 +187,14 @@ async def _get_client(
             verify=verify,
         )
     return _clients[name]
+
+
+async def _api_call(method: str, url: str, *, client_name: str = "http", **kw) -> httpx.Response:
+    """Unified async HTTP helper. Returns raw response — caller calls .json() or .text."""
+    client = await _get_client(client_name)
+    resp = await getattr(client, method.lower())(url, **kw)
+    resp.raise_for_status()
+    return resp
 
 
 # Cursor utilities for pagination
@@ -278,17 +277,10 @@ def _parse_time_window(
 
 def _relative_delta(n: int, unit: str) -> timedelta:
     """Convert a relative time token to a timedelta."""
-    if unit == "s":
-        return timedelta(seconds=n)
-    elif unit == "m":
-        return timedelta(minutes=n)
-    elif unit == "h":
-        return timedelta(hours=n)
-    elif unit == "d":
-        return timedelta(days=n)
-    elif unit == "w":
-        return timedelta(weeks=n)
-    return timedelta(days=365)  # fallback — shouldn't happen with validated regex
+    _UNIT_MAP = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days", "w": "weeks"}
+    if unit not in _UNIT_MAP:
+        return timedelta(days=365)  # fallback — shouldn't happen with validated regex
+    return timedelta(**{_UNIT_MAP[unit]: n})
 
 
 # Wazuh JWT token cache
@@ -308,10 +300,9 @@ _AGENT_NAME_DESC = "Optional agent name filter."
 def _is_private_or_reserved(ip: str) -> bool:
     """Check whether an IP belongs to a private or reserved range (not routable)."""
     try:
-        addr = ipaddress.ip_address(ip)
+        return ipaddress.ip_address(ip).is_private
     except ValueError:
         return False
-    return any(addr in net for net in _PRIVATE_NETWORKS)
 
 
 def _validate_public_ip(v: str) -> str:
@@ -351,8 +342,6 @@ def _handle_api_error(e: Exception, context: str = "") -> str:
         return f"{prefix}Error: API request failed with status {status}."
     if isinstance(e, httpx.TimeoutException):
         return f"{prefix}Error: Request timed out after {HTTP_TIMEOUT}s. Try again."
-    if isinstance(e):
-        return f"{prefix}Error: Circuit breaker is open — {e}"
     if isinstance(e, RuntimeError):
         return f"{prefix}Error: {e}"
     logger.exception("Unexpected error in %s", context)
@@ -387,7 +376,7 @@ def _escape_md_table(value: str) -> str:
 
 
 # Circuit Breaker - prevents cascading failures when upstream APIs are down.
-# 3-Sum throttle state — prevents rapid-fire Indexer queries
+# 3 Sum throttle state — prevents rapid-fire Indexer queries
 _last_eval_time: float = 0.0
 _last_eval_result: Optional[Dict[str, Any]] = None
 
@@ -412,13 +401,13 @@ MITRE_TACTIC_TO_CATEGORY: Dict[str, str] = {
 # depending on the log source. Engine A queries all known paths via multi_terms aggregation
 # to avoid silent false negatives from decoder field-path fragmentation.
 _SRCIP_FIELD_PATHS: list[str] = [
-    "data.srcip",
     "data.srcip.keyword",
     "data.src_ip.keyword",
     "data.client_ip.keyword",
     "data.remote_ip.keyword",
     "data.source_ip.keyword",
     "data.ip.keyword",
+    "srcip.keyword",
 ]
 
 
@@ -526,7 +515,7 @@ def _mask_domain(domain: str) -> str:
 
 
 def _redact_alert_data(data: Any, *, bypass: bool = False) -> Any:
-    """Apply redacted-but-real PII and credential masking to alert payloads (PRD FR-17).
+    """Apply redacted-but-real PII and credential masking to alert payloads.
 
     **Six layers — apply in strict priority order:**
 
@@ -549,11 +538,11 @@ def _redact_alert_data(data: Any, *, bypass: bool = False) -> Any:
     Returns the redacted copy — original is never mutated.
     """
     if isinstance(data, str):
-        # Layer 1: Credential stripping (MANDATORY — no env var override) ──
+        # Layer 1: Credential stripping (MANDATORY — no env var override)
         for pattern, replacement in _CREDENTIAL_STRIP_RULES:
             data = pattern.sub(replacement, data)
 
-        # Layer 2: Email redaction (BLUETEAM_REDACT_EMAILS) ──
+        # Layer 2: Email redaction (BLUETEAM_REDACT_EMAILS)
         if not bypass and BLUETEAM_REDACT_EMAILS:
             def _redact_email(m: re.Match) -> str:
                 local, domain = m.group(1), m.group(2)
@@ -566,7 +555,7 @@ def _redact_alert_data(data: Any, *, bypass: bool = False) -> Any:
                 return f"{rlocal}@{domain} [h:{forensic_hash}]"
             data = _REDACT_EMAIL_RE.sub(_redact_email, data)
 
-        # Layer 3: Internal IP masking (BLUETEAM_REDACT_PII) ──
+        # Layer 3: Internal IP masking (BLUETEAM_REDACT_PII)
         # RFC1918 + 127.x.x.x + 169.254.x.x + IPv6 ::1
         if not bypass and BLUETEAM_REDACT_PII:
             def _redact_internal_ip(m: re.Match) -> str:
@@ -594,7 +583,7 @@ def _redact_alert_data(data: Any, *, bypass: bool = False) -> Any:
             # IPv6 loopback
             data = re.sub(r"\b::1\b", "<LOOPBACK_REDACTED>", data)
 
-        # Layer 4: Domain/hostname masking in text (BLUETEAM_REDACT_DOMAINS) ──
+        # Layer 4: Domain/hostname masking in text (BLUETEAM_REDACT_DOMAINS)
         if not bypass and BLUETEAM_REDACT_DOMAINS:
             data = re.sub(
                 r"(?<![@\w])([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
@@ -603,7 +592,24 @@ def _redact_alert_data(data: Any, *, bypass: bool = False) -> Any:
                 lambda m: _mask_domain(m.group(1)), data,
             )
 
-        # Layer 6: UA truncation in full_log ──
+        # Layer 5: Log location masking in full_log
+        # Mask absolute Unix paths found in full_log strings (e.g.
+        # /containers/bangjaka/logs/nginx/access.log). Preserves leaf
+        # filename + forensic hash so analysts can still identify the
+        # log source without exposing full directory structure.
+        if not bypass and BLUETEAM_REDACT_LOCATIONS:
+            def _redact_log_path(m: re.Match) -> str:
+                path = m.group(0)
+                parts = path.rstrip("/").split("/")
+                leaf = parts[-1] if len(parts) > 1 else path
+                path_hash = hashlib.sha256(f"{_REDACT_SALT}:{path}".encode()).hexdigest()[:6]
+                return f".../{leaf} [h:{path_hash}]"
+            data = re.sub(
+                r"/(?:[a-zA-Z0-9._-]+/){2,}[a-zA-Z0-9._-]+",
+                _redact_log_path, data,
+            )
+
+        # Layer 6: UA truncation in full_log
         if not bypass and BLUETEAM_REDACT_UAS:
             if len(data) > 80 and re.search(r"Mozilla|Chrome|Safari|Firefox|curl|wget|python", data):
                 data = data[:80] + "..."
@@ -772,17 +778,9 @@ async def _wazuh_get_token() -> Optional[str]:
         return _wazuh_token
     try:
         url = f"{WAZUH_API_URL}/security/user/authenticate?raw=true"
-
-        async def _do_wazuh_auth_http() -> str:
-            client = await _get_client("wazuh", verify=WAZUH_API_VERIFY_SSL, max_keepalive=10, max_connections=50)
-            resp = await client.post(
-                url,
-                auth=(WAZUH_API_USER, WAZUH_API_PASSWORD),
-            )
-            resp.raise_for_status()
-            return resp.text.strip().strip('"')
-
-        _wazuh_token = await _do_wazuh_auth_http()
+        resp = await _api_call("post", url, client_name="wazuh",
+                                auth=(WAZUH_API_USER, WAZUH_API_PASSWORD))
+        _wazuh_token = resp.text.strip().strip('"')
         _wazuh_token_expiry = now + _WAZUH_TOKEN_TTL
         return _wazuh_token
     except httpx.HTTPStatusError as e:
@@ -791,15 +789,11 @@ async def _wazuh_get_token() -> Optional[str]:
         _wazuh_token_expiry = 0.0
         return None
     except Exception as e:
-        logger.warning("Wazuh auth failed: circuit breaker open — %s", e)
-        _wazuh_token = None
-        _wazuh_token_expiry = 0.0
-        return None
-    except Exception as e:
         logger.warning("Wazuh auth failed: %s", e)
         _wazuh_token = None
         _wazuh_token_expiry = 0.0
         return None
+
 
 async def _wazuh_api_get(path: str, params: Dict[str, str] = None) -> Dict:
     """Call Wazuh API GET endpoint. path should start with / (e.g. /agents)."""
@@ -817,30 +811,15 @@ async def _wazuh_api_get(path: str, params: Dict[str, str] = None) -> Dict:
         }
     url = f"{WAZUH_API_URL}{path}"
     try:
-
-        async def _do_wazuh_api_http() -> dict:
-            client = await _get_client("wazuh", verify=WAZUH_API_VERIFY_SSL, max_keepalive=10, max_connections=50)
-            resp = await client.get(
-                url,
-                headers={"Authorization": f"Bearer {token}"},
-                params=params or {},
-            )
-            resp.raise_for_status()
-            return resp.json()
-
-        return await _do_wazuh_api_http()
+        resp = await _api_call("get", url, client_name="wazuh",
+                                headers={"Authorization": f"Bearer {token}"},
+                                params=params or {})
+        return resp.json()
     except httpx.HTTPStatusError as e:
         return {"error": f"Wazuh API error: {e.response.status_code}", "detail": e.response.text[:500]}
-    except Exception:
-        return {
-            "error": "Wazuh Manager API is temporarily unavailable (circuit breaker open)",
-            "detail": (
-                "The Wazuh Manager API has been unresponsive. The circuit breaker "
-                "will retry automatically after the recovery timeout. Try again in ~60 seconds."
-            ),
-        }
     except Exception as e:
         return {"error": str(e)}
+
 
 async def _wazuh_indexer_search(
     index_pattern: str,
@@ -854,6 +833,7 @@ async def _wazuh_indexer_search(
     srcips: Optional[list[str]] = None,
     fields: Optional[list[str]] = None,
     rule_groups: Optional[list[str]] = None,
+    geo_country: Optional[str] = None,
 ) -> Dict:
     """Query Wazuh Indexer (OpenSearch) for alerts/events. Read-only _search only.
     Uses search_after cursor pagination — bypasses the 10000 doc max_result_window
@@ -905,6 +885,10 @@ async def _wazuh_indexer_search(
     # against the array field — more precise than free-text keyword on rule.description.
     if rule_groups:
         must_clauses.append({"terms": {"rule.groups": rule_groups}})
+    # GeoLocation country filter — exact match on Wazuh Indexer GeoIP enrichment.
+    # Only alerts that passed through GeoIP processing will match.
+    if geo_country and geo_country.strip():
+        must_clauses.append({"term": {"GeoLocation.country_name": geo_country.strip()}})
     # Time-range filter on @timestamp (UTC). Accepts ISO 8601 AND relative time
     # expressions ('24h', '1h', '7d', '30d', '5m') via _parse_time_window().
     # Supports since-only, until-only, or both together.
@@ -970,19 +954,12 @@ async def _wazuh_indexer_search(
     if search_after is not None:
         body["search_after"] = search_after
 
-    async def _do_indexer_http() -> dict[str, Any]:
-        client = await _get_client("indexer", verify=WAZUH_INDEXER_VERIFY_SSL, max_keepalive=10, max_connections=50)
-        resp = await client.post(
-            url,
-            auth=(WAZUH_INDEXER_USER, WAZUH_INDEXER_PASSWORD),
-            json=body,
-            headers={"Content-Type": "application/json"},
-        )
-        resp.raise_for_status()
-        return resp.json()
-
     try:
-        result = await _do_indexer_http()
+        resp = await _api_call("post", url, client_name="indexer",
+                                auth=(WAZUH_INDEXER_USER, WAZUH_INDEXER_PASSWORD),
+                                json=body,
+                                headers={"Content-Type": "application/json"})
+        result = resp.json()
         # Report clamping when _WAZUH_INDEXER_MAX_SIZE caps the requested size,
         # so callers can programmatically detect incomplete pages.
         applied = body["size"]
@@ -1065,7 +1042,7 @@ async def _wazuh_indexer_email_search(
         "size": min(size, _WAZUH_INDEXER_MAX_SIZE),
         "sort": [{"@timestamp": {"order": "asc"}}, {"_id": {"order": "asc"}}],
         "query": query,
-        # Only fetch fields we actually need — raw full_log can be huge
+        # Only fetch fields we actually need - raw full_log can be huge
         "_source": [
             "full_log",
             "data.account",
@@ -1269,6 +1246,7 @@ async def _wazuh_indexer_aggregate(
     top_n_srcips: int = 5,
     top_n_agents: int = 3,
     keyword: Optional[str] = None,
+    geo_country: Optional[str] = None,
 ) -> Dict:
     """Query Wazuh Indexer with a date_histogram aggregation — no document hits.
 
@@ -1299,6 +1277,8 @@ async def _wazuh_indexer_aggregate(
         filter_clauses.append({"terms": {"rule.groups": list(rule_groups)}})
     if rule_level_min is not None:
         filter_clauses.append({"range": {"rule.level": {"gte": rule_level_min}}})
+    if geo_country and geo_country.strip():
+        filter_clauses.append({"term": {"GeoLocation.country_name": geo_country.strip()}})
     # Free-text keyword filter - same query_string pattern as _wazuh_indexer_search
     if keyword and keyword.strip():
         k = keyword.strip()
@@ -1384,10 +1364,8 @@ def _get_crowdsec_api_key() -> str:
 
 async def _crowdsec_request(path: str) -> dict[str, Any]:
     """Reusable async GET request to the CrowdSec CTI API.
-
     Implements an in-memory TTL cache (default 15 min, configurable via
-    CROWDSEC_CACHE_TTL) per PRD FR-2a / SKILLS.md §3.1. Cache entries are
-    keyed by the exact path (which includes the IP). Error responses (HTTP
+    CROWDSEC_CACHE_TTL) . Cache entries are keyed by the exact path (which includes the IP). Error responses (HTTP
     4xx/5xx) are never cached.
     """
     #cache lookup
@@ -1408,14 +1386,9 @@ async def _crowdsec_request(path: str) -> dict[str, Any]:
     }
     url = f"{CROWDSEC_BASE_URL}{path}"
 
-    # circuit-breaker-wrapped HTTP call — cache hits skip this entirely
-    async def _do_crowdsec_http() -> dict[str, Any]:
-        client = await _get_client("http")
-        response = await client.get(url, headers=headers)
-        response.raise_for_status()
-        return response.json()
-
-    data = await _do_crowdsec_http()
+    # circuit-breaker-wrapped HTTP call - cache hits skip this entirely
+    resp = await _api_call("get", url, headers=headers)
+    data = resp.json()
 
     #Cache store
     _crowdsec_cache[path] = (now + CROWDSEC_CACHE_TTL, data)
@@ -1550,7 +1523,7 @@ class CrowdsecIpReputationBulkInput(BaseModel):
 )
 async def crowdsec_ip_reputation(params: CrowdsecIpReputationInput) -> str:
     """
-    Check the threat reputation of a public IP address using the CrowdSec CTI Smoke API.
+    Check the threat reputation of a public IP address using the CrowdSec API.
 
     This tool is READ-ONLY — it queries CrowdSec's threat intelligence database to
     retrieve reputation, observed attack behaviors, related MITRE ATT&CK techniques,
@@ -1701,18 +1674,18 @@ def _format_greynoise_markdown(ip: str, raw: dict[str, Any]) -> str:
     # Noise
     noise = raw.get("noise")
     if noise is True:
-        lines.append("- **Noise**: Yes — this IP has been observed scanning the internet")
+        lines.append("- **Noise**: Yes - this IP has been observed scanning the internet")
     elif noise is False:
-        lines.append("- **Noise**: No — this IP has not been observed scanning")
+        lines.append("- **Noise**: No - this IP has not been observed scanning")
     else:
         lines.append("- **Noise**: unknown")
 
     # RIOT (business service)
     riot = raw.get("riot")
     if riot is True:
-        lines.append("- **RIOT**: Yes — this IP is a known business service (trusted)")
+        lines.append("- **RIOT**: Yes - this IP is a known business service (trusted)")
     elif riot is False:
-        lines.append("- **RIOT**: No — not a known business service")
+        lines.append("- **RIOT**: No - not a known business service")
     else:
         lines.append("- **RIOT**: unknown")
 
@@ -1827,8 +1800,8 @@ async def greynoise_ip_context(ip: ValidPublicIp, response_format: Literal["mark
     return _truncate_if_needed(result)
 
 
-# NETRA THREAT INTELLIGENCE
-# Optional: set NETRA_API_KEY to enable the netra_ip_analysis tool.
+# NETRA THREAT INTELLIGENCE (Adjusted by the response of NETRA TI)
+# Set NETRA_API_KEY to enable the netra_ip_analysis tool.
 def _get_netra_api_key() -> str:
     """Read Netra Threat Intelligence API key from environment."""
     key = os.environ.get(NETRA_API_KEY_ENV)
@@ -2024,7 +1997,7 @@ def _format_netra_markdown(ip: str, raw: dict[str, Any]) -> str:
 async def netra_ip_analysis(ip: ValidPublicIp, response_format: Literal["markdown", "json"] = "markdown", bypass_redaction: bool = False) -> str:
     """Analyze a public IP address using Netra Threat Intelligence.
 
-    This tool is READ-ONLY — it queries the Netra Threat Intelligence API to
+    This tool is READ ONLY - it queries the Netra Threat Intelligence API to
     retrieve threat analysis, classification, and contextual data for a given IP.
 
     Args:
@@ -2167,8 +2140,8 @@ async def netra_ip_analysis(ip: ValidPublicIp, response_format: Literal["markdow
     return _truncate_if_needed(result)
 
 
-# ARGUS THREAT INTELLIGENCE
-# Optional: set ARGUS_API_KEY and ARGUS_BASE_URL to enable the argus_ip_lookup tool.
+# ARGUS THREAT INTELLIGENCE (AUL : Adjusted from ARGUS Responses.)
+# Set ARGUS_API_KEY and ARGUS_BASE_URL to enable the argus_ip_lookup tool.
 def _get_argus_api_key() -> str:
     """Read Argus Threat Intelligence API key from environment."""
     key = os.environ.get(ARGUS_API_KEY_ENV)
@@ -2196,13 +2169,9 @@ async def _argus_request(path: str, payload: dict) -> dict[str, Any]:
     }
     url = f"{ARGUS_BASE_URL}{path}"
 
-    async def _do_argus_http() -> dict[str, Any]:
-        client = await _get_client("argus", verify=ARGUS_VERIFY_SSL, max_keepalive=5, max_connections=20)
-        resp = await client.post(url, headers=headers, json=payload)
-        resp.raise_for_status()
-        return resp.json()
-
-    return await _do_argus_http()
+    resp = await _api_call("post", url, client_name="argus",
+                            headers=headers, json=payload)
+    return resp.json()
 
 
 def _format_argus_markdown(ip: str, raw: dict[str, Any]) -> str:
@@ -2696,14 +2665,14 @@ async def blueteam_capture_traffic(params: CaptureInput) -> str:
     if output_path and r["returncode"] == 0:
         result = json.dumps({"status": "captured", "file": output_path, "packets": params.count})
     else:
-        # Redact internal RFC1918 IPs from stdout text output (PRD FR-17, AGENTS.md §3.3).
+        # Redact internal RFC1918 IPs from stdout text output.
         # Connection metadata contains internal endpoint IPs; mask them without altering
         # the packet-capture file itself (which is forensic evidence and always unredacted).
         result = _redact_alert_data(result, bypass=params.bypass_redaction)
     _audit_log("blueteam_capture_traffic", {"interface": params.interface, "count": params.count}, result[:200])
     return result
 
-# WAZUH SIEM
+# WAZUH SIEM TANGKOT
 @mcp.tool(
     name="blueteam_wazuh_agents",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
@@ -2810,14 +2779,14 @@ async def blueteam_wazuh_manager_logs(log_type: str = "alerts", limit: int = 50,
         if decoded:
             offset = decoded.get("offset", 0)
 
-    # Wazuh Manager API hard-caps limit at 500 — values > 500 return 400.
+    # Wazuh Manager API hard-caps limit at 500 - values > 500 return 400.
     # Auto-cap here so LLM clients pass large values without triggering API errors.
     wazuh_safe_limit = min(limit, 500)
     api_params = {"offset": str(offset), "limit": str(wazuh_safe_limit), "pretty": "true"}
     tag = _WAZUH_LOG_TAG.get(params.log_type)
     if tag:
         api_params["tag"] = tag
-    # Never send "type" - Wazuh 4.x only accepts "tag"; "type" causes 400
+    # Never send "type" - Wazuh 4.x only accepts "tag"; "type" causes 400 ERROR
     api_params.pop("type", None)
     data = await _wazuh_api_get("/manager/logs", api_params)
     if isinstance(data.get("error"), str):
@@ -2869,7 +2838,7 @@ async def blueteam_wazuh_alerts(agent_name: Optional[str] = None, srcip: Optiona
         return json.dumps({"error": err})
     p = Path(_WAZUH_ALERTS_PATH)
     if not p.exists():
-        # Self-healing fallback: when alerts.json is absent (remote Wazuh Manager),
+        # Self healing fallback: when alerts.json is absent (remote Wazuh Manager),
         # transparently delegate to the Wazuh Indexer instead of returning an error.
         # This avoids forcing the LLM to manually switch tools.
         if not WAZUH_INDEXER_URL or not WAZUH_INDEXER_PASSWORD:
@@ -2882,7 +2851,7 @@ async def blueteam_wazuh_alerts(agent_name: Optional[str] = None, srcip: Optiona
                 "path": _WAZUH_ALERTS_PATH,
             }, indent=2)
 
-        # Decode cursor — handle both indexer search_after and legacy scanned formats
+        # Decode cursor - handle both indexer search_after and legacy scanned formats
         search_after: Optional[list] = None
         if cursor:
             decoded = _decode_cursor(cursor)
@@ -2988,6 +2957,2652 @@ async def blueteam_wazuh_alerts(agent_name: Optional[str] = None, srcip: Optiona
     }, indent=2))
 
 
+# Sprint 2: Alert Enrichment Pipeline (F-1, F-2, F-3)
+# Known attack chains for F-3 (rule.id regex -> phase label transition patterns)
+_KNOWN_ATTACK_CHAINS: list[dict[str, Any]] = [
+    {
+        "id": "recon_to_bruteforce",
+        "phases": ["recon", "bruteforce"],
+        "pattern": [re.compile(r"^(600029|5710|5760|60100|33100)$"),
+                     re.compile(r"^(5710|5712|5716|5760|6020|5551)$")],
+        "description": "Reconnaissance → Brute-force / credential attack",
+        "confidence": 0.75,
+    },
+    {
+        "id": "recon_to_exploit",
+        "phases": ["recon", "exploit"],
+        "pattern": [re.compile(r"^(600029|5710|5760|60100|33100)$"),
+                     re.compile(r"^(31100|31300|31500|31700|33300|33800)$")],
+        "description": "Reconnaissance → Exploitation / payload delivery",
+        "confidence": 0.80,
+    },
+    {
+        "id": "bruteforce_to_access",
+        "phases": ["bruteforce", "access"],
+        "pattern": [re.compile(r"^(5710|5712|5716|5760|6020|5551)$"),
+                     re.compile(r"^(5500|5501|5502|5503|60106|60122)$")],
+        "description": "Brute-force → Successful authentication",
+        "confidence": 0.90,
+    },
+    {
+        "id": "recon_to_c2",
+        "phases": ["recon", "c2_response"],
+        "pattern": [re.compile(r"^(600029|5710|5760|60100|33100)$"),
+                     re.compile(r"^(606029|510|520|530|540|550|560)$")],
+        "description": "Reconnaissance → Active Response / C2 trigger",
+        "confidence": 0.60,
+    },
+    {
+        "id": "full_kill_chain",
+        "phases": ["recon", "bruteforce", "access", "c2_response"],
+        "pattern": [
+            re.compile(r"^(600029|5710|5760|60100|33100)$"),
+            re.compile(r"^(5710|5712|5716|5760|6020|5551)$"),
+            re.compile(r"^(5500|5501|5502|5503|60106|60122)$"),
+            re.compile(r"^(606029|510|520|530|540|550|560)$"),
+        ],
+        "description": "Full kill-chain: Recon → Brute-force → Access → C2/Response",
+        "confidence": 0.95,
+    },
+]
+
+
+# F-1: Alert Summarization
+class AlertSummarizeInput(BaseModel):
+    """Input model for blueteam_wazuh_alert_summarize."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    srcip: str = Field(
+        ...,
+        min_length=7,
+        max_length=45,
+        description="Source IP to summarize alerts for (e.g. '103.107.116.202').",
+    )
+    agent_name: ValidAgentName = Field(
+        default=None,
+        max_length=64,
+        description="Optional Wazuh agent name filter.",
+    )
+    since: Optional[str] = Field(
+        default="24h",
+        max_length=30,
+        description="Start of time window. ISO 8601 or relative ('5m','1h','24h','7d','30d').",
+    )
+    until: Optional[str] = Field(
+        default=None,
+        max_length=30,
+        description="End of time window. Defaults to now.",
+    )
+    limit: int = Field(
+        default=200,
+        ge=10,
+        le=2000,
+        description="Max alerts to fetch for summarization (default 200).",
+    )
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown",
+        description="Output format: 'markdown' (human-readable digest) or 'json'.",
+    )
+    bypass_redaction: bool = Field(
+        default=False,
+        description=_BYPASS_REDACTION_DESC,
+    )
+
+
+@mcp.tool(
+    name="blueteam_wazuh_alert_summarize",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def blueteam_wazuh_alert_summarize(params: AlertSummarizeInput) -> str:
+    """Summarize Wazuh alerts for a source IP into a compact threat digest.
+
+    Extracts IoCs (domains, URLs, user-agents), groups alerts by rule.id
+    with counts, computes first_seen / last_seen per rule, and flags
+    unusual user-agent strings (old browsers, scripted clients).
+
+    Returns a markdown report or JSON with the structured digest — the LLM
+    can reason about attack patterns from the summary without scanning
+    raw alert documents.
+
+    **Required Permissions**: Wazuh Indexer user with ``read`` access.
+
+    **Worked Examples**
+
+    1. *Basic IP summary*:
+       ``blueteam_wazuh_alert_summarize(srcip="103.107.116.202")``
+
+    2. *Focused time window*:
+       ``blueteam_wazuh_alert_summarize(srcip="103.107.116.202", since="1h")``
+
+    3. *Single agent only*:
+       ``blueteam_wazuh_alert_summarize(srcip="103.107.116.202", agent_name="thezoo-prod")``
+    """
+    _audit_log("blueteam_wazuh_alert_summarize", {"srcip": params.srcip})
+    if not WAZUH_INDEXER_URL or not WAZUH_INDEXER_PASSWORD:
+        return json.dumps({
+            "error": "WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD must be set.",
+        }, indent=2)
+
+    since_iso, until_iso = _parse_time_window(params.since, params.until)
+
+    must_clauses: list[dict] = [
+        {"range": {"@timestamp": {"gte": since_iso, "lt": until_iso,
+                                     "format": "strict_date_optional_time"}}},
+        {"bool": {
+            "should": [
+                {"match": {"data.srcip": params.srcip.strip()}},
+                {"match_phrase": {"full_log": params.srcip.strip()}},
+            ],
+            "minimum_should_match": 1,
+        }},
+    ]
+    if params.agent_name:
+        must_clauses.append({"match": {"agent.name": params.agent_name.strip()}})
+
+    body = {
+        "size": min(params.limit, _WAZUH_INDEXER_MAX_SIZE),
+        "sort": [{"@timestamp": {"order": "asc"}}],
+        "query": {"bool": {"must": must_clauses}},
+        "_source": [
+            "@timestamp", "agent.name", "rule.id", "rule.level",
+            "rule.description", "rule.groups", "rule.mitre.tactic",
+            "data.srcip", "data.domain", "data.url", "data.user_agent",
+        ],
+    }
+    raw = await _wazuh_indexer_post(body)
+    if "error" in raw:
+        return json.dumps(raw, indent=2)
+
+    hits = raw.get("hits", {}).get("hits", [])
+    docs = [_redact_alert_data(h.get("_source", h), bypass=params.bypass_redaction)
+            for h in hits]
+
+    if not docs:
+        result = {"srcip": params.srcip, "total_alerts": 0,
+                  "summary": "No alerts found for this IP in the time window."}
+        return json.dumps(result, indent=2) if params.response_format == "json" else (
+            f"# Alert Digest - {params.srcip}\n\n**No alerts found** in window "
+            f"`{since_iso}` -> `{until_iso}`.")
+
+    # IoC extraction
+    rule_counts: dict[str, int] = {}
+    rule_descriptions: dict[str, str] = {}
+    rule_timestamps: dict[str, list[str]] = {}
+    domains: set[str] = set()
+    urls: list[dict[str, str]] = []
+    uas: Counter[str] = Counter()
+    unusual_uas: list[str] = []
+    mitre_tactics: set[str] = set()
+    first_ts = docs[0].get("@timestamp", "")
+    last_ts = docs[-1].get("@timestamp", "")
+
+    for d in docs:
+        rid = str(d.get("rule", {}).get("id", "unknown"))
+        rule_counts[rid] = rule_counts.get(rid, 0) + 1
+        if rid not in rule_descriptions:
+            rule_descriptions[rid] = str(d.get("rule", {}).get("description", rid))
+        rule_timestamps.setdefault(rid, []).append(str(d.get("@timestamp", "")))
+
+        data = d.get("data", {})
+        if isinstance(data, dict):
+            dom = str(data.get("domain", "")).strip()
+            if dom and dom != "-":
+                domains.add(dom)
+            url = str(data.get("url", "")).strip()
+            if url and url != "-":
+                urls.append({"url": url, "ts": str(d.get("@timestamp", ""))})
+            ua = str(data.get("user_agent", "")).strip()
+            if ua and ua != "-":
+                uas[ua] += 1
+
+        mitre = d.get("rule", {}).get("mitre", {})
+        if isinstance(mitre, dict):
+            tactics = mitre.get("tactic", [])
+            if isinstance(tactics, list):
+                mitre_tactics.update(tactics)
+
+    # Flag unusual UA
+    _UA_SIGNALS = [
+        (re.compile(r"Firefox/(?:[1-6]\d|7[0-7])\."), "Old Firefox (pre-78)"),
+        (re.compile(r"Chrome/(?:[1-5]\d|6[0-9])\."), "Old Chrome (pre-70)"),
+        (re.compile(r"curl|wget|python|go-http|libwww|Java/"), "Scripted/automated client"),
+        (re.compile(r"zgrab|masscan|nmap|nikto|sqlmap|ffuf|burp"), "Scanner/exploitation tool"),
+    ]
+    for ua, _ in uas.most_common(20):
+        for pat, label in _UA_SIGNALS:
+            if pat.search(ua):
+                unusual_uas.append(f"{label}: `{ua[:120]}`")
+                break
+
+    # Build response
+    if params.response_format == "json":
+        result = {
+            "srcip": params.srcip,
+            "window": {"since": since_iso, "until": until_iso},
+            "total_alerts": len(docs),
+            "first_seen": first_ts,
+            "last_seen": last_ts,
+            "rules": [
+                {
+                    "id": rid,
+                    "count": cnt,
+                    "description": rule_descriptions.get(rid, ""),
+                    "first_seen": rule_timestamps[rid][0],
+                    "last_seen": rule_timestamps[rid][-1],
+                }
+                for rid, cnt in rule_counts.most_common()
+            ],
+            "iocs": {
+                "domains": sorted(domains),
+                "urls": urls[:50],
+                "top_user_agents": [{"ua": ua, "count": n}
+                                    for ua, n in uas.most_common(5)],
+            },
+            "mitre_tactics": sorted(mitre_tactics),
+            "unusual_user_agents": unusual_uas,
+        }
+        return _truncate_if_needed(json.dumps(result, indent=2, ensure_ascii=False))
+
+    # Markdown digest
+    lines = [
+        f"# Alert Digest - `{params.srcip}`",
+        "",
+        f"- **Window**: `{since_iso}` -> `{until_iso}`",
+        f"- **Total alerts**: {len(docs)} | **First seen**: `{first_ts}` | **Last seen**: `{last_ts}`",
+        "",
+        "## Rules Triggered",
+        "",
+        "| Rule ID | Count | Description | First → Last |",
+        "|---------|-------|-------------|--------------|",
+    ]
+    for rid, cnt in rule_counts.most_common():
+        desc = _escape_md_table(rule_descriptions.get(rid, ""))[:80]
+        fst = rule_timestamps[rid][0][:19] if rule_timestamps[rid] else "-"
+        lst = rule_timestamps[rid][-1][:19] if rule_timestamps[rid] else "-"
+        lines.append(f"| {rid} | {cnt} | {desc} | {fst} → {lst} |")
+
+    if domains:
+        lines.append("")
+        lines.append("## Target Domains")
+        for d in sorted(domains):
+            lines.append(f"- `{d}`")
+
+    if urls:
+        lines.append("")
+        lines.append(f"## URLs Accessed ({len(urls)} total, showing first 15)")
+        for u in urls[:15]:
+            ts_short = u["ts"][:19] if len(u["ts"]) > 19 else u["ts"]
+            lines.append(f"- `[{ts_short}]` `{u['url'][:100]}`")
+        if len(urls) > 15:
+            lines.append(f"- ... and {len(urls) - 15} more")
+
+    if mitre_tactics:
+        lines.append("")
+        lines.append("## MITRE ATT&CK Tactics")
+        for t in sorted(mitre_tactics):
+            cat = MITRE_TACTIC_TO_CATEGORY.get(t, "?")
+            lines.append(f"- {t} (3-Sum Cat: `{cat}`)")
+
+    if unusual_uas:
+        lines.append("")
+        lines.append("## ⚠️ Unusual User-Agents Flagged")
+        for ua_flag in unusual_uas:
+            lines.append(f"- {ua_flag}")
+
+    if uas:
+        lines.append("")
+        lines.append("## Top User-Agents")
+        for ua, n in uas.most_common(3):
+            lines.append(f"- ({n}×) `{ua[:100]}`")
+
+    return _truncate_if_needed("\n".join(lines))
+
+
+# F-2: Beacon Detection
+class BeaconDetectInput(BaseModel):
+    """Input model for blueteam_beacon_detect."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    srcip: str = Field(
+        ...,
+        min_length=7,
+        max_length=45,
+        description="Source IP to analyze for C2 beaconing patterns.",
+    )
+    since: Optional[str] = Field(
+        default="24h",
+        max_length=30,
+        description="Start of time window. ISO 8601 or relative.",
+    )
+    until: Optional[str] = Field(
+        default=None,
+        max_length=30,
+        description="End of time window. Defaults to now.",
+    )
+    cv_threshold: float = Field(
+        default=0.35,
+        ge=0.0,
+        le=1.0,
+        description="Coefficient of variation threshold. CV < threshold → regular beaconing. "
+                    "Lower = stricter (0.15 for tight beacons, 0.35 for relaxed).",
+    )
+    min_events: int = Field(
+        default=5,
+        ge=3,
+        le=1000,
+        description="Minimum events required to compute beacon score.",
+    )
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown",
+        description="Output format: 'markdown' or 'json'.",
+    )
+
+
+@mcp.tool(
+    name="blueteam_beacon_detect",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def blueteam_beacon_detect(params: BeaconDetectInput) -> str:
+    """Detect C2 beaconing patterns via inter-arrival time analysis.
+    Fetches ``@timestamp`` for all alerts from a given source IP, computes
+    inter-arrival gaps, and calculates the coefficient of variation (CV =
+    σ/μ). A low CV with consistent intervals is the statistical signature
+    of periodic beaconing — a hallmark of C2 callbacks.
+
+    Returns beacon score (0.0–1.0), estimated period, gap statistics,
+    and a timeline summary.
+
+    **Required Permissions**: Wazuh Indexer user with ``read`` access.
+
+    **Worked Examples**
+
+    1. *Default 24h scan*:
+       ``blueteam_beacon_detect(srcip="103.107.116.202")``
+
+    2. *7-day window, stricter threshold*:
+       ``blueteam_beacon_detect(srcip="103.107.116.202", since="7d", cv_threshold=0.15)``
+
+    3. *Short window for rapid beaconing*:
+       ``blueteam_beacon_detect(srcip="103.107.116.202", since="1h", min_events=10)``
+    """
+    _audit_log("blueteam_beacon_detect", {"srcip": params.srcip})
+    if not WAZUH_INDEXER_URL or not WAZUH_INDEXER_PASSWORD:
+        return json.dumps({
+            "error": "WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD must be set.",
+        }, indent=2)
+
+    since_iso, until_iso = _parse_time_window(params.since, params.until)
+
+    body = {
+        "size": 2000,
+        "sort": [{"@timestamp": {"order": "asc"}}],
+        "query": {
+            "bool": {
+                "must": [
+                    {"range": {"@timestamp": {"gte": since_iso, "lt": until_iso,
+                                             "format": "strict_date_optional_time"}}},
+                    {"bool": {
+                        "should": [
+                            {"match": {"data.srcip": params.srcip.strip()}},
+                            {"match_phrase": {"full_log": params.srcip.strip()}},
+                        ],
+                        "minimum_should_match": 1,
+                    }},
+                ]
+            }
+        },
+        "_source": ["@timestamp"],
+    }
+    raw = await _wazuh_indexer_post(body)
+    if "error" in raw:
+        return json.dumps(raw, indent=2)
+
+    hits = raw.get("hits", {}).get("hits", [])
+    if len(hits) < params.min_events:
+        result = {
+            "srcip": params.srcip,
+            "beacon_score": 0.0,
+            "verdict": "insufficient_data",
+            "detail": f"Only {len(hits)} events — need at least {params.min_events}.",
+        }
+        return json.dumps(result, indent=2) if params.response_format == "json" else (
+            f"# Beacon Detection — `{params.srcip}`\n\n"
+            f"**Insufficient data**: {len(hits)} events (need ≥{params.min_events}). "
+            f"Expand the time window and retry.")
+
+    # Parse timestamps into epoch seconds
+    timestamps: list[float] = []
+    for h in hits:
+        ts = h.get("_source", {}).get("@timestamp", "")
+        try:
+            dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            timestamps.append(dt.timestamp())
+        except (ValueError, TypeError):
+            continue
+
+    if len(timestamps) < params.min_events:
+        result = {
+            "srcip": params.srcip,
+            "beacon_score": 0.0,
+            "verdict": "unparseable_timestamps",
+            "detail": f"Only {len(timestamps)} parseable timestamps from {len(hits)} hits.",
+        }
+        return json.dumps(result, indent=2) if params.response_format == "json" else (
+            f"# Beacon Detection - `{params.srcip}`\n\n"
+            f"**Could not parse enough timestamps**: {len(timestamps)} valid from {len(hits)} total.")
+
+    # Inter-arrival analysis
+    gaps = [timestamps[i] - timestamps[i - 1] for i in range(1, len(timestamps))]
+    n = len(gaps)
+    mean_gap = sum(gaps) / n
+    variance = sum((g - mean_gap) ** 2 for g in gaps) / n
+    stddev = math.sqrt(variance)
+    cv = stddev / mean_gap if mean_gap > 0 else float("inf")
+
+    # Beacon score: 1.0 = perfect periodicity, 0.0 = random
+    # clamp CV to [0, 1] range via sigmoid-like decay
+    beacon_score = max(0.0, min(1.0, 1.0 - (cv / 0.5)))
+
+    # Estimate period - use median for robustness against outliers
+    sorted_gaps = sorted(gaps)
+    median_gap = sorted_gaps[n // 2] if n > 0 else 0.0
+    period_secs = round(median_gap)
+
+    # Detect multiple period candidates (e.g. 60s + 300s harmonics)
+    gap_counter: Counter[int] = Counter()
+    for g in gaps:
+        gap_counter[int(round(g))] += 1
+    top_periods = gap_counter.most_common(3)
+
+    verdict = (
+        "strong_beacon" if beacon_score >= 0.8 else
+        "likely_beacon" if beacon_score >= 0.5 else
+        "possible_beacon" if beacon_score >= 0.25 else
+        "no_beacon"
+    )
+
+    if params.response_format == "json":
+        result = {
+            "srcip": params.srcip,
+            "window": {"since": since_iso, "until": until_iso},
+            "total_events": len(timestamps),
+            "gaps": {
+                "count": n,
+                "mean_seconds": round(mean_gap, 1),
+                "median_seconds": round(median_gap, 1),
+                "stddev_seconds": round(stddev, 1),
+                "cv": round(cv, 3),
+            },
+            "beacon_score": round(beacon_score, 3),
+            "verdict": verdict,
+            "estimated_period_seconds": period_secs,
+            "top_periods": [{"seconds": p, "count": c} for p, c in top_periods],
+            "timeline_preview": [
+                {"ts": datetime.utcfromtimestamp(t).isoformat() + "Z",
+                 "gap_from_prev_s": round(gaps[i - 1], 1) if i > 0 else None}
+                for i, t in enumerate(timestamps[:20])
+            ],
+        }
+        return _truncate_if_needed(json.dumps(result, indent=2, ensure_ascii=False))
+
+    # Markdown report Format
+    verdict_icon = {"strong_beacon": "🔴", "likely_beacon": "🟠",
+                     "possible_beacon": "🟡", "no_beacon": "🟢"}
+    lines = [
+        f"# Beacon Detection — `{params.srcip}`",
+        "",
+        f"- **Verdict**: {verdict_icon.get(verdict, '')} **{verdict.replace('_', ' ').title()}**",
+        f"- **Beacon Score**: `{beacon_score:.3f}` (0.0 = random, 1.0 = perfect periodicity)",
+        f"- **Events**: {len(timestamps)} over {since_iso} → {until_iso}",
+        "",
+        f"| Metric | Value |",
+        f"|--------|-------|",
+        f"| Mean gap | {mean_gap:.1f}s |",
+        f"| Median gap | {median_gap:.1f}s |",
+        f"| StdDev | {stddev:.1f}s |",
+        f"| CV (σ/μ) | {cv:.3f} |",
+        "",
+    ]
+    if period_secs > 0:
+        period_display = (
+            f"{period_secs}s" if period_secs < 120 else
+            f"{period_secs / 60:.1f}m" if period_secs < 3600 else
+            f"{period_secs / 3600:.1f}h"
+        )
+        lines.append(f"**Estimated period**: ~{period_display}")
+
+    if top_periods:
+        lines.append("")
+        lines.append("## Top Period Candidates")
+        for secs, cnt in top_periods:
+            d = f"{secs}s" if secs < 120 else f"{secs / 60:.1f}m"
+            lines.append(f"- {d} — {cnt} occurrences")
+
+    lines.append("")
+    lines.append("## Gap Distribution (first 20 events)")
+    lines.append("```")
+    for i, t in enumerate(timestamps[:20]):
+        ts_str = datetime.utcfromtimestamp(t).isoformat()[:19] + "Z"
+        gap_str = f"+{gaps[i - 1]:.0f}s" if i > 0 else "start"
+        bar = "█" * min(40, int(gaps[i - 1] / max(1, mean_gap) * 10)) if i > 0 else ""
+        lines.append(f"  {ts_str}  {gap_str:>8s}  {bar}")
+    if len(timestamps) > 20:
+        lines.append(f"  ... and {len(timestamps) - 20} more events")
+    lines.append("```")
+
+    return _truncate_if_needed("\n".join(lines))
+
+
+# F-3: Attack Chain Analysis
+class AttackChainInput(BaseModel):
+    """Input model for blueteam_attack_chain."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    srcip: str = Field(
+        ...,
+        min_length=7,
+        max_length=45,
+        description="Source IP to analyze for attack progression chains.",
+    )
+    since: Optional[str] = Field(
+        default="24h",
+        max_length=30,
+        description="Start of time window.",
+    )
+    until: Optional[str] = Field(
+        default=None,
+        max_length=30,
+        description="End of time window.",
+    )
+    min_transitions: int = Field(
+        default=2,
+        ge=2,
+        le=100,
+        description="Minimum rule transitions to consider a chain.",
+    )
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown",
+        description="Output format: 'markdown' or 'json'.",
+    )
+
+
+@mcp.tool(
+    name="blueteam_attack_chain",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def blueteam_attack_chain(params: AttackChainInput) -> str:
+    """Analyze rule-to-rule transitions to reconstruct attack kill-chain progression.
+
+    Fetches all alerts for a source IP ordered by timestamp, builds a
+    Markov transition graph of ``rule.id`` sequences, and matches observed
+    transitions against known attack chains (recon -> bruteforce -> access -> C2/response).
+
+    Returns matched chains with confidence scores, the full transition
+    matrix, and a timeline of key transitions.
+
+    **Required Permissions**: Wazuh Indexer user with ``read`` access.
+
+    **Worked Examples**
+
+    1. *Default 24h*:
+       ``blueteam_attack_chain(srcip="103.107.116.202")``
+
+    2. *7-day forensic window*:
+       ``blueteam_attack_chain(srcip="103.107.116.202", since="7d")``
+
+    3. *Require 3+ transitions*:
+       ``blueteam_attack_chain(srcip="103.107.116.202", min_transitions=3)``
+    """
+    _audit_log("blueteam_attack_chain", {"srcip": params.srcip})
+    if not WAZUH_INDEXER_URL or not WAZUH_INDEXER_PASSWORD:
+        return json.dumps({
+            "error": "WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD must be set.",
+        }, indent=2)
+
+    since_iso, until_iso = _parse_time_window(params.since, params.until)
+
+    body = {
+        "size": 2000,
+        "sort": [{"@timestamp": {"order": "asc"}}],
+        "query": {
+            "bool": {
+                "must": [
+                    {"range": {"@timestamp": {"gte": since_iso, "lt": until_iso,
+                                             "format": "strict_date_optional_time"}}},
+                    {"bool": {
+                        "should": [
+                            {"match": {"data.srcip": params.srcip.strip()}},
+                            {"match_phrase": {"full_log": params.srcip.strip()}},
+                        ],
+                        "minimum_should_match": 1,
+                    }},
+                ]
+            }
+        },
+        "_source": ["@timestamp", "rule.id", "rule.description", "rule.level", "rule.mitre.tactic"],
+    }
+    raw = await _wazuh_indexer_post(body)
+    if "error" in raw:
+        return json.dumps(raw, indent=2)
+
+    hits = raw.get("hits", {}).get("hits", [])
+    docs = [h.get("_source", h) for h in hits]
+
+    if len(docs) < params.min_transitions:
+        result = {
+            "srcip": params.srcip,
+            "total_events": len(docs),
+            "verdict": "insufficient_data",
+            "detail": f"Need at least {params.min_transitions} rule transitions.",
+        }
+        return json.dumps(result, indent=2) if params.response_format == "json" else (
+            f"# Attack Chain — `{params.srcip}`\n\n"
+            f"**Insufficient data**: {len(docs)} events (need ≥{params.min_transitions} transitions).")
+
+    # Build rule sequence and transition matrix
+    rule_seq: list[str] = []
+    rule_info: dict[str, dict[str, str]] = {}
+    for d in docs:
+        rid = str(d.get("rule", {}).get("id", "unknown"))
+        rule_seq.append(rid)
+        if rid not in rule_info:
+            rule_info[rid] = {
+                "description": str(d.get("rule", {}).get("description", rid)),
+                "level": str(d.get("rule", {}).get("level", "?")),
+            }
+
+    # Compress consecutive duplicates (Aul Adjusted : same rule firing repeatedly = persistence, not a transition)
+    compressed: list[str] = [rule_seq[0]]
+    for rid in rule_seq[1:]:
+        if rid != compressed[-1]:
+            compressed.append(rid)
+
+    transitions: list[tuple[str, str]] = []
+    for i in range(len(compressed) - 1):
+        transitions.append((compressed[i], compressed[i + 1]))
+
+    # Count transitions
+    trans_counter: Counter[tuple[str, str]] = Counter(transitions)
+
+    # Match against known attack chains
+    chain_matches: list[dict[str, Any]] = []
+    for chain in _KNOWN_ATTACK_CHAINS:
+        chain_ids = [rid for rid, _ in transitions]
+        # Check if the compressed sequence contains the ordered pattern
+        # Use a subsequence match: each phase must appear in order, not necessarily consecutive
+        pattern = chain["pattern"]
+        seq_idx = 0
+        matched_ids: list[str] = []
+        for rid in compressed:
+            if seq_idx < len(pattern) and pattern[seq_idx].search(rid):
+                matched_ids.append(rid)
+                seq_idx += 1
+        if seq_idx >= 2:  # at least 2 phases matched
+            # Compute observed phase-by-phase transition details
+            phase_detail: list[dict[str, Any]] = []
+            for j in range(len(matched_ids) - 1):
+                phase_detail.append({
+                    "from_phase": chain["phases"][j],
+                    "to_phase": chain["phases"][j + 1],
+                    "from_rule": matched_ids[j],
+                    "to_rule": matched_ids[j + 1],
+                })
+            adjusted_conf = chain["confidence"] * min(1.0, seq_idx / len(pattern))
+            chain_matches.append({
+                "chain_id": chain["id"],
+                "description": chain["description"],
+                "confidence": round(adjusted_conf, 2),
+                "phases_matched": seq_idx,
+                "phases_total": len(pattern),
+                "matched_rules": matched_ids[:8],
+                "phase_transitions": phase_detail,
+            })
+    chain_matches.sort(key=lambda c: c["confidence"], reverse=True)
+
+    if params.response_format == "json":
+        result = {
+            "srcip": params.srcip,
+            "window": {"since": since_iso, "until": until_iso},
+            "total_events": len(docs),
+            "unique_rules": len(rule_info),
+            "transitions_observed": len(transitions),
+            "compressed_sequence": compressed[:50],
+            "rule_info": rule_info,
+            "top_transitions": [
+                {"from": f, "to": t, "count": c}
+                for (f, t), c in trans_counter.most_common(15)
+            ],
+            "chain_matches": chain_matches,
+        }
+        return _truncate_if_needed(json.dumps(result, indent=2, ensure_ascii=False))
+
+    # Markdown report
+    lines = [
+        f"# Attack Chain — `{params.srcip}`",
+        "",
+        f"- **Window**: `{since_iso}` → `{until_iso}`",
+        f"- **Events**: {len(docs)} → {len(compressed)} distinct rule transitions",
+        f"- **Unique rules triggered**: {len(rule_info)}",
+        "",
+    ]
+
+    if chain_matches:
+        lines.append("## 🎯 Matched Kill-Chain Patterns")
+        lines.append("")
+        for cm in chain_matches[:5]:
+            conf_bar = "█" * int(cm["confidence"] * 10) + "░" * (10 - int(cm["confidence"] * 10))
+            lines.append(f"### {cm['chain_id']} (confidence: {cm['confidence']:.2f})")
+            lines.append(f"`[{conf_bar}]`")
+            lines.append(f"{cm['description']}")
+            lines.append(f"- **Phases matched**: {cm['phases_matched']}/{cm['phases_total']}")
+            # Draw ASCII chain
+            arrow_parts: list[str] = []
+            for pt in cm.get("phase_transitions", []):
+                arrow_parts.append(
+                    f"`{pt['from_phase']}`[{pt['from_rule']}] → "
+                    f"`{pt['to_phase']}`[{pt['to_rule']}]"
+                )
+            lines.append(f"- **Path**: {' → '.join(arrow_parts) if arrow_parts else '(see matched_rules)'}")
+            lines.append("")
+    else:
+        lines.append("## No known attack chain matched")
+        lines.append("")
+
+    # Compressed sequence visualization
+    lines.append("## Rule Transition Sequence")
+    lines.append("")
+    lines.append("```")
+    for i, rid in enumerate(compressed[:30]):
+        info = rule_info.get(rid, {})
+        desc = info.get("description", "?")[:70]
+        lvl = info.get("level", "?")
+        arrow = " → " if i < len(compressed[:30]) - 1 else ""
+        lines.append(f"  [{lvl}] {rid} ({desc}){arrow}")
+    if len(compressed) > 30:
+        lines.append(f"  ... and {len(compressed) - 30} more transitions")
+    lines.append("```")
+
+    # Top transitions table
+    if trans_counter:
+        lines.append("")
+        lines.append("## Top Rule Transitions")
+        lines.append("")
+        lines.append("| From | To | Count |")
+        lines.append("|------|----|-------|")
+        for (f, t), c in trans_counter.most_common(10):
+            lines.append(f"| `{f}` | `{t}` | {c} |")
+
+    return _truncate_if_needed("\n".join(lines))
+
+
+# F-5: Threat Card Generation (AUL Adjusted)
+class ThreatCardInput(BaseModel):
+    """Input model for blueteam_threat_card."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    srcip: str = Field(
+        ...,
+        min_length=7,
+        max_length=45,
+        description="Source IP to generate a comprehensive threat card for.",
+    )
+    since: Optional[str] = Field(
+        default="24h",
+        max_length=30,
+        description="Start of time window.",
+    )
+    until: Optional[str] = Field(
+        default=None,
+        max_length=30,
+        description="End of time window. Defaults to now.",
+    )
+    include_threat_intel: bool = Field(
+        default=True,
+        description="Include CrowdSec and GreyNoise reputation lookups (may add ~2s latency).",
+    )
+    bypass_redaction: bool = Field(
+        default=False,
+        description=_BYPASS_REDACTION_DESC,
+    )
+
+
+@mcp.tool(
+    name="blueteam_threat_card",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def blueteam_threat_card(params: ThreatCardInput) -> str:
+    """Generate a comprehensive threat card for a source IP.
+    Collapses alert summarization, attack chain analysis, MITRE ATT&CK
+    mapping, and threat intelligence (CrowdSec + GreyNoise) into a single
+    structured report. Designed as the one-stop triage tool — the LLM can
+    understand the full threat context in one call.
+
+    **Required Permissions**: Wazuh Indexer ``read`` access.
+    CrowdSec/GreyNoise lookups are best-effort (fail gracefully if keys
+    are not configured).
+
+    **Worked Examples**
+
+    1. *Default 24h card*:
+       ``blueteam_threat_card(srcip="103.107.116.202")``
+
+    2. *7-day forensic card*:
+       ``blueteam_threat_card(srcip="103.107.116.202", since="7d")``
+
+    3. *Skip threat intel for speed*:
+       ``blueteam_threat_card(srcip="103.107.116.202", include_threat_intel=false)``
+    """
+    _audit_log("blueteam_threat_card", {"srcip": params.srcip})
+    if not WAZUH_INDEXER_URL or not WAZUH_INDEXER_PASSWORD:
+        return json.dumps({
+            "error": "WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD must be set.",
+        }, indent=2)
+
+    since_iso, until_iso = _parse_time_window(params.since, params.until)
+
+    # Fetch alerts for this IP
+    body = {
+        "size": 500,
+        "sort": [{"@timestamp": {"order": "asc"}}],
+        "query": {
+            "bool": {
+                "must": [
+                    {"range": {"@timestamp": {"gte": since_iso, "lt": until_iso,
+                                             "format": "strict_date_optional_time"}}},
+                    {"bool": {
+                        "should": [
+                            {"match": {"data.srcip": params.srcip.strip()}},
+                            {"match_phrase": {"full_log": params.srcip.strip()}},
+                        ],
+                        "minimum_should_match": 1,
+                    }},
+                ]
+            }
+        },
+        "_source": [
+            "@timestamp", "agent.name", "rule.id", "rule.level",
+            "rule.description", "rule.groups", "rule.mitre.tactic",
+            "data.srcip", "data.domain", "data.url", "data.user_agent",
+        ],
+    }
+
+    # Fetch alerts + threat intel concurrently
+    async def _fetch_alerts():
+        raw = await _wazuh_indexer_post(body)
+        if "error" in raw:
+            return raw
+        return [h.get("_source", h) for h in raw.get("hits", {}).get("hits", [])]
+
+    async def _fetch_crowdsec():
+        if not params.include_threat_intel or not os.environ.get(CROWDSEC_API_KEY_ENV):
+            return None
+        try:
+            return await _crowdsec_request(f"/v2/smoke/{params.srcip}")
+        except Exception:
+            return None
+
+    async def _fetch_greynoise():
+        if not params.include_threat_intel:
+            return None
+        try:
+            return await _greynoise_community_request(params.srcip)
+        except Exception:
+            return None
+
+    docs, crowdsec_data, greynoise_data = await asyncio.gather(
+        _fetch_alerts(), _fetch_crowdsec(), _fetch_greynoise(),
+    )
+
+    if isinstance(docs, dict) and "error" in docs:
+        return json.dumps(docs, indent=2)
+
+    docs = _redact_alert_data(docs, bypass=params.bypass_redaction)
+
+    # Build threat card
+    lines = [
+        f"# 🛡️ Threat Card — `{params.srcip}`",
+        "",
+        f"**Window**: `{since_iso}` → `{until_iso}` | **Total events**: {len(docs)}",
+        "",
+        "---",
+        "",
+    ]
+
+    if not docs:
+        lines.append("## No alerts found")
+        lines.append(f"No Wazuh alerts for `{params.srcip}` in this time window.")
+        return "\n".join(lines)
+
+    # Section 1: Executive Summary
+    rule_counts: Counter[str] = Counter()
+    rule_descs: dict[str, str] = {}
+    mitre_tactics: set[str] = set()
+    domains: set[str] = set()
+    urls: list[str] = []
+    levels: list[int] = []
+    agents: set[str] = set()
+    first_ts = str(docs[0].get("@timestamp", ""))[:19]
+    last_ts = str(docs[-1].get("@timestamp", ""))[:19]
+
+    for d in docs:
+        r = d.get("rule", {})
+        rid = str(r.get("id", "unknown"))
+        rule_counts[rid] += 1
+        if rid not in rule_descs:
+            rule_descs[rid] = str(r.get("description", rid))
+        lvl = r.get("level")
+        if isinstance(lvl, (int, str)):
+            try:
+                levels.append(int(lvl))
+            except (ValueError, TypeError):
+                pass
+        mitre = r.get("mitre", {})
+        if isinstance(mitre, dict):
+            tactics = mitre.get("tactic", [])
+            if isinstance(tactics, list):
+                mitre_tactics.update(tactics)
+        data = d.get("data", {})
+        if isinstance(data, dict):
+            dom = str(data.get("domain", "")).strip()
+            if dom and dom != "-":
+                domains.add(dom)
+            url = str(data.get("url", "")).strip()
+            if url and url != "-":
+                urls.append(url)
+        ag = d.get("agent", {})
+        if isinstance(ag, dict):
+            aname = str(ag.get("name", ""))
+            if aname:
+                agents.add(aname)
+
+    max_level = max(levels) if levels else 0
+    avg_level = sum(levels) / len(levels) if levels else 0.0
+
+    lines.append("## 📊 Executive Summary")
+    lines.append("")
+    lines.append(f"| Field | Value |")
+    lines.append(f"|-------|-------|")
+    lines.append(f"| Total alerts | {len(docs)} |")
+    lines.append(f"| Unique rules | {len(rule_counts)} |")
+    lines.append(f"| Max rule level | {max_level} |")
+    lines.append(f"| Avg rule level | {avg_level:.1f} |")
+    lines.append(f"| Agents targeted | {len(agents)} ({', '.join(sorted(agents)[:3])}{"..." if len(agents) > 3 else ""}) |")
+    lines.append(f"| First seen | `{first_ts}` |")
+    lines.append(f"| Last seen | `{last_ts}` |")
+    lines.append("")
+
+    # Section 2: MITRE ATT&CK
+    if mitre_tactics:
+        lines.append("## 🎯 MITRE ATT&CK Tactics")
+        lines.append("")
+        lines.append("| Tactic | 3-Sum Category |")
+        lines.append("|--------|---------------|")
+        for t in sorted(mitre_tactics):
+            cat = MITRE_TACTIC_TO_CATEGORY.get(t, "?")
+            lines.append(f"| {t} | `{cat}` |")
+        lines.append("")
+
+    # Section 3: Rules Fired
+    lines.append("## 🔥 Rules Triggered")
+    lines.append("")
+    lines.append("| Rule ID | Count | Description |")
+    lines.append("|---------|-------|-------------|")
+    for rid, cnt in rule_counts.most_common(10):
+        desc = _escape_md_table(rule_descs.get(rid, ""))[:80]
+        lines.append(f"| {rid} | {cnt} | {desc} |")
+    lines.append("")
+
+    # Section 4: Targeted Resources
+    if domains:
+        lines.append("## 🌐 Targeted Domains")
+        for d in sorted(domains):
+            lines.append(f"- `{d}`")
+        lines.append("")
+    if urls:
+        lines.append(f"## 🔗 URLs Probed ({len(urls)} unique)")
+        for u in sorted(set(urls))[:10]:
+            lines.append(f"- `{u[:120]}`")
+        if len(set(urls)) > 10:
+            lines.append(f"- ... and {len(set(urls)) - 10} more")
+        lines.append("")
+
+    # Section 5: Threat Intelligence
+    if crowdsec_data or greynoise_data:
+        lines.append("## 🌍 External Threat Intelligence")
+        lines.append("")
+    if crowdsec_data:
+        rep = crowdsec_data.get("reputation", "unknown")
+        behaviors = [b.get("name", "") for b in crowdsec_data.get("behaviors", [])]
+        lines.append(f"- **CrowdSec**: reputation `{rep}`")
+        if behaviors:
+            lines.append(f"  - Behaviors: {', '.join(behaviors[:5])}")
+        cves = crowdsec_data.get("cves", [])
+        if cves:
+            lines.append(f"  - Related CVEs: {', '.join(cves[:5])}")
+    if greynoise_data:
+        noise = greynoise_data.get("noise")
+        riot = greynoise_data.get("riot")
+        classification = greynoise_data.get("classification", "unknown")
+        lines.append(f"- **GreyNoise**: classification `{classification}`")
+        if noise:
+            lines.append(f"  - Internet scanner: ✅ (background noise)")
+        if riot:
+            lines.append(f"  - Known business service: ✅ (likely benign)")
+    if crowdsec_data or greynoise_data:
+        lines.append("")
+
+    # Section 6: Recommended Actions
+    lines.append("## 🛠️ Recommended Actions")
+    lines.append("")
+
+    # Heuristic recommendations based on alert patterns
+    if max_level >= 12:
+        lines.append("1. **🚨 IMMEDIATE**: Critical-severity alerts detected — initiate incident response")
+        lines.append(f"2. Block `{params.srcip}` at perimeter firewall immediately")
+    elif max_level >= 10:
+        lines.append(f"1. **⚠️ HIGH**: Block `{params.srcip}` at perimeter firewall")
+        lines.append("2. Review affected agent logs for signs of compromise")
+    elif max_level >= 6:
+        lines.append(f"1. **📋 MEDIUM**: Monitor `{params.srcip}` and add to watchlist")
+        lines.append("2. Review web/app logs for suspicious request patterns")
+    else:
+        lines.append(f"1. **ℹ️ LOW**: `{params.srcip}` shows low-severity activity")
+        lines.append("2. No immediate action required — continue monitoring")
+
+    if crowdsec_data and crowdsec_data.get("reputation") == "malicious":
+        lines.append("3. CrowdSec confirms malicious — escalate block priority")
+    if len(agents) > 1:
+        lines.append(f"4. IP targeted {len(agents)} agents — check for lateral movement")
+    if len(mitre_tactics) >= 3:
+        lines.append("5. Multiple MITRE tactics observed — full compromise assessment recommended")
+
+    lines.append("")
+    lines.append("---")
+    lines.append(f"*Card generated by blue_team_mcp at {datetime.utcnow().isoformat()[:19]}Z*")
+
+    return _truncate_if_needed("\n".join(lines))
+
+
+# F-6: Alert Comparison
+class AlertCompareInput(BaseModel):
+    """Input model for blueteam_wazuh_alert_compare."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    srcip_a: str = Field(
+        ...,
+        min_length=7,
+        max_length=45,
+        description="First source IP to compare.",
+    )
+    srcip_b: str = Field(
+        ...,
+        min_length=7,
+        max_length=45,
+        description="Second source IP to compare.",
+    )
+    since: Optional[str] = Field(
+        default="24h",
+        max_length=30,
+        description="Start of time window.",
+    )
+    until: Optional[str] = Field(
+        default=None,
+        max_length=30,
+        description="End of time window. Defaults to now.",
+    )
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown",
+        description="Output format: 'markdown' (side-by-side) or 'json'.",
+    )
+
+
+@mcp.tool(
+    name="blueteam_wazuh_alert_compare",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def blueteam_wazuh_alert_compare(params: AlertCompareInput) -> str:
+    """Compare alert profiles of two source IPs side-by-side.
+
+    Fetches alert counts, top rules, max severity, MITRE tactics, and
+    beacon scores for both IPs and returns a structured comparison with
+    a verdict on which IP is more suspicious.
+
+    Saves the LLM from orchestrating 4+ sequential calls to analyze two
+    IPs independently.
+
+    **Required Permissions**: Wazuh Indexer ``read`` access.
+
+    **Worked Examples**
+
+    1. *Compare two suspicious IPs*:
+       ``blueteam_wazuh_alert_compare(srcip_a="103.107.116.202", srcip_b="185.220.101.1")``
+
+    2. *7-day comparison*:
+       ``blueteam_wazuh_alert_compare(srcip_a="10.0.0.5", srcip_b="10.0.0.99", since="7d")``
+    """
+    _audit_log("blueteam_wazuh_alert_compare",
+               {"srcip_a": params.srcip_a, "srcip_b": params.srcip_b})
+    if not WAZUH_INDEXER_URL or not WAZUH_INDEXER_PASSWORD:
+        return json.dumps({
+            "error": "WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD must be set.",
+        }, indent=2)
+
+    since_iso, until_iso = _parse_time_window(params.since, params.until)
+
+    async def _profile_ip(ip: str) -> dict[str, Any]:
+        body = {
+            "size": 0,
+            "query": {
+                "bool": {
+                    "must": [
+                        {"range": {"@timestamp": {"gte": since_iso, "lt": until_iso,
+                                                 "format": "strict_date_optional_time"}}},
+                        {"bool": {
+                            "should": [
+                                {"match": {"data.srcip": ip.strip()}},
+                                {"match_phrase": {"full_log": ip.strip()}},
+                            ],
+                            "minimum_should_match": 1,
+                        }},
+                    ]
+                }
+            },
+            "aggs": {
+                "top_rules": {"terms": {"field": "rule.id.keyword", "size": 5}},
+                "by_level": {
+                    "range": {
+                        "field": "rule.level",
+                        "ranges": [
+                            {"key": "low", "to": 5},
+                            {"key": "medium", "from": 5, "to": 10},
+                            {"key": "high", "from": 10},
+                        ],
+                    }
+                },
+                "top_agents": {"terms": {"field": "agent.name.keyword", "size": 5}},
+            },
+        }
+        raw = await _wazuh_indexer_post(body)
+        if "error" in raw:
+            return {"srcip": ip, "error": raw["error"]}
+        total = raw.get("hits", {}).get("total", {})
+        total_val = total.get("value", 0) if isinstance(total, dict) else total
+        aggs = raw.get("aggregations", {})
+        return {
+            "srcip": ip,
+            "total_alerts": total_val,
+            "top_rules": [
+                {"id": b["key"], "count": b["doc_count"]}
+                for b in aggs.get("top_rules", {}).get("buckets", [])
+            ],
+            "severity": {
+                b["key"]: b["doc_count"]
+                for b in aggs.get("by_level", {}).get("buckets", [])
+            },
+            "agents": [
+                {"name": b["key"], "count": b["doc_count"]}
+                for b in aggs.get("top_agents", {}).get("buckets", [])
+            ],
+        }
+
+    profile_a, profile_b = await asyncio.gather(
+        _profile_ip(params.srcip_a), _profile_ip(params.srcip_b),
+    )
+
+    if params.response_format == "json":
+        result = {
+            "window": {"since": since_iso, "until": until_iso},
+            "ip_a": profile_a,
+            "ip_b": profile_b,
+        }
+        # Determine which is more suspicious
+        a_score = profile_a.get("total_alerts", 0)
+        b_score = profile_b.get("total_alerts", 0)
+        if a_score > b_score * 2:
+            result["verdict"] = f"{params.srcip_a} is significantly more active"
+        elif b_score > a_score * 2:
+            result["verdict"] = f"{params.srcip_b} is significantly more active"
+        else:
+            result["verdict"] = "Both IPs show comparable activity levels"
+        return _truncate_if_needed(json.dumps(result, indent=2, ensure_ascii=False))
+
+    # Markdown side-by-side
+    a_total = profile_a.get("total_alerts", 0)
+    b_total = profile_b.get("total_alerts", 0)
+    a_rules = ", ".join(f"`{r['id']}`({r['count']})"
+                         for r in profile_a.get("top_rules", [])[:3]) or "-"
+    b_rules = ", ".join(f"`{r['id']}`({r['count']})"
+                         for r in profile_b.get("top_rules", [])[:3]) or "-"
+    a_sev = profile_a.get("severity", {})
+    b_sev = profile_b.get("severity", {})
+    a_high = a_sev.get("high", 0)
+    b_high = b_sev.get("high", 0)
+    a_agents = len(profile_a.get("agents", []))
+    b_agents = len(profile_b.get("agents", []))
+
+    # Verdict
+    if a_total > b_total * 2 and a_high > b_high:
+        verdict = f"🔴 **{params.srcip_a}** is significantly more threatening"
+    elif b_total > a_total * 2 and b_high > a_high:
+        verdict = f"🔴 **{params.srcip_b}** is significantly more threatening"
+    elif a_total > b_total:
+        verdict = f"🟡 **{params.srcip_a}** has more activity — investigate first"
+    elif b_total > a_total:
+        verdict = f"🟡 **{params.srcip_b}** has more activity — investigate first"
+    else:
+        verdict = "🟢 Both IPs show comparable activity"
+
+    lines = [
+        f"# Alert Comparison",
+        "",
+        f"**Window**: `{since_iso}` → `{until_iso}`",
+        "",
+        f"| Metric | `{params.srcip_a}` | `{params.srcip_b}` |",
+        f"|--------|{'-' * (len(params.srcip_a) + 4)}|{'-' * (len(params.srcip_b) + 4)}|",
+        f"| Total alerts | **{a_total}** | **{b_total}** |",
+        f"| High severity (L10+) | {a_high} | {b_high} |",
+        f"| Medium severity (L5-9) | {a_sev.get('medium', 0)} | {b_sev.get('medium', 0)} |",
+        f"| Low severity (L1-4) | {a_sev.get('low', 0)} | {b_sev.get('low', 0)} |",
+        f"| Agents targeted | {a_agents} | {b_agents} |",
+        f"| Top rules | {a_rules} | {b_rules} |",
+        "",
+        f"### Verdict",
+        f"{verdict}",
+    ]
+
+    return _truncate_if_needed("\n".join(lines))
+
+
+# Sprint 6: Geo-Aware Curated Threat Intelligence Pipeline (AUL Adjust)
+# Composable filter specification - any combination of dimensions can be AND'd.
+# Cross-source deduplication patterns (parent-child alert relationships).
+# Each entry: (child_rule_id_regex, parent_rule_field_path_in_nested_alert)
+# When deduplicate=True, child alerts matching these patterns are subtracted
+# from aggregate counts to prevent double-counting.
+_DEDUP_PATTERNS: list[tuple[str, str]] = [
+    ("606029", "data.parameters.alert.rule.id"),  # Active Response wraps its trigger
+    ("651",   "data.parameters.alert.rule.id"),   # Ossec agent-spawned alerts
+]
+
+# Maps directly to OpenSearch bool.must/filter clauses inside _build_curated_query().
+class CuratedReportFilters(BaseModel):
+    """Filter specification for blueteam_curated_threat_report. Every field is
+    optional — only specified filters are applied. All filters are AND'd together.
+    """
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    # Geo dimension
+    geo_country: Optional[str] = Field(
+        default=None, max_length=60,
+        description="Exact match on GeoLocation.country_name, e.g. 'Indonesia'.")
+    geo_country_pattern: Optional[str] = Field(
+        default=None, max_length=60,
+        description="Wildcard match, e.g. 'Indo*'.")
+
+    # Domain dimension
+    domain: Optional[str] = Field(
+        default=None, max_length=253,
+        description="Exact match on data.domain, e.g. 'bangjaka.tangerangkota.go.id'.")
+    domain_pattern: Optional[str] = Field(
+        default=None, max_length=253,
+        description="Wildcard on data.domain, e.g. '*.tangerangkota.go.id'.")
+    domain_contains: Optional[str] = Field(
+        default=None, max_length=253,
+        description="Substring match on data.domain, e.g. 'tangerangkota'.")
+
+    # Rule dimension
+    rule_ids: Optional[list[str]] = Field(default=None, max_length=30,
+        description="Specific rule IDs, e.g. ['600029','606029'].")
+    rule_level_min: Optional[int] = Field(default=None, ge=1, le=16,
+        description="Minimum rule.level (severity floor).")
+    rule_level_max: Optional[int] = Field(default=None, ge=1, le=16,
+        description="Maximum rule.level (severity ceiling).")
+    rule_groups: Optional[list[str]] = Field(default=None,
+        description="Wazuh rule.groups tokens, e.g. ['recon','firewall_drop'].")
+    mitre_tactics: Optional[list[str]] = Field(default=None,
+        description="MITRE ATT&CK tactics, e.g. ['Discovery','Collection'].")
+    mitre_techniques: Optional[list[str]] = Field(default=None,
+        description="MITRE technique IDs, e.g. ['T1083','T1552'].")
+
+    # Agent dimension
+    agent_name: Optional[str] = Field(default=None, max_length=64,
+        description="Target agent name, e.g. 'thezoo-prod'.")
+    agent_ip: Optional[str] = Field(default=None, max_length=45,
+        description="Target agent internal IP, e.g. '172.16.10.135'.")
+    agent_id: Optional[str] = Field(default=None, max_length=32,
+        description="Target agent ID, e.g. '227'.")
+    decoder: Optional[str] = Field(default=None, max_length=64,
+        description="Decoder name, e.g. 'web-accesslog', 'ar_log_json', 'sysmon'.")
+
+    # HTTP dimension
+    url_pattern: Optional[str] = Field(default=None, max_length=1024,
+        description="Wildcard on data.url, e.g. '/.vscode/*'.")
+    response_codes: Optional[list[str]] = Field(default=None,
+        description="HTTP response codes, e.g. ['403','404'].")
+    http_methods: Optional[list[str]] = Field(default=None,
+        description="HTTP methods, e.g. ['POST','PUT'].")
+    user_agent_contains: Optional[str] = Field(default=None, max_length=512,
+        description="Substring in data.user_agent, e.g. 'Firefox'.")
+    referrer_pattern: Optional[str] = Field(default=None, max_length=1024,
+        description="Wildcard on data.referrer, e.g. '*tangerangkota*'.")
+    response_size_min: Optional[int] = Field(default=None, ge=0,
+        description="Minimum data.response_size in bytes (exfil indicator).")
+    response_size_max: Optional[int] = Field(default=None, ge=0,
+        description="Maximum data.response_size in bytes.")
+
+    # Rule description dimension
+    rule_desc_contains: Optional[str] = Field(default=None, max_length=512,
+        description="Substring in rule.description, e.g. 'sensitive files'.")
+    rule_firedtimes_min: Optional[int] = Field(default=None, ge=1,
+        description="Minimum rule.firedtimes (persistence signal — rule triggered at least N times).")
+    log_source_pattern: Optional[str] = Field(default=None, max_length=512,
+        description="Wildcard on location field, e.g. '/containers/*/logs/*' to filter by log source path.")
+
+    # Geo bounding box
+    geo_bbox: Optional[str] = Field(default=None, max_length=80,
+        description="Geo bounding box: 'lat1,lon1,lat2,lon2' (bottom-left, top-right). "
+                    "Filters GeoLocation.location within box, e.g. '-7.0,106.5,-5.5,107.0' "
+                    "for Jabodetabek area. Only alerts with GeoIP data are matched.")
+
+    # IP dimension
+    srcips: Optional[list[str]] = Field(default=None, max_length=25,
+        description="Specific IPs to INCLUDE (max 25).")
+    exclude_srcips: Optional[list[str]] = Field(default=None, max_length=25,
+        description="IPs to EXCLUDE, e.g. known scanners.")
+
+    # Threat intel pre-filter
+    min_crowdsec_reputation: Optional[str] = Field(default=None,
+        description="Pre-filter: only IPs with this CrowdSec reputation "
+                    "('malicious','suspicious','safe','unknown'). "
+                    "Requires CROWDSEC_API_KEY and adds per-IP API calls.")
+
+
+def _build_curated_query(
+    since_iso: str, until_iso: str, f: CuratedReportFilters,
+) -> list[dict]:
+    """Translate CuratedReportFilters into OpenSearch bool.must clauses.
+
+    Each non-None filter field becomes an AND clause. Returns a list of
+    OpenSearch query/filter dicts ready for a bool.must array.
+    """
+    clauses: list[dict] = [
+        {"range": {"@timestamp": {"gte": since_iso, "lt": until_iso,
+                                   "format": "strict_date_optional_time"}}},
+    ]
+    # Geo
+    if f.geo_country:
+        clauses.append({"term": {"GeoLocation.country_name": f.geo_country.strip()}})
+    if f.geo_country_pattern:
+        clauses.append({"wildcard": {"GeoLocation.country_name": f.geo_country_pattern.strip()}})
+
+    # Domain
+    if f.domain:
+        clauses.append({"match": {"data.domain": f.domain.strip()}})
+    if f.domain_pattern:
+        clauses.append({"wildcard": {"data.domain.keyword": f.domain_pattern.strip()}})
+    if f.domain_contains:
+        clauses.append({"wildcard": {"data.domain.keyword": f"*{f.domain_contains.strip()}*"}})
+
+    # Rule
+    if f.rule_ids:
+        clauses.append({"terms": {"rule.id.keyword": [r.strip() for r in f.rule_ids]}})
+    if f.rule_level_min is not None:
+        clauses.append({"bool": {"should": [
+            {"range": {"rule.level": {"gte": f.rule_level_min}}},
+        ], "minimum_should_match": 1}})
+    if f.rule_level_max is not None:
+        clauses.append({"bool": {"should": [
+            {"range": {"rule.level": {"lte": f.rule_level_max}}},
+        ], "minimum_should_match": 1}})
+    if f.rule_groups:
+        clauses.append({"bool": {"should": [
+            {"terms": {"rule.groups": f.rule_groups}},
+            {"terms": {"rule.groups.keyword": f.rule_groups}},
+        ], "minimum_should_match": 1}})
+    if f.mitre_tactics:
+        clauses.append({"terms": {"rule.mitre.tactic": f.mitre_tactics}})
+    if f.mitre_techniques:
+        clauses.append({"terms": {"rule.mitre.id": f.mitre_techniques}})
+
+    # Agent
+    if f.agent_name:
+        clauses.append({"match": {"agent.name": f.agent_name.strip()}})
+    if f.agent_ip:
+        clauses.append({"match": {"agent.ip": f.agent_ip.strip()}})
+    if f.agent_id:
+        clauses.append({"match": {"agent.id": f.agent_id.strip()}})
+    if f.decoder:
+        clauses.append({"term": {"decoder.name": f.decoder.strip()}})
+
+    # HTTP
+    if f.url_pattern:
+        clauses.append({"wildcard": {"data.url.keyword": f.url_pattern.strip()}})
+    if f.response_codes:
+        clauses.append({"terms": {"data.response_code": f.response_codes}})
+    if f.http_methods:
+        clauses.append({"terms": {"data.method": f.http_methods}})
+    if f.user_agent_contains:
+        clauses.append({"wildcard": {"data.user_agent.keyword":
+                                     f"*{f.user_agent_contains.strip()}*"}})
+    if f.referrer_pattern:
+        clauses.append({"wildcard": {"data.referrer.keyword": f.referrer_pattern.strip()}})
+    if f.response_size_min is not None:
+        clauses.append({"range": {"data.response_size": {"gte": f.response_size_min}}})
+    if f.response_size_max is not None:
+        clauses.append({"range": {"data.response_size": {"lte": f.response_size_max}}})
+
+    # Rule description free-text
+    if f.rule_desc_contains:
+        clauses.append({"wildcard": {"rule.description.keyword":
+                                     f"*{f.rule_desc_contains.strip()}*"}})
+    if f.rule_firedtimes_min is not None:
+        clauses.append({"range": {"rule.firedtimes": {"gte": f.rule_firedtimes_min}}})
+    if f.log_source_pattern:
+        clauses.append({"wildcard": {"location.keyword": f.log_source_pattern.strip()}})
+
+    # Geo bounding box
+    if f.geo_bbox:
+        parts = [p.strip() for p in f.geo_bbox.split(",")]
+        if len(parts) == 4:
+            try:
+                lat1, lon1, lat2, lon2 = float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3])
+                clauses.append({"bool": {"must": [
+                    {"range": {"GeoLocation.location.lat": {"gte": min(lat1, lat2), "lte": max(lat1, lat2)}}},
+                    {"range": {"GeoLocation.location.lon": {"gte": min(lon1, lon2), "lte": max(lon1, lon2)}}},
+                ]}})
+            except ValueError:
+                pass  # invalid bbox -> skip filter silently
+
+    # IP inclusion/exclusion
+    if f.srcips:
+        ip_clauses = []
+        for ip in f.srcips:
+            ip = ip.strip()
+            if ip:
+                ip_clauses.append({"bool": {"should": [
+                    {"match": {"data.srcip": ip}},
+                    {"match_phrase": {"full_log": ip}},
+                ], "minimum_should_match": 1}})
+        clauses.extend(ip_clauses)
+    if f.exclude_srcips:
+        for ip in f.exclude_srcips:
+            ip = ip.strip()
+            if ip:
+                clauses.append({"bool": {"must_not": {"match": {"data.srcip": ip}}}})
+
+    return clauses
+
+
+# G-2: Geo Distribution
+class GeoDistributionInput(BaseModel):
+    """Input model for blueteam_wazuh_geo_distribution."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    since: Optional[str] = Field(default="24h", max_length=30,
+        description="Start of time window.")
+    until: Optional[str] = Field(default=None, max_length=30,
+        description="End of time window. Defaults to now.")
+    top_n: int = Field(default=15, ge=3, le=50,
+        description="Number of top countries to return.")
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown", description="'markdown' or 'json'.")
+
+
+@mcp.tool(
+    name="blueteam_wazuh_geo_distribution",
+    annotations={"readOnlyHint": True, "destructiveHint": False,
+                 "idempotentHint": True, "openWorldHint": False},
+)
+async def blueteam_wazuh_geo_distribution(params: GeoDistributionInput) -> str:
+    """Show top attacking countries by alert volume using Wazuh GeoIP data.
+
+    Pure aggregation - zero documents fetched (size: 0). Returns a country
+    ranking with alert counts and unique IP counts. Uses Wazuh Indexer's
+    built-in GeoLocation.country_name field.
+
+    **Required Permissions**: Wazuh Indexer read access.
+
+    **Worked Examples**
+
+    1. *Last 24h*:
+       ``blueteam_wazuh_geo_distribution()``
+
+    2. *Last 7 days, top 25*:
+       ``blueteam_wazuh_geo_distribution(since="7d", top_n=25)``
+
+    3. *Specific date range*:
+       ``blueteam_wazuh_geo_distribution(since="2026-07-17T00:00:00Z", until="2026-07-18T00:00:00Z")``
+    """
+    _audit_log("blueteam_wazuh_geo_distribution", {})
+    if not WAZUH_INDEXER_URL or not WAZUH_INDEXER_PASSWORD:
+        return json.dumps({"error": "WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD must be set."}, indent=2)
+
+    since_iso, until_iso = _parse_time_window(params.since, params.until)
+
+    body = {
+        "size": 0,
+        "query": {"bool": {"filter": [
+            {"range": {"@timestamp": {"gte": since_iso, "lt": until_iso,
+                                       "format": "strict_date_optional_time"}}},
+            {"exists": {"field": "GeoLocation.country_name"}},
+        ]}},
+        "aggs": {
+            "by_country": {
+                "terms": {"field": "GeoLocation.country_name", "size": params.top_n,
+                          "order": {"_count": "desc"}},
+                "aggs": {
+                    "unique_ips": {
+                        "cardinality": {"field": "data.srcip.keyword",
+                                        "precision_threshold": 40000},
+                    },
+                    "top_rules": {
+                        "terms": {"field": "rule.id.keyword", "size": 3},
+                    },
+                },
+            },
+            "total_with_geo": {"value_count": {"field": "GeoLocation.country_name"}},
+        },
+    }
+    raw = await _wazuh_indexer_post(body)
+    if "error" in raw:
+        return json.dumps(raw, indent=2)
+
+    aggs = raw.get("aggregations", {})
+    total_with_geo = aggs.get("total_with_geo", {}).get("value", 0)
+    buckets = aggs.get("by_country", {}).get("buckets", [])
+
+    if params.response_format == "json":
+        return _truncate_if_needed(json.dumps({
+            "window": {"since": since_iso, "until": until_iso},
+            "total_alerts_with_geo": total_with_geo,
+            "countries": [
+                {"country": b["key"], "alerts": b["doc_count"],
+                 "unique_ips": b.get("unique_ips", {}).get("value", 0),
+                 "top_rules": [r["key"] for r in b.get("top_rules", {}).get("buckets", [])]}
+                for b in buckets
+            ],
+        }, indent=2))
+
+    lines = [
+        f"# 🌍 Attack Geography — `{since_iso}` → `{until_iso}`",
+        "",
+        f"**Alerts with GeoIP data**: {total_with_geo:,}",
+        "",
+        "| Country | Alerts | Unique IPs | Top Rules |",
+        "|---------|--------|------------|-----------|",
+    ]
+    for b in buckets:
+        ips = b.get("unique_ips", {}).get("value", 0)
+        rules = ", ".join(f"`{r['key']}`" for r in b.get("top_rules", {}).get("buckets", [])[:2]) or "-"
+        lines.append(f"| {b['key']} | {b['doc_count']:,} | {ips:,} | {rules} |")
+
+    if not buckets:
+        lines.append("| *(no data)* | - | - | - |")
+        lines.append("")
+        lines.append("> ⚠️ GeoIP enrichment may not be enabled on this Wazuh Indexer. "
+                     "Check that the GeoIP processor is configured.")
+
+    return _truncate_if_needed("\n".join(lines))
+
+
+# G-3: Curated Threat Report
+class CuratedThreatReportInput(BaseModel):
+    """Input model for blueteam_curated_threat_report."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    since: Optional[str] = Field(default="24h", max_length=30,
+        description="Start of time window.")
+    until: Optional[str] = Field(default=None, max_length=30,
+        description="End of time window. Defaults to now.")
+    filters: CuratedReportFilters = Field(
+        default_factory=CuratedReportFilters,
+        description="Filter specification. Only specified fields are applied. "
+                    "All filters are AND'd. E.g.: "
+                    '{"geo_country": "Indonesia", "domain_pattern": "*.go.id", "rule_level_min": 6}.')
+    include_threat_intel: bool = Field(
+        default=True,
+        description="Enrich top IPs with Argus + CrowdSec + GreyNoise (adds ~3s latency).")
+    max_entities: int = Field(
+        default=50, ge=10, le=100,
+        description="Max unique IPs to enrich with detailed threat intel.")
+    group_by: Literal["srcip", "domain", "rule.id", "agent"] = Field(
+        default="srcip",
+        description="Aggregation axis: 'srcip' (per attacker), 'domain' (per target domain), "
+                    "'rule.id' (per rule), 'agent' (per target agent).")
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown", description="'markdown' or 'json'.")
+    bypass_redaction: bool = Field(default=False,
+        description=_BYPASS_REDACTION_DESC)
+    compare_since: Optional[str] = Field(
+        default=None, max_length=30,
+        description="Comparison window start. When set, runs a second query for the "
+                    "previous period of equal length and produces a delta report. "
+                    "E.g., since='48h' + compare_since='168h' compares current 48h "
+                    "against the 48h before that. Aliases: 'compare', 'baseline'.")
+    investigation_depth: Literal["summary", "enriched", "deep"] = Field(
+        default="enriched",
+        description="'summary' = aggregation only (fast), "
+                    "'enriched' = aggregation + threat intel (default), "
+                    "'deep' = enriched + auto-generated per-IP threat cards and "
+                    "attack chains for IPs with max_level≥10 or crowdsec=malicious.")
+    deduplicate: bool = Field(
+        default=False,
+        description="Remove child alerts (e.g., Active Response wrappers triggered "
+                    "by parent alerts) from counts. Reduces noise from 1:N alert "
+                    "relationships. Recognizes rule 606029 as child of its parent "
+                    "rule via data.parameters.alert.rule.id.")
+    time_decay: Literal["none", "linear", "exponential"] = Field(
+        default="none",
+        description="Weight recent alerts higher: 'none' (all equal), "
+                    "'linear' (weight = 1 - age/window), "
+                    "'exponential' (weight = e^(-age/half_life)). "
+                    "Applied via OpenSearch function_score gauss decay on @timestamp.")
+    scoring_mode: Literal["volume", "diversity"] = Field(
+        default="volume",
+        description="Entity ranking: 'volume' = by alert count (default), "
+                    "'diversity' = by rule group entropy (surfaces multi-phase "
+                    "attackers with few alerts across many tactics).")
+
+
+@mcp.tool(
+    name="blueteam_curated_threat_report",
+    annotations={"readOnlyHint": True, "destructiveHint": False,
+                 "idempotentHint": True, "openWorldHint": True},
+)
+async def blueteam_curated_threat_report(params: CuratedThreatReportInput) -> str:
+    """Generate a geo/domain/rule-filtered threat intelligence report in one call.
+
+    Combines alert aggregation, IP extraction, and multi-source threat intel
+    enrichment into a single structured report. Replace 8–12 sequential LLM
+    tool calls with one.
+
+    **Filter dimensions** (any combination, all AND'd):
+      • geo_country / geo_country_pattern — GeoLocation.country_name
+      • geo_bbox - bounding box "lat1,lon1,lat2,lon2" for area filtering
+      • domain / domain_pattern / domain_contains — data.domain
+      • rule_ids / rule_level_min / rule_level_max / rule_groups / rule_desc_contains — rule filtering
+      • mitre_tactics / mitre_techniques — ATT&CK filtering
+      • agent_name / agent_ip / agent_id — target agent
+      • decoder - log decoder name (web-accesslog, sysmon, etc.)
+      • url_pattern / referrer_pattern / response_codes / response_size_min / response_size_max / http_methods / user_agent_contains - HTTP layer
+      • rule_firedtimes_min - persistence signal
+      • log_source_pattern - wildcard on location field
+      • srcips (include) / exclude_srcips — IP-level
+      • min_crowdsec_reputation — pre-filter by threat intel
+
+    **Threat Intel** (best-effort, concurrent):
+      Argus (7 upstream sources) + CrowdSec CTI (behaviors, MITRE, CVE) +
+      AbuseIPDB (abuse score, reports) + VirusTotal (engine verdicts) +
+      GreyNoise Community (scanner/business classification).
+
+    **Required Permissions**: Wazuh Indexer read access. CROWDSEC_API_KEY for
+    CrowdSec enrichment. ARGUS_API_KEY for Argus enrichment.
+
+    **Worked Example**
+
+    1. *Indonesian attackers targeting .go.id domains*:
+       ``blueteam_curated_threat_report(filters={"geo_country": "Indonesia", "domain_pattern": "*.go.id"})``
+
+    2. *Critical-severity recon against thezoo-prod*:
+       ``blueteam_curated_threat_report(filters={"rule_level_min": 10, "agent_name": "thezoo-prod", "rule_groups": ["recon"]})``
+
+    3. *Visual Studio Code probing from Indonesia*:
+       ``blueteam_curated_threat_report(filters={"geo_country": "Indonesia", "url_pattern": "/.vscode/*"})``
+
+    4. *T1083 technique, 7-day window*:
+       ``blueteam_curated_threat_report(since="7d", filters={"mitre_techniques": ["T1083"]})``
+
+    5. *Exclude known scanner*:
+       ``blueteam_curated_threat_report(filters={"exclude_srcips": ["203.0.113.42"]})``
+    """
+    _audit_log("blueteam_curated_threat_report", {"filters": str(params.filters)[:200]})
+    if not WAZUH_INDEXER_URL or not WAZUH_INDEXER_PASSWORD:
+        return json.dumps({"error": "WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD must be set."}, indent=2)
+
+    since_iso, until_iso = _parse_time_window(params.since, params.until)
+    f = params.filters
+
+    # Phase 1: Aggregation query (size: 0, no documents fetched)
+    clauses = _build_curated_query(since_iso, until_iso, f)
+
+    # Time-decay weighting via function_score gauss decay on @timestamp
+    query_wrapper: dict = {"bool": {"must": clauses}}
+    if params.time_decay != "none":
+        half_life = max(60, _duration_minutes(since_iso, until_iso) * 15)  # seconds
+        decay_config = {"@timestamp": {"origin": until_iso, "scale": f"{half_life:.0f}s",
+                                        "decay": 0.5}}
+        query_wrapper = {
+            "function_score": {
+                "query": {"bool": {"must": clauses}},
+                "functions": [{"gauss": decay_config}],
+                "boost_mode": "replace",
+            }
+        }
+
+    # Select primary aggregation axis based on group_by
+    group_config: dict[str, tuple[str, str]] = {
+        "srcip": ("data.srcip.keyword", "top_entities"),
+        "domain": ("data.domain.keyword", "top_entities"),
+        "rule.id": ("rule.id.keyword", "top_entities"),
+        "agent": ("agent.name.keyword", "top_entities"),
+    }
+    agg_field, agg_name = group_config.get(params.group_by, group_config["srcip"])
+
+    body = {
+        "size": 0,
+        "query": query_wrapper,
+        "aggs": {
+            agg_name: {
+                "terms": {"field": agg_field, "size": params.max_entities,
+                          "order": {"_count": "desc"}},
+                "aggs": {
+                    "first_seen": {"min": {"field": "@timestamp"}},
+                    "last_seen": {"max": {"field": "@timestamp"}},
+                    "max_level": {"max": {"field": "rule.level"}},
+                    "top_rules": {"terms": {"field": "rule.id.keyword", "size": 5}},
+                    "top_urls": {"terms": {"field": "data.url.keyword", "size": 5}},
+                    "sample_geo": {"top_hits": {"size": 1, "_source": {"includes": ["GeoLocation"]}}},
+                },
+            },
+            "total_alerts": {"value_count": {"field": "_id"}},
+            "total_with_geo": {"value_count": {"field": "GeoLocation.country_name"}},
+            "top_rules": {"terms": {"field": "rule.id.keyword", "size": 10}},
+            "top_agents": {"terms": {"field": "agent.name.keyword", "size": 10}},
+            "top_domains": {"terms": {"field": "data.domain.keyword", "size": 10}},
+            "severity_bands": {
+                "range": {"field": "rule.level",
+                          "ranges": [{"key": "low", "to": 5},
+                                     {"key": "medium", "from": 5, "to": 10},
+                                     {"key": "high", "from": 10}]},
+            },
+        },
+    }
+    raw = await _wazuh_indexer_post(body)
+    if "error" in raw:
+        return json.dumps(raw, indent=2)
+
+    aggs = raw.get("aggregations", {})
+    total_alerts = aggs.get("total_alerts", {}).get("value", 0)
+    total_with_geo = aggs.get("total_with_geo", {}).get("value", 0)
+    geo_coverage_pct = round(total_with_geo / total_alerts * 100, 1) if total_alerts > 0 else 0.0
+    entity_buckets = aggs.get(agg_name, {}).get("buckets", [])
+    rule_buckets = aggs.get("top_rules", {}).get("buckets", [])
+    rule_buckets = aggs.get("top_rules", {}).get("buckets", [])
+    agent_buckets = aggs.get("top_agents", {}).get("buckets", [])
+    domain_buckets = aggs.get("top_domains", {}).get("buckets", [])
+    severity = {b["key"]: b["doc_count"] for b in aggs.get("severity_bands", {}).get("buckets", [])}
+
+    # Deduplication: remove child alert wrapper counts
+    dedup_note = ""
+    if params.deduplicate:
+        dedup_body = {
+            "size": 0,
+            "query": {"bool": {"must": clauses + [
+                {"terms": {"rule.id": ["606029", "651"]}},
+            ]}},
+            "aggs": {"total_children": {"value_count": {"field": "_id"}}},
+        }
+        try:
+            dedup_raw = await _wazuh_indexer_post(dedup_body)
+            child_count = (dedup_raw.get("aggregations", {})
+                          .get("total_children", {}).get("value", 0))
+            total_alerts = max(0, total_alerts - child_count)
+            dedup_note = f" ({child_count} Active Response wrappers deduplicated)"
+        except Exception:
+            dedup_note = ""
+
+    # Compare mode: run second query for previous period
+    compare_data: dict[str, Any] = {}
+    if params.compare_since:
+        try:
+            curr_duration = _duration_minutes(since_iso, until_iso)
+            window_mins = max(60, curr_duration)
+            comp_since_dt = datetime.fromisoformat(since_iso.replace("Z", "+00:00").rstrip("Z"))
+            comp_since_iso = (comp_since_dt - timedelta(minutes=window_mins)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            comp_until_iso = since_iso
+
+            comp_clauses = _build_curated_query(comp_since_iso, comp_until_iso, f)
+            comp_body = {
+                "size": 0,
+                "query": {"bool": {"must": comp_clauses}},
+                "aggs": {
+                    agg_name: {"terms": {"field": agg_field, "size": params.max_entities}},
+                    "total_alerts": {"value_count": {"field": "_id"}},
+                    "severity_bands": {"range": {"field": "rule.level",
+                        "ranges": [{"key": "low", "to": 5},
+                                   {"key": "medium", "from": 5, "to": 10},
+                                   {"key": "high", "from": 10}]}},
+                },
+            }
+            comp_raw = await _wazuh_indexer_post(comp_body)
+            if "error" not in comp_raw:
+                c_aggs = comp_raw.get("aggregations", {})
+                compare_data = {
+                    "total_alerts": c_aggs.get("total_alerts", {}).get("value", 0),
+                    "entities": len(c_aggs.get(agg_name, {}).get("buckets", [])),
+                    "severity": {b["key"]: b["doc_count"]
+                        for b in c_aggs.get("severity_bands", {}).get("buckets", [])},
+                    "window": {"since": comp_since_iso, "until": comp_until_iso},
+                }
+        except Exception:
+            compare_data = {"error": "comparison_query_failed"}
+
+    # min_crowdsec_reputation pre-filter (Phase 0.5)
+    crowdsec_filter_note = ""
+    if params.filters.min_crowdsec_reputation and entity_buckets and params.group_by == "srcip" and os.environ.get(CROWDSEC_API_KEY_ENV):
+        threshold_rep = params.filters.min_crowdsec_reputation.strip()
+        all_ips = [b["key"] for b in entity_buckets]
+        cs_verdicts: dict[str, str] = {}
+        for ip in all_ips[:50]:
+            try:
+                cs = await _crowdsec_request(f"/v2/smoke/{ip}")
+                cs_verdicts[ip] = cs.get("reputation", "unknown")
+            except Exception:
+                cs_verdicts[ip] = "lookup_failed"
+        before = len(entity_buckets)
+        entity_buckets = [b for b in entity_buckets if cs_verdicts.get(b["key"]) == threshold_rep]
+        removed = before - len(entity_buckets)
+        crowdsec_filter_note = f" (CrowdSec pre-filter '{threshold_rep}': {removed} IPs removed, {len(entity_buckets)} retained)"
+
+    # Diversity re-ranking (when scoring_mode="diversity")
+    if params.scoring_mode == "diversity" and entity_buckets:
+        # Score each entity by rule group diversity (Shannon entropy * alert_count)
+        for b in entity_buckets:
+            rule_buckets_inner = b.get("top_rules", {}).get("buckets", [])
+            distinct_rules = len(rule_buckets_inner)
+            alert_count = b["doc_count"]
+            # Diversity score: distinct rules * log(1 + alert_count)
+            # rewards multi-phase attackers with moderate volume over noisy single-rule scanners
+            import math
+            b["_diversity_score"] = distinct_rules * math.log(1 + alert_count)
+        entity_buckets.sort(key=lambda b: b.get("_diversity_score", 0), reverse=True)
+
+    # Phase 2: Concurrent threat intel enrichment
+    threat_data: dict[str, dict] = {}
+    if params.include_threat_intel and entity_buckets and params.group_by == "srcip":
+        top_ips = [b["key"] for b in entity_buckets[:min(params.max_entities, 15)]]
+
+        async def _enrich_ip(ip: str) -> tuple[str, dict]:
+            result: dict = {}
+            # CrowdSec (cached)
+            if os.environ.get(CROWDSEC_API_KEY_ENV):
+                try:
+                    cs = await _crowdsec_request(f"/v2/smoke/{ip}")
+                    result["crowdsec"] = {
+                        "reputation": cs.get("reputation", "unknown"),
+                        "behaviors": [b.get("name", "") for b in cs.get("behaviors", [])],
+                        "cves": cs.get("cves", []),
+                    }
+                except Exception:
+                    result["crowdsec"] = {"error": "lookup_failed"}
+            # Argus
+            if os.environ.get(ARGUS_API_KEY_ENV):
+                try:
+                    argus_data = await _argus_request("/api/v1/lookup", {"ip_address": ip})
+                    result["argus"] = {
+                        "overall_score": argus_data.get("overall_score"),
+                        "sources": list(argus_data.get("sources", {}).keys()) if isinstance(argus_data.get("sources"), dict) else [],
+                    }
+                except Exception:
+                    result["argus"] = {"error": "lookup_failed"}
+            # AbuseIPDB
+            if ABUSEIPDB_API_KEY:
+                try:
+                    client = await _get_client("http")
+                    resp = await client.get(
+                        "https://api.abuseipdb.com/api/v2/check",
+                        headers={"Key": ABUSEIPDB_API_KEY, "Accept": "application/json"},
+                        params={"ipAddress": ip, "maxAgeInDays": "90"},
+                    )
+                    resp.raise_for_status()
+                    data = resp.json().get("data", {})
+                    result["abuseipdb"] = {
+                        "abuse_score": data.get("abuseConfidenceScore"),
+                        "total_reports": data.get("totalReports"),
+                        "country": data.get("countryCode"),
+                    }
+                except Exception:
+                    result["abuseipdb"] = {"error": "lookup_failed"}
+            # VirusTotal
+            if VIRUSTOTAL_API_KEY:
+                try:
+                    client = await _get_client("http")
+                    resp = await client.get(
+                        f"https://www.virustotal.com/api/v3/ip_addresses/{ip}",
+                        headers={"x-apikey": VIRUSTOTAL_API_KEY, "Accept": "application/json"},
+                    )
+                    resp.raise_for_status()
+                    vt_data = resp.json().get("data", {}).get("attributes", {})
+                    stats = vt_data.get("last_analysis_stats", {})
+                    result["virustotal"] = {
+                        "malicious": stats.get("malicious", 0),
+                        "suspicious": stats.get("suspicious", 0),
+                        "harmless": stats.get("harmless", 0),
+                        "total_engines": sum(stats.values()) if stats else 0,
+                    }
+                except Exception:
+                    result["virustotal"] = {"error": "lookup_failed"}
+            return (ip, result)
+
+        enrich_results = await asyncio.gather(*[_enrich_ip(ip) for ip in top_ips])
+        threat_data = dict(enrich_results)
+
+    # Phase 3: Format report
+    if params.response_format == "json":
+        result = {
+            "window": {"since": since_iso, "until": until_iso},
+            "filters_applied": f.model_dump(exclude_none=True),
+            "total_alerts": total_alerts,
+            "severity": severity,
+            "top_rules": [{"id": b["key"], "count": b["doc_count"]} for b in rule_buckets],
+            "top_agents": [{"name": b["key"], "count": b["doc_count"]} for b in agent_buckets],
+            "top_domains": [{"domain": b["key"], "count": b["doc_count"]} for b in domain_buckets],
+            "dedup_note": dedup_note if dedup_note else None,
+            "compare": compare_data if compare_data else None,
+            "attackers": [
+                {
+                    "ip": b["key"],
+                    "alerts": b["doc_count"],
+                    "max_level": int(b.get("max_level", {}).get("value", 0)),
+                    "first_seen": b.get("first_seen", {}).get("value_as_string", ""),
+                    "last_seen": b.get("last_seen", {}).get("value_as_string", ""),
+                    "top_rules": [r["key"] for r in b.get("top_rules", {}).get("buckets", [])],
+                    "top_urls": list(set(u["key"] for u in b.get("top_urls", {}).get("buckets", [])))[:5],
+                    "threat_intel": threat_data.get(b["key"], {}),
+                }
+                for b in entity_buckets[:params.max_entities]
+            ],
+        }
+        return _truncate_if_needed(json.dumps(result, indent=2, ensure_ascii=False))
+
+    # Markdown report
+    filter_desc_parts: list[str] = []
+    for field_name in ["geo_country", "domain_pattern", "domain_contains", "rule_ids",
+                        "rule_level_min", "rule_level_max", "rule_groups",
+                        "rule_desc_contains", "mitre_tactics", "mitre_techniques",
+                        "agent_name", "agent_ip", "agent_id", "decoder",
+                        "url_pattern", "referrer_pattern",
+                        "response_size_min", "response_size_max",
+                        "rule_firedtimes_min", "log_source_pattern",
+                        "response_codes", "http_methods", "user_agent_contains",
+                        "geo_bbox", "exclude_srcips"]:
+        val = getattr(f, field_name, None)
+        if val:
+            filter_desc_parts.append(f"`{field_name}={val}`")
+    filter_desc = ", ".join(filter_desc_parts) if filter_desc_parts else "(none — all alerts)"
+
+    lines = [
+        f"# 🛡️ Curated Threat Report",
+        "",
+        f"**Window**: `{since_iso}` → `{until_iso}`",
+        f"**Filters**: {filter_desc}",
+        "",
+        "---",
+        "",
+        "## 📊 Executive Summary",
+        "",
+        f"| Metric | Value |",
+        f"|--------|-------|",
+        f"| Total alerts matching filters | **{total_alerts:,}** |",
+        f"| Unique entities | **{len(entity_buckets)}** |",
+        f"| High-severity (L10+) | {severity.get('high', 0):,} |",
+        f"| Medium-severity (L5-9) | {severity.get('medium', 0):,} |",
+        f"| Low-severity (L1-4) | {severity.get('low', 0):,} |",
+        f"| Unique rules triggered | {len(rule_buckets)} |",
+        f"| Agents targeted | {len(agent_buckets)} |",
+        f"| GeoIP coverage | {total_with_geo:,} of {total_alerts:,} ({geo_coverage_pct}%) |",
+        f"| Dedup note | {dedup_note or 'none'} |",
+        f"| CrowdSec filter | {crowdsec_filter_note or 'none'} |",
+        "",
+    ]
+    # Comparison delta table
+    if compare_data and "error" not in compare_data:
+        prev_total = compare_data.get("total_alerts", 0)
+        delta = total_alerts - prev_total
+        delta_pct = (delta / prev_total * 100) if prev_total > 0 else float("inf")
+        arrow = "↑" if delta > 0 else "↓" if delta < 0 else "—"
+        lines.append("")
+        lines.append("## 📈 Comparison vs Previous Period")
+        lines.append("")
+        lines.append("| Metric | Current | Previous | Δ |")
+        lines.append("|--------|---------|----------|---|")
+        lines.append(f"| Total alerts | {total_alerts:,} | {prev_total:,} | {delta:+,} ({delta_pct:+.0f}%) {arrow} |")
+        prev_entities = compare_data.get("entities", 0)
+        e_delta = len(entity_buckets) - prev_entities
+        lines.append(f"| Unique entities | {len(entity_buckets)} | {prev_entities} | {e_delta:+} |")
+        prev_sev = compare_data.get("severity", {})
+        for sev_key in ["high", "medium", "low"]:
+            cur_s = severity.get(sev_key, 0)
+            prev_s = prev_sev.get(sev_key, 0)
+            s_delta = cur_s - prev_s
+            lines.append(f"| {sev_key.title()} severity | {cur_s:,} | {prev_s:,} | {s_delta:+,} |")
+        lines.append("")
+
+    # Top entities table — heading changes based on group_by
+    entity_labels: dict[str, str] = {
+        "srcip": ("🔴 Top Attackers", "IP", "Alerts"),
+        "domain": ("🌐 Top Targeted Domains", "Domain", "Alerts"),
+        "rule.id": ("🔥 Top Rules Triggered", "Rule ID", "Alerts"),
+        "agent": ("🖥️ Most Targeted Agents", "Agent", "Alerts"),
+    }
+    section_title, col_name, col_alerts = entity_labels.get(params.group_by, entity_labels["srcip"])
+
+    if entity_buckets:
+        lines.append(f"## {section_title}")
+        lines.append("")
+        if params.group_by == "srcip":
+            lines.append(f"| {col_name} | {col_alerts} | Max Lvl | Threat Intel | Top Rules | First → Last |")
+            lines.append("|----|--------|---------|-------------|-----------|-------------|")
+            for b in entity_buckets[:30]:
+                key = b["key"]
+                alerts = b["doc_count"]
+                lvl = int(b.get("max_level", {}).get("value", 0))
+                rules = ", ".join(f"`{r['key']}`" for r in b.get("top_rules", {}).get("buckets", [])[:2])
+                fst = (b.get("first_seen", {}).get("value_as_string", "") or "")[:19]
+                lst = (b.get("last_seen", {}).get("value_as_string", "") or "")[:19]
+                ti = threat_data.get(key, {})
+                ti_parts = []
+                cs = ti.get("crowdsec", {})
+                if cs and "error" not in cs:
+                    ti_parts.append(f"CS:`{cs.get('reputation','?')}`")
+                arg = ti.get("argus", {})
+                if arg and "error" not in arg and arg.get("overall_score"):
+                    ti_parts.append(f"Arg:{arg['overall_score']}")
+                ab = ti.get("abuseipdb", {})
+                if ab and "error" not in ab and ab.get("abuse_score") is not None:
+                    ti_parts.append(f"AB:{ab['abuse_score']}%")
+                vt = ti.get("virustotal", {})
+                if vt and "error" not in vt:
+                    ti_parts.append(f"VT:{vt.get('malicious',0)}/{vt.get('total_engines',0)}")
+                ti_str = " ".join(ti_parts) if ti_parts else "-"
+                lines.append(f"| `{key}` | {alerts:,} | {lvl} | {ti_str} | {rules} | {fst} → {lst} |")
+        else:
+            lines.append(f"| {col_name} | {col_alerts} | Top Rules | First → Last |")
+            lines.append("|----|--------|-----------|-------------|")
+            for b in entity_buckets[:30]:
+                key = b["key"]
+                alerts = b["doc_count"]
+                rules = ", ".join(f"`{r['key']}`" for r in b.get("top_rules", {}).get("buckets", [])[:3])
+                fst = (b.get("first_seen", {}).get("value_as_string", "") or "")[:19]
+                lst = (b.get("last_seen", {}).get("value_as_string", "") or "")[:19]
+                lines.append(f"| `{key}` | {alerts:,} | {rules} | {fst} → {lst} |")
+
+    if rule_buckets:
+        lines.append("")
+        lines.append("## 🔥 Top Rules")
+        for b in rule_buckets:
+            lines.append(f"- `{b['key']}` — {b['doc_count']:,} alerts")
+
+    if domain_buckets:
+        lines.append("")
+        lines.append("## 🌐 Top Targeted Domains")
+        for b in domain_buckets[:10]:
+            lines.append(f"- `{b['key']}` — {b['doc_count']:,} alerts")
+
+    if agent_buckets:
+        lines.append("")
+        lines.append("## 🖥️ Most Targeted Agents")
+        for b in agent_buckets[:10]:
+            lines.append(f"- `{b['key']}` — {b['doc_count']:,} alerts")
+
+    lines.append("")
+    lines.append("## 🛠️ Recommended Actions")
+
+    high_entities = [b for b in entity_buckets if int(b.get("max_level", {}).get("value", 0)) >= 10]
+    if high_entities:
+        lines.append(f"1. 🚨 {len(high_entities)} entities triggered critical-severity rules — initiate incident response")
+    for b in entity_buckets[:5]:
+        ip = b["key"]
+        ti = threat_data.get(ip, {})
+        cs = ti.get("crowdsec", {})
+        if cs and cs.get("reputation") == "malicious":
+            lines.append(f"2. Block `{ip}` — confirmed malicious by CrowdSec")
+            break
+    else:
+        lines.append("2. Review top-10 IPs in external threat intel platforms for confirmation")
+    lines.append(f"3. Total {len(entity_buckets)} unique entities — add high-severity offenders to watchlist")
+
+    # Deep investigation: auto-chain attack chain analysis
+    if params.investigation_depth == "deep" and entity_buckets and params.group_by == "srcip":
+        deep_ips = []
+        for b in entity_buckets[:10]:
+            key = b["key"]
+            lvl = int(b.get("max_level", {}).get("value", 0))
+            ti = threat_data.get(key, {})
+            cs = ti.get("crowdsec", {})
+            if lvl >= 10 or (cs.get("reputation") == "malicious" and "error" not in cs):
+                deep_ips.append(key)
+
+        if deep_ips:
+            lines.append("")
+            lines.append("## 🔬 Deep Investigation (Auto-Chained)")
+            lines.append("")
+            lines.append(f"*{len(deep_ips)} qualifying IPs (max_level≥10 or CrowdSec=malicious)*")
+            lines.append("")
+
+            async def _chain_for_ip(ip):
+                cbody = {"size": 500, "sort": [{"@timestamp": {"order": "asc"}}],
+                    "query": {"bool": {"must": [
+                        {"range": {"@timestamp": {"gte": since_iso, "lt": until_iso,
+                                                 "format": "strict_date_optional_time"}}},
+                        {"bool": {"should": [{"match": {"data.srcip": ip}},
+                                            {"match_phrase": {"full_log": ip}}],
+                                  "minimum_should_match": 1}},
+                    ]}},
+                    "_source": ["@timestamp", "rule.id", "rule.description"]}
+                cr = await _wazuh_indexer_post(cbody)
+                if "error" in cr:
+                    return (ip, None)
+                hits = cr.get("hits", {}).get("hits", [])
+                rule_seq = [str(h.get("_source", {}).get("rule", {}).get("id", "?")) for h in hits]
+                # compress consecutive duplicates
+                comp = []
+                for r in rule_seq:
+                    if not comp or r != comp[-1]:
+                        comp.append(r)
+                rc = Counter(rule_seq)
+                return (ip, {"total": len(hits), "chain": comp[:15], "top": rc.most_common(4)})
+
+            chain_results = await asyncio.gather(*[_chain_for_ip(ip) for ip in deep_ips])
+            for ip, ci in chain_results:
+                if ci is None:
+                    continue
+                lines.append(f"### `{ip}`")
+                lines.append(f"- Alerts: {ci['total']} | Chain: `{' → '.join(ci['chain'][:10])}`")
+                top_str = ", ".join(f"`{r}`({c})" for r, c in ci["top"][:4])
+                lines.append(f"- Top rules: {top_str}")
+                lines.append("")
+
+    lines.append("")
+    lines.append("---")
+    lines.append(f"*Report generated by blue_team_mcp (Wazuh Ft. AI by TangerangKota-CSIRT) at {datetime.utcnow().isoformat()[:19]}Z*")
+
+    return _truncate_if_needed("\n".join(lines))
+
+
+# Statistical Baselining
+class BaselineProfileInput(BaseModel):
+    """Input model for blueteam_baseline_profile."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    agent_name: Optional[str] = Field(default=None, max_length=64,
+        description="Target agent for per-agent baselining.")
+    rule_groups: Optional[list[str]] = Field(default=None,
+        description="Filter by rule groups for per-rule-type baselining.")
+    metric: Literal["alert_volume", "unique_ips", "high_severity"] = Field(
+        default="alert_volume",
+        description="Baseline metric: alert_volume, unique_ips, or high_severity (L10+).")
+    window: str = Field(default="7d", max_length=30,
+        description="Historical window for baseline computation.")
+    granularity: str = Field(default="1h", max_length=10,
+        description="Bucket granularity: 15m, 1h, 6h, 1d.")
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown", description="'markdown' or 'json'.")
+
+
+@mcp.tool(
+    name="blueteam_baseline_profile",
+    annotations={"readOnlyHint": True, "destructiveHint": False,
+                 "idempotentHint": True, "openWorldHint": False},
+)
+async def blueteam_baseline_profile(params: BaselineProfileInput) -> str:
+    """Compute statistical baselines for alert volume, unique IPs, or severity.
+
+    Queries historical alert data and returns mean (μ), standard deviation (σ),
+    and per-bucket Z-scores so the LLM can answer: "Is this normal?"
+
+    **Required Permissions**: Wazuh Indexer read access.
+
+    **Worked Examples**
+
+    1. *Is current alert volume normal for thezoo-prod?*:
+       ``blueteam_baseline_profile(agent_name="thezoo-prod", metric="alert_volume", window="7d")``
+
+    2. *High-severity baseline across all agents*:
+       ``blueteam_baseline_profile(metric="high_severity", window="30d", granularity="6h")``
+
+    3. *Unique IP baseline for recon alerts*:
+       ``blueteam_baseline_profile(rule_groups=["recon","scan"], metric="unique_ips", window="7d")``
+    """
+    _audit_log("blueteam_baseline_profile", {"metric": params.metric})
+    if not WAZUH_INDEXER_URL or not WAZUH_INDEXER_PASSWORD:
+        return json.dumps({"error": "WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD must be set."}, indent=2)
+
+    since_iso, until_iso = _parse_time_window(params.window, None)
+
+    filter_clauses: list[dict] = [
+        {"range": {"@timestamp": {"gte": since_iso, "lt": until_iso,
+                                   "format": "strict_date_optional_time"}}},
+    ]
+    if params.agent_name:
+        filter_clauses.append({"match": {"agent.name": params.agent_name.strip()}})
+    if params.rule_groups:
+        filter_clauses.append({"bool": {"should": [
+            {"terms": {"rule.groups": params.rule_groups}},
+            {"terms": {"rule.groups.keyword": params.rule_groups}},
+        ], "minimum_should_match": 1}})
+    if params.metric == "high_severity":
+        filter_clauses.append({"range": {"rule.level": {"gte": 10}}})
+
+    aggs: dict = {}
+    if params.metric == "unique_ips":
+        aggs["metric_value"] = {"cardinality": {"field": "data.srcip.keyword",
+                                                 "precision_threshold": 40000}}
+    else:
+        aggs["metric_value"] = {"value_count": {"field": "_id"}}
+
+    body = {
+        "size": 0,
+        "query": {"bool": {"filter": filter_clauses}},
+        "aggs": {
+            "over_time": {
+                "date_histogram": {
+                    "field": "@timestamp",
+                    "fixed_interval": params.granularity,
+                    "min_doc_count": 0,
+                    "extended_bounds": {"min": since_iso, "max": until_iso},
+                },
+                "aggs": aggs,
+            }
+        },
+    }
+    raw = await _wazuh_indexer_post(body)
+    if "error" in raw:
+        return json.dumps(raw, indent=2)
+
+    buckets = raw.get("aggregations", {}).get("over_time", {}).get("buckets", [])
+    values = [
+        (b.get("metric_value", {}).get("value", 0) if params.metric == "unique_ips"
+         else b.get("doc_count", 0))
+        for b in buckets
+    ]
+    n = len(values)
+    if n < 2:
+        result = {"baseline": {"mean": values[0] if values else 0, "stddev": 0.0,
+                  "buckets": n, "verdict": "insufficient_data"}}
+        return json.dumps(result, indent=2)
+
+    mean_val = sum(values) / n
+    variance = sum((v - mean_val) ** 2 for v in values) / n
+    stddev = math.sqrt(variance)
+
+    # Current value = most recent bucket
+    current = values[-1] if values else 0
+    z_current = (current - mean_val) / stddev if stddev > 0.0001 else 0.0
+
+    max_val = max(values)
+    max_z = (max_val - mean_val) / stddev if stddev > 0.0001 else 0.0
+    peak_at = buckets[values.index(max_val)]["key_as_string"] if values else None
+
+    verdict = (
+        "critical_anomaly" if abs(z_current) >= 3.0 else
+        "significant" if abs(z_current) >= 2.0 else
+        "elevated" if abs(z_current) >= 1.0 else
+        "normal"
+    )
+
+    if params.response_format == "json":
+        result = {
+            "window": {"since": since_iso, "until": until_iso},
+            "granularity": params.granularity,
+            "metric": params.metric,
+            "baseline": {"mean": round(mean_val, 2), "stddev": round(stddev, 2),
+                        "buckets": n},
+            "current": {"value": current, "z_score": round(z_current, 2),
+                       "verdict": verdict},
+            "peak": {"value": max_val, "z_score": round(max_z, 2), "at": peak_at},
+        }
+        return _truncate_if_needed(json.dumps(result, indent=2, ensure_ascii=False))
+
+    label = params.metric.replace("_", " ").title()
+    lines = [
+        f"# 📊 Baseline Profile — {label}",
+        "",
+        f"**Window**: `{since_iso}` → `{until_iso}` ({params.granularity} buckets)",
+        "",
+        f"| Statistic | Value |",
+        f"|-----------|-------|",
+        f"| Mean (μ) | {mean_val:.1f} |",
+        f"| StdDev (σ) | {stddev:.1f} |",
+        f"| Current | **{current}** |",
+        f"| Current Z-score | **{z_current:+.1f}σ** |",
+        f"| Verdict | {verdict.replace('_',' ').title()} |",
+        f"| Peak | {max_val} at {peak_at or '?'} ({max_z:+.1f}σ) |",
+        "",
+    ]
+    if abs(z_current) >= 2.0:
+        lines.append(f"⚠️ Current value is **{abs(z_current):.1f}σ** from mean — investigate.")
+    else:
+        lines.append("✅ Current value is within normal range.")
+
+    lines.append("")
+    lines.append("## Per-Bucket Breakdown")
+    lines.append("```")
+    for i, (b, v) in enumerate(zip(buckets, values)):
+        ts = b.get("key_as_string", f"b{i}")[:16]
+        z = (v - mean_val) / stddev if stddev > 0.0001 else 0.0
+        bar = "█" * min(30, int(abs(z) * 8)) if abs(z) > 0.5 else "▁"
+        marker_flag = " ← current" if i == n - 1 else ""
+        lines.append(f"  {ts}  {v:>6.0f}  Z:{z:+.1f}  {bar}{marker_flag}")
+    lines.append("```")
+
+    return _truncate_if_needed("\n".join(lines))
+
+
+
+# Investigation History
+_INVESTIGATION_HISTORY_FILE = os.environ.get("BLUETEAM_INVESTIGATION_HISTORY", "")
+def _read_history() -> dict[str, dict]:
+    """Read investigation history from JSONL file. Returns {ip: latest_entry}."""
+    if not _INVESTIGATION_HISTORY_FILE:
+        return {}
+    history: dict[str, dict] = {}
+    try:
+        with open(_INVESTIGATION_HISTORY_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                ip = entry.get("srcip", "")
+                if ip:
+                    history[ip] = entry
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    return history
+
+
+def _write_history(srcip: str, verdict: str, summary: dict) -> None:
+    """Append an investigation entry to the history file."""
+    if not _INVESTIGATION_HISTORY_FILE:
+        return
+    try:
+        entry = {"ts": datetime.utcnow().isoformat() + "Z", "srcip": srcip,
+                 "verdict": verdict, "summary": summary}
+        with open(_INVESTIGATION_HISTORY_FILE, "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+class InvestigationHistoryInput(BaseModel):
+    """Input model for blueteam_investigation_history."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    srcip: str = Field(..., min_length=7, max_length=45,
+        description="Source IP to check investigation history for.")
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown", description="'markdown' or 'json'.")
+
+
+@mcp.tool(
+    name="blueteam_investigation_history",
+    annotations={"readOnlyHint": True, "destructiveHint": False,
+                 "idempotentHint": True, "openWorldHint": False},
+)
+async def blueteam_investigation_history(params: InvestigationHistoryInput) -> str:
+    """Check if an IP was previously investigated and what the verdict was.
+
+    Reads from BLUETEAM_INVESTIGATION_HISTORY (JSONL file). Returns the last
+    investigation entry for the IP with timestamp, verdict, and summary.
+
+    **Required**: BLUETEAM_INVESTIGATION_HISTORY env var pointing to a writable
+    JSONL file. Without it, returns empty history.
+
+    **Worked Examples**
+
+    1. *Check prior investigation*:
+       ``blueteam_investigation_history(srcip="103.107.116.202")``
+
+    2. *Verify if IP is new*:
+       ``blueteam_investigation_history(srcip="185.220.101.1")``
+    """
+    _audit_log("blueteam_investigation_history", {"srcip": params.srcip})
+    history = _read_history()
+    entry = history.get(params.srcip.strip())
+
+    if params.response_format == "json":
+        return json.dumps({
+            "srcip": params.srcip,
+            "previously_investigated": entry is not None,
+            "last_entry": entry,
+        }, indent=2, ensure_ascii=False)
+
+    if entry:
+        ts = entry.get("ts", "?")[:19]
+        verdict = entry.get("verdict", "unknown")
+        summary = entry.get("summary", {})
+        return (
+            f"# Investigation History — `{params.srcip}`\n\n"
+            f"- **Last analyzed**: {ts}\n"
+            f"- **Verdict**: {verdict}\n"
+            f"- **Summary**: {json.dumps(summary, indent=2)}\n\n"
+            f"_History file: {_INVESTIGATION_HISTORY_FILE}_"
+        )
+    return (
+        f"# Investigation History — `{params.srcip}`\n\n"
+        f"**No prior investigation found**. This IP has not been analyzed before.\n\n"
+        f"_History file: {_INVESTIGATION_HISTORY_FILE or '(not configured)'}_"
+    )
+
+
+
+# AUL Adjust - CAT-B: Calendar Heatmap (Periodicity Detection)
+class CalendarHeatmapInput(BaseModel):
+    """Input model for blueteam_calendar_heatmap."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    srcip: Optional[str] = Field(default=None, max_length=45,
+        description="Source IP to analyze. If omitted, aggregates all IPs.")
+    days: int = Field(default=30, ge=7, le=90,
+        description="Number of days to analyze (7-90). Default 30.")
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown", description="'markdown' or 'json'.")
+
+
+@mcp.tool(
+    name="blueteam_calendar_heatmap",
+    annotations={"readOnlyHint": True, "destructiveHint": False,
+                 "idempotentHint": True, "openWorldHint": False},
+)
+async def blueteam_calendar_heatmap(params: CalendarHeatmapInput) -> str:
+    """Detect scheduled attack patterns via day×hour heatmap analysis.
+
+    Queries 7-90 days of alert data and builds a day-of-week x hour-of-day
+    matrix. High-density cells reveal periodic attack schedules - the
+    hallmark of automated C2 beaconing, cron-job exploitation, or
+    scheduled scanning campaigns.
+
+    **Required Permissions**: Wazuh Indexer read access.
+
+    **Worked Examples**
+
+    1. *Check if an IP attacks on a schedule*:
+       ``blueteam_calendar_heatmap(srcip="103.107.116.202", days=30)``
+
+    2. *Global attack pattern across all IPs*:
+       ``blueteam_calendar_heatmap(days=14)``
+
+    3. *Extended 90-day analysis*:
+       ``blueteam_calendar_heatmap(srcip="185.220.101.1", days=90)``
+    """
+    _audit_log("blueteam_calendar_heatmap", {"srcip": params.srcip, "days": params.days})
+    if not WAZUH_INDEXER_URL or not WAZUH_INDEXER_PASSWORD:
+        return json.dumps({"error": "WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD must be set."}, indent=2)
+
+    since_dt = datetime.utcnow() - timedelta(days=params.days)
+    until_dt = datetime.utcnow()
+    since_iso = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    until_iso = until_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    must_clauses: list[dict] = [
+        {"range": {"@timestamp": {"gte": since_iso, "lt": until_iso,
+                                   "format": "strict_date_optional_time"}}},
+    ]
+    if params.srcip:
+        must_clauses.append({"bool": {"should": [
+            {"match": {"data.srcip": params.srcip.strip()}},
+            {"match_phrase": {"full_log": params.srcip.strip()}},
+        ], "minimum_should_match": 1}})
+
+    body = {
+        "size": 0,
+        "query": {"bool": {"must": must_clauses}},
+        "aggs": {
+            "by_hour": {
+                "date_histogram": {
+                    "field": "@timestamp",
+                    "fixed_interval": "1h",
+                    "min_doc_count": 0,
+                    "extended_bounds": {"min": since_iso, "max": until_iso},
+                },
+            },
+        },
+    }
+    raw = await _wazuh_indexer_post(body)
+    if "error" in raw:
+        return json.dumps(raw, indent=2)
+
+    buckets = raw.get("aggregations", {}).get("by_hour", {}).get("buckets", [])
+
+    # Build day x hour matrix (Mon-Sun rows, 0-23 hour columns)
+    days_of_week = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    matrix: list[list[int]] = [[0] * 24 for _ in range(7)]
+    total_alerts = 0
+
+    for b in buckets:
+        ts = b.get("key_as_string", "")
+        count = b.get("doc_count", 0)
+        total_alerts += count
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            dow = dt.weekday()  # 0=Mon, 6=Sun
+            hour = dt.hour
+            matrix[dow][hour] += count
+        except (ValueError, TypeError):
+            continue
+
+    # Find peak cell and compute statistics
+    max_val = max(max(row) for row in matrix)
+    flat = [v for row in matrix for v in row]
+    n_cells = len(flat)
+    mean_val = sum(flat) / n_cells if n_cells > 0 else 0.0
+    variance = sum((v - mean_val) ** 2 for v in flat) / n_cells if n_cells > 0 else 0.0
+    stddev = math.sqrt(variance)
+
+    # Find peak day and hour
+    peak_day_idx, peak_hour = 0, 0
+    for d in range(7):
+        for h in range(24):
+            if matrix[d][h] > matrix[peak_day_idx][peak_hour]:
+                peak_day_idx, peak_hour = d, h
+
+    # Detect strongly periodic patterns (Z > 2.5 in any cell)
+    periodic_cells = []
+    for d in range(7):
+        for h in range(24):
+            z = (matrix[d][h] - mean_val) / stddev if stddev > 0.001 else 0.0
+            if z >= 2.5:
+                periodic_cells.append((days_of_week[d], h, matrix[d][h], round(z, 1)))
+
+    verdict = (
+        "strong_periodicity" if len(periodic_cells) >= 3 else
+        "possible_periodicity" if periodic_cells else
+        "no_periodicity"
+    )
+
+    if params.response_format == "json":
+        return _truncate_if_needed(json.dumps({
+            "window": {"since": since_iso, "until": until_iso, "days": params.days},
+            "srcip": params.srcip,
+            "total_alerts": total_alerts,
+            "stats": {"mean_per_cell": round(mean_val, 1), "stddev": round(stddev, 1)},
+            "peak": {"day": days_of_week[peak_day_idx], "hour": peak_hour,
+                    "count": matrix[peak_day_idx][peak_hour]},
+            "verdict": verdict,
+            "periodic_cells": [{"day": d, "hour": h, "count": c, "z": z}
+                              for d, h, c, z in periodic_cells],
+            "matrix": {days_of_week[d]: {str(h): matrix[d][h] for h in range(24)}
+                      for d in range(7)},
+        }, indent=2, ensure_ascii=False))
+
+    # ASCII heatmap
+    lines = [
+        f"# 📅 Calendar Heatmap — {params.srcip or 'All IPs'}",
+        "",
+        f"**Window**: {params.days} days ({since_iso[:10]} → {until_iso[:10]})",
+        f"**Total alerts**: {total_alerts:,}",
+        f"**Verdict**: {verdict.replace('_', ' ').title()}",
+        "",
+    ]
+
+    if periodic_cells:
+        lines.append("## ⚠️ Periodic Hotspots (Z ≥ 2.5)")
+        lines.append("")
+        for d, h, c, z in periodic_cells[:8]:
+            lines.append(f"- **{d} {h:02d}:00** — {c:,} alerts ({z:+.1f}σ)")
+        lines.append("")
+
+    lines.append(f"## Day × Hour Matrix  (peak: {days_of_week[peak_day_idx]} {peak_hour:02d}:00 = {matrix[peak_day_idx][peak_hour]:,})")
+    lines.append("")
+    # Header
+    lines.append("```")
+    header = "     " + "".join(f"{h:>4}" for h in range(24))
+    lines.append(header)
+    lines.append("    " + "-" * 96)
+
+    for d in range(7):
+        row_vals = matrix[d]
+        # Find max in this row for scaling
+        row_max = max(row_vals) if max(row_vals) > 0 else 1
+        # Build ASCII bar row
+        bars = ""
+        for h in range(24):
+            v = row_vals[h]
+            if v == 0:
+                bars += "   ·"
+            else:
+                intensity = int(v / row_max * 3)
+                chars = ["░", "▒", "▓", "█"]
+                bars += f"  {chars[min(intensity, 3)]}"
+        marker = " ◀" if d == peak_day_idx else ""
+        lines.append(f" {days_of_week[d]} {bars}{marker}")
+    lines.append("```")
+    lines.append("")
+    lines.append("_· = 0   ░ = low   ▒ = medium   ▓ = high   █ = peak_")
+    lines.append("")
+    lines.append(f"**Peak**: {days_of_week[peak_day_idx]} at {peak_hour:02d}:00 UTC "
+                 f"({matrix[peak_day_idx][peak_hour]:,} alerts)")
+
+    return _truncate_if_needed("\n".join(lines))
+
+
+
 # Wazuh Indexer index patterns (OpenSearch)
 _WAZUH_INDEX_PATTERNS = {
     "alerts": "wazuh-alerts-*",
@@ -3005,7 +5620,7 @@ _EMAIL_RE = re.compile(
     r'(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}'
 )
 
-# Shared keyword search fields — used across all Wazuh Indexer query helpers.
+# Shared keyword search fields - used across all Wazuh Indexer query helpers.
 # Each tuple is (field_name, boost). boost=0 means the field is searched
 # but does not influence score ranking.
 _KEYWORD_SEARCH_FIELDS: list[tuple[str, int]] = [
@@ -3021,7 +5636,6 @@ _KEYWORD_SEARCH_FIELDS: list[tuple[str, int]] = [
     ("data.referrer", 0),
 ]
 
-
 def _validate_keyword_field(v: Optional[str]) -> Optional[str]:
     """Shared keyword validator — strip, reject null bytes / control chars."""
     if v is not None:
@@ -3033,7 +5647,6 @@ def _validate_keyword_field(v: Optional[str]) -> Optional[str]:
         if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", v):
             raise ValueError("keyword contains invalid control characters")
     return v
-
 
 def _validate_agent_name_field(v: Optional[str]) -> Optional[str]:
     """Shared agent_name validator — strip, length-check, safe-chars-only."""
@@ -3130,7 +5743,7 @@ class WazuhIndexerSearchInput(BaseModel):
         default=None,
         validation_alias=AliasChoices("from", "start", "after"),
         max_length=30,
-        description="Start of time window — ISO 8601 ('2026-07-05T18:30:00Z') or relative "
+        description="Start of time window - ISO 8601 ('2026-07-05T18:30:00Z') or relative "
                     "('5m', '1h', '24h', '7d', '30d'). "
                     "To convert WIB (GMT+7): subtract 7 hours. "
                     "Can be used alone (no until required).",
@@ -3160,6 +5773,13 @@ class WazuhIndexerSearchInput(BaseModel):
                     "Matches ANY of the listed IPs across data.srcip, data.srcip2, "
                     "srcip, and full_log fields. Use for searching alerts by multiple "
                     "suspicious IPs in a single call. Example: ['114.10.116.20', '51.159.125.199']",
+    )
+    geo_country: Optional[str] = Field(
+        default=None,
+        max_length=60,
+        description="Filter by GeoLocation.country_name (Wazuh Indexer GeoIP enrichment). "
+                    "Exact match, e.g. 'Indonesia'. Only alerts processed through GeoIP "
+                    "enrichment are matched — results represent a lower bound.",
     )
     rule_groups: Optional[list[str]] = Field(
         default=None,
@@ -3216,6 +5836,12 @@ class WazuhIndexerSearchInput(BaseModel):
                     "into counts and samples. Dangerous for large time windows — always "
                     "pair with a conservative max_scanned. Ignored if the environment guard "
                     "is not active.",
+    )
+    auto_enrich: bool = Field(
+        default=False,
+        description="When True, pre-fetches CrowdSec reputation for all unique srcips "
+                    "in the result set and injects an '_enrichment' field into each "
+                    "document. Adds ~1s latency per 10 IPs. Requires CROWDSEC_API_KEY.",
     )
 
     @field_validator("bypass_character_limit")
@@ -3329,7 +5955,7 @@ class WazuhIndexerSearchInput(BaseModel):
                 return None
             if len(v) > 45:
                 raise ValueError("srcip too long (max 45)")
-            # Allow IPv4, IPv6, and CIDR notation — reject obvious non-IP strings
+            # Allow IPv4, IPv6, and CIDR notation - reject obvious non-IP strings
             if not re.match(r"^[0-9a-fA-F.:/]+$", v):
                 raise ValueError("srcip must be a valid IP address or CIDR range")
         return v
@@ -3619,14 +6245,14 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhI
         return json.dumps({"error": f"index_type must be one of: {list(_WAZUH_INDEX_PATTERNS)}"})
     index_pattern = _WAZUH_INDEX_PATTERNS[params.index_type]
 
-    # Decode pagination cursor — search_after uses sort-key values, not numeric offsets
+    # Decode pagination cursor - search_after uses sort-key values, not numeric offsets
     search_after: Optional[list] = None
     if params.cursor:
         decoded = _decode_cursor(params.cursor)
         if decoded:
             search_after = decoded.get("search_after")
 
-    # Auto-pagination mode — scan ALL pages internally, return aggregate
+    # Auto-pagination mode - scan ALL pages internally, return aggregate
     if params.max_scanned is not None:
         return await _wazuh_indexer_search_full_scan(
             params, index_pattern, search_after
@@ -3644,6 +6270,7 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhI
         srcips=params.srcips,
         fields=params.fields,
         rule_groups=params.rule_groups,
+        geo_country=params.geo_country,
     )
     if isinstance(data.get("error"), str):
         return json.dumps(data, indent=2)
@@ -3660,6 +6287,31 @@ async def blueteam_wazuh_indexer_search(params: WazuhIndexerSearchInput = WazuhI
         last_sort = hit_list[-1].get("sort")
         if last_sort:
             next_cursor = _encode_cursor({"search_after": last_sort})
+
+    # Auto-enrich: inject CrowdSec reputation inline
+    if params.auto_enrich and docs and os.environ.get(CROWDSEC_API_KEY_ENV):
+        unique_ips = set()
+        for d in docs:
+            data = d.get("data", {}) if isinstance(d, dict) else {}
+            sip = str(data.get("srcip", "")).strip()
+            if sip:
+                unique_ips.add(sip)
+        if unique_ips:
+            enrich_map: dict[str, dict] = {}
+            for ip in list(unique_ips)[:10]:  # cap at 10 IPs to avoid rate limits
+                try:
+                    cs = await _crowdsec_request(f"/v2/smoke/{ip}")
+                    enrich_map[ip] = {
+                        "reputation": cs.get("reputation", "unknown"),
+                        "behaviors": [b.get("name", "") for b in cs.get("behaviors", [])[:3]],
+                    }
+                except Exception:
+                    enrich_map[ip] = {"reputation": "lookup_failed"}
+            for d in docs:
+                data = d.get("data", {}) if isinstance(d, dict) else {}
+                sip = str(data.get("srcip", "")).strip()
+                if sip in enrich_map:
+                    d["_enrichment"] = {"crowdsec": enrich_map[sip]}
 
     meta: dict = {
         "total": {"value": total_val, "relation": total_relation},
@@ -3799,8 +6451,6 @@ class WazuhEmailLookupInput(BaseModel):
 
 
 
-
-
 @mcp.tool(
     name="wazuh_email_lookup",
     annotations={
@@ -3869,7 +6519,7 @@ async def wazuh_email_lookup(params: WazuhEmailLookupInput) -> str:
             )
             if "error" in data:
                 error_msg = data["error"]
-                # If we've already collected some data, return partial results
+                # If already collected some data, return partial results. (Aul Adjust)
                 if total_scanned > 0:
                     break
                 return json.dumps(data, indent=2)
@@ -4048,7 +6698,7 @@ class WazuhDomainLookupInput(BaseModel):
     )
     response_format: Literal["markdown", "json"] = Field(
         default="markdown",
-        description="'markdown' for human-readable summary, 'json' for structured data.",
+        description="'markdown' for human readable summary, 'json' for structured data.",
     )
     keyword: ValidKeyword = Field(
         default=None,
@@ -4062,8 +6712,8 @@ class WazuhDomainLookupInput(BaseModel):
         le=500000,
         description="When set, auto-paginate through all matching alerts up to this limit. "
                     "Returns aggregated results (counts, top IPs, top rules) across ALL "
-                    "scanned pages — no need to manually iterate with next_cursor. "
-                    "When None (default), returns a single page with next_cursor for "
+                    "scanned pages - no need to manually iterate with next_cursor."
+                    "When None (default), returns a single page with next_cursor for"
                     "manual pagination. include_full_log is forced to False in this mode.",
     )
 
@@ -4086,8 +6736,6 @@ class WazuhDomainLookupInput(BaseModel):
         return v
 
 
-
-
 async def _wazuh_domain_lookup_full_scan(
     params: "WazuhDomainLookupInput",
     since_str: str,
@@ -4098,7 +6746,6 @@ async def _wazuh_domain_lookup_full_scan(
 
     Uses the shared ``_full_scan_paginate`` loop internally.
     """
-
     async def _fetch_page(ps: int, sa):
         return await _wazuh_indexer_domain_search(
             domain=params.domain,
@@ -4299,7 +6946,7 @@ async def wazuh_domain_lookup(params: WazuhDomainLookupInput) -> str:
         if decoded:
             search_after = decoded.get("search_after")
 
-    # Auto-pagination mode — scan ALL pages internally, return aggregate
+    # Auto pagination mode - scan ALL pages internally, return aggregate.
     if params.max_scanned is not None:
         return await _wazuh_domain_lookup_full_scan(
             params, since_str, until_str, search_after
@@ -4494,8 +7141,6 @@ class WazuhCompromisedEmailsAnalysisInput(BaseModel):
         return cleaned
 
 
-
-
 @mcp.tool(
     name="wazuh_compromised_emails_analysis",
     annotations={
@@ -4507,7 +7152,6 @@ class WazuhCompromisedEmailsAnalysisInput(BaseModel):
 )
 async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalysisInput) -> str:
     """Correlate compromised email addresses with attacker IPs from Wazuh alerts.
-
     Given a list of email addresses (typically sourced from ``wazuh_email_lookup``),
     queries the Wazuh Indexer for alerts mentioning any of them, extracts and ranks
     the source IPs involved, and optionally enriches the top attacker IPs through
@@ -4611,7 +7255,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
 
     top_ips = ip_counter.most_common(params.top_ips)
 
-    # Optional Netra enrichment for top IPs (max 10)
+    # Netra enrichment for top IPs (max 10)
     netra_results: dict[str, dict] = {}
     if params.enrich_with_netra:
         enrich_count = min(len(top_ips), 10)
@@ -4639,7 +7283,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
                     "country_name": geo.get("country_name"),
                     "isp": geo.get("isp"),
                 }
-                # Rate-limit courtesy: 1s delay between Netra calls
+                # Rate limit : 1s delay between Netra calls
                 await asyncio.sleep(1)
             except (httpx.HTTPStatusError, httpx.TimeoutException, Exception) as e:
                 netra_results[ip] = {"error": str(e)}
@@ -4773,7 +7417,7 @@ async def wazuh_compromised_emails_analysis(params: WazuhCompromisedEmailsAnalys
     return _truncate_if_needed("\n".join(lines))
 
 
-# Dynamic Time-Based Alert Analysis
+# Dynamic Time Based Alert Analysis
 def _auto_bucket_interval(window_duration_minutes: float) -> str:
     """Pick a reasonable date_histogram bucket interval for a given time window.
 
@@ -4931,6 +7575,7 @@ async def wazuh_alert_timeline(params: WazuhAlertTimelineInput) -> str:
             rule_groups=rule_group_list,
             rule_level_min=params.rule_level_min,
             keyword=params.keyword,
+            geo_country=params.geo_country if hasattr(params, 'geo_country') else None,
         )
     except (httpx.HTTPStatusError, httpx.TimeoutException, RuntimeError) as e:
         return _handle_api_error(e, context="wazuh_alert_timeline")
@@ -5030,7 +7675,7 @@ async def wazuh_alert_timeline(params: WazuhAlertTimelineInput) -> str:
         quiet_count = quiet.get("doc_count", 0)
         lines.append(f"- **Quietest**: {quiet_key} — {quiet_count:,} alerts")
 
-    # Per-severity totals
+    # Per severity totals
     all_low = sum(
         next((r.get("doc_count", 0) for r in (b.get("by_level", {}) or {}).get("buckets", []) if r.get("key") == "low"), 0)
         for b in buckets
@@ -5181,6 +7826,7 @@ async def wazuh_attack_velocity(params: WazuhAttackVelocityInput = WazuhAttackVe
                 agent_name=params.agent_name,
                 rule_groups=rule_group_list,
                 keyword=params.keyword,
+                geo_country=params.geo_country if hasattr(params, 'geo_country') else None,
             ),
             _wazuh_indexer_aggregate(
                 bucket_interval=bucket_interval,
@@ -5189,6 +7835,7 @@ async def wazuh_attack_velocity(params: WazuhAttackVelocityInput = WazuhAttackVe
                 agent_name=params.agent_name,
                 rule_groups=rule_group_list,
                 keyword=params.keyword,
+                geo_country=params.geo_country if hasattr(params, 'geo_country') else None,
             ),
         )
     except (httpx.HTTPStatusError, httpx.TimeoutException, RuntimeError) as e:
@@ -5925,7 +8572,7 @@ async def blueteam_list_users(bypass_redaction: bool = False) -> str:
     except Exception as e:
         return json.dumps({"error": str(e)})
 
-    # Sort: UID 0 first, then regular users, then system accounts
+    # Sort: UID 0 first, then regular users, then system accounts.
     users.sort(key=lambda u: (not u["flags"]["uid_zero_root"], not u["flags"]["has_login_shell"], u["uid"]))
     return _redact_alert_data(json.dumps(users, indent=2, bypass=bypass_redaction))
 
@@ -6062,19 +8709,11 @@ async def _wazuh_indexer_post(body: dict, index_pattern: Optional[str] = None) -
         return {"error": "WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD must be set. See README for Indexer setup."}
     url = f"{WAZUH_INDEXER_URL}/{index_pattern}/_search"
 
-    async def _do_post() -> dict[str, Any]:
-        client = await _get_client("indexer", verify=WAZUH_INDEXER_VERIFY_SSL, max_keepalive=10, max_connections=50)
-        resp = await client.post(
-            url,
-            auth=(WAZUH_INDEXER_USER, WAZUH_INDEXER_PASSWORD),
-            json=body,
-            headers={"Content-Type": "application/json"},
-        )
-        resp.raise_for_status()
-        return resp.json()
-
     try:
-        return await _do_post()
+        resp = await _api_call("post", url, client_name="indexer",
+                                auth=(WAZUH_INDEXER_USER, WAZUH_INDEXER_PASSWORD),
+                                json=body, headers={"Content-Type": "application/json"})
+        return resp.json()
     except httpx.HTTPStatusError as e:
         return {"error": f"Indexer API error: {e.response.status_code}", "detail": e.response.text[:500]}
     except Exception as e:
@@ -6157,6 +8796,7 @@ def _build_filter_clauses(
     rule_groups: Optional[list[str]] = None,
     rule_level_min: Optional[int] = None,
     keyword: Optional[str] = None,
+    geo_country: Optional[str] = None,
 ) -> list[dict]:
     """Build OpenSearch filter clauses shared across all Tier-1 modes."""
     filters: list[dict] = [
@@ -6174,6 +8814,8 @@ def _build_filter_clauses(
         filters.append({"terms": {"rule.groups": list(rule_groups)}})
     if rule_level_min is not None:
         filters.append({"range": {"rule.level": {"gte": rule_level_min}}})
+    if geo_country and geo_country.strip():
+        filters.append({"term": {"GeoLocation.country_name": geo_country.strip()}})
     if keyword and keyword.strip():
         _KW = _KEYWORD_SEARCH_FIELDS[:8]
         k = keyword.strip()
@@ -6491,7 +9133,7 @@ def _format_aggregate_markdown(
     },
 )
 async def wazuh_alert_aggregate_analysis(params: AggregateAnalysisInput) -> str:
-    """Full-period statistical analysis of Wazuh alerts — NO document limits.
+    """Full-period statistical analysis of Wazuh alerts - NO document limits.
 
     All matching alerts are processed server-side by the Wazuh Indexer (OpenSearch)
     using ``size: 0`` aggregations. Only statistics and bucketed summaries are
@@ -6499,11 +9141,11 @@ async def wazuh_alert_aggregate_analysis(params: AggregateAnalysisInput) -> str:
     consume roughly the same LLM context budget (~10–50 KB).
 
     **Analysis modes:**
-    - ``topology`` — Top-N (src_ip × rule_id × agent) attack patterns + severity bands
-    - ``anomaly`` — Statistical-deviation detection: which time slices are >2σ above mean?
-    - ``correlation`` — Significant IP↔rule co-occurrence via significant_terms
-    - ``trend`` — Multi-resolution rate-of-change (acceleration/deceleration) detection
-    - ``summary`` — All four modes dispatched in parallel (recommended)
+    - ``topology`` - Top-N (src_ip × rule_id × agent) attack patterns + severity bands
+    - ``anomaly`` - Statistical-deviation detection: which time slices are >2σ above mean?
+    - ``correlation`` - Significant IP↔rule co-occurrence via significant_terms
+    - ``trend`` - Multi-resolution rate-of-change (acceleration/deceleration) detection
+    - ``summary`` - All four modes dispatched in parallel (recommended)
 
     **Typical workflow:**
     1. Call with ``mode="summary"`` to get the full statistical picture
@@ -6597,7 +9239,6 @@ async def wazuh_alert_aggregate_analysis(params: AggregateAnalysisInput) -> str:
 
 
 # Tier 2: wazuh_alert_dsl_query - power user escape hatch (size: 0 enforced)
-
 def _check_no_scripts(obj: Any, path: str = "") -> None:
     """Reject scripted aggregations - shared by DslQueryInput validators."""
     if isinstance(obj, dict):
@@ -6644,7 +9285,7 @@ class DslQueryInput(BaseModel):
         ),
     )
 
-    # Raw string path (deprecated — backward compat only)
+    # Raw string path (deprecated - backward compat only)
     query_json: Optional[str] = Field(
         default=None,
         min_length=5,
@@ -6653,7 +9294,7 @@ class DslQueryInput(BaseModel):
             "[DEPRECATED] Raw OpenSearch DSL JSON string. Prefer ``aggs`` + ``query`` instead. "
             "MUST use 'size': 0 (aggregation-only). "
             "When using this path, Painless script quotes require quadruple backslash escaping "
-            "(\\\\\") to survive JSON-in-JSON double-serialization — see SKILLS.md §14.11."
+            "(\\\\\") to survive JSON-in-JSON double-serialization."
         ),
     )
 
@@ -6760,7 +9401,7 @@ async def wazuh_alert_dsl_query(params: DslQueryInput) -> str:
       as native JSON objects. The server serializes to the OpenSearch wire format —
       no JSON-in-JSON escaping required. Safe for LLM callers.
     - **Raw string (deprecated)**: pass ``params.query_json`` as a pre-serialized DSL
-      string. Requires correct double-escaping for nested quotes — see SKILLS.md §14.11.
+      string. Requires correct double-escaping for nested quotes.
 
     Use this when you need a specific OpenSearch aggregation (percentiles,
     geo_distance, nested, reverse_nested, etc.) that the built-in tools
@@ -6794,7 +9435,7 @@ async def wazuh_alert_dsl_query(params: DslQueryInput) -> str:
     """
     _audit_log("wazuh_alert_dsl_query", {"index": params.index_pattern})
 
-    # Build the DSL body — structured path (preferred) or raw path (deprecated)
+    # Build the DSL body - structured path (preferred) or raw path (deprecated)
     if params.aggs is not None:
         body: dict[str, Any] = {"size": 0, "aggs": params.aggs}
         if params.query is not None:
@@ -7575,11 +10216,13 @@ class ThreeSumCorrelationInput(BaseModel):
     )
     category_b_groups: list[str] = Field(
         default=["authentication_failures", "bruteforce", "malicious_login", "blocklist",
-                 "blacklist", "credential_breach", "account_compromised", "zimbra"],
+                 "blacklist", "credential_breach", "account_compromised", "zimbra",
+                 "spam", "postfix"],
         description="Wazuh rule.groups for Category B (Access Anomaly). "
                     "Partially validated against Zimbra alerts (authentication_failures, "
-                    "bruteforce, blocklist, zimbra all present). TangerangKota-CSIRT taxonomy. "
-                    "MCP-TAXONOMY-V2: full diagnostic scan pending.",
+                    "bruteforce, blocklist, zimbra all present). MCP-TAXONOMY-V2: "
+                    "spam/postfix included to capture mail-infrastructure reject scans. "
+                    "TangerangKota-CSIRT taxonomy.",
     )
     category_c_groups: list[str] = Field(
         default=["firewall_drop", "exfiltration", "overflow", "opencti", "persistent",
@@ -7622,6 +10265,11 @@ class ThreeSumCorrelationInput(BaseModel):
     cidr_normalize: bool = Field(
         default=False,
         description="Group srcips by /24 (IPv4) or /64 (IPv6) before intersection. Opt-in — disabled by default to avoid false matches from IP rotation.",
+    )
+    follow_up: Literal["none", "curated_report"] = Field(
+        default="none",
+        description="'none' = return 3-Sum results only. 'curated_report' = automatically run "
+                    "curated threat report enrichment for each Engine-A trigger IP.",
     )
     exclude_srcips: list[str] = Field(
         default=[],
@@ -7882,6 +10530,16 @@ async def three_sum_correlation(data: ThreeSumCorrelationInput) -> str:
 
         # Engine B: date_histogram per source (3 parallel queries)
         if data.engine_b_enabled:
+            # Auto-select bucket interval based on time window (target ~60 buckets)
+            window_mins = data.time_window_minutes
+            b_interval = "1m"
+            if window_mins > 120:
+                b_interval = "5m"
+            if window_mins > 600:
+                b_interval = "15m"
+            if window_mins > 1440:
+                b_interval = "1h"
+
             async def _fetch_bucket_counts(label: str, groups: list[str]) -> tuple[str, list[dict[str, Any]]]:
                 """Fetch per-minute alert counts for a single source."""
                 body = {
@@ -7914,7 +10572,7 @@ async def three_sum_correlation(data: ThreeSumCorrelationInput) -> str:
                         "alerts_over_time": {
                             "date_histogram": {
                                 "field": "@timestamp",
-                                "fixed_interval": "1m",
+                                "fixed_interval": b_interval,
                                 "min_doc_count": 0,
                                 "extended_bounds": {"min": since_iso, "max": until_iso},
                             }
@@ -7955,6 +10613,31 @@ async def three_sum_correlation(data: ThreeSumCorrelationInput) -> str:
             for label_ret, buckets in fetched_b:
                 buckets_by_label[label_ret] = buckets
 
+            # Query account lockout events for advisory volume signal.
+            # Counts data.error events containing "locked" in the window —
+            # never used as a scoring input, only metadata.
+            account_lockouts_total = 0
+            try:
+                lockout_body = {
+                    "size": 0,
+                    "query": {
+                        "bool": {
+                            "filter": [
+                                {"range": {"@timestamp": {"gte": since_iso, "lt": until_iso,
+                                                         "format": "strict_date_optional_time"}}},
+                                {"query_string": {"query": "data.error: *locked*",
+                                                  "default_operator": "AND"}},
+                            ]
+                        }
+                    },
+                }
+                lockout_raw = await _wazuh_indexer_post(lockout_body, _WAZUH_INDEX_PATTERNS["alerts"])
+                if "error" not in lockout_raw:
+                    total = lockout_raw.get("hits", {}).get("total", {})
+                    account_lockouts_total = total.get("value", 0) if isinstance(total, dict) else total
+            except Exception:
+                account_lockouts_total = 0  # advisory only — never fail the eval
+
             engine_b_result = evaluate_engine_b(
                 buckets_by_label.get(label_a, []),
                 buckets_by_label.get(label_b, []),
@@ -7963,9 +10646,10 @@ async def three_sum_correlation(data: ThreeSumCorrelationInput) -> str:
                 source_2_label=label_b,
                 source_3_label=label_c,
                 z_score_threshold=data.z_score_threshold,
+                account_lockouts_total=account_lockouts_total,
             )
             logger.info(
-                "[3SUM-EVAL] Engine-B evaluation complete — %d simultaneous triggers",
+                "[3SUM-EVAL] Engine-B evaluation complete - %d simultaneous triggers",
                 len(engine_b_result["simultaneous_triggers"]),
             )
 
@@ -7983,6 +10667,42 @@ async def three_sum_correlation(data: ThreeSumCorrelationInput) -> str:
         # Cache result for throttle gate
         _last_eval_time = time.monotonic()
         _last_eval_result = result
+
+        # Follow-up: auto-enrich trigger IPs via curated report
+        if data.follow_up == "curated_report" and engine_a_results:
+            triggers, _ = engine_a_results
+            if triggers:
+                fu_results: list[dict] = []
+                for t in triggers[:5]:  # cap at 5 to avoid rate limits
+                    ip = t["srcip"]
+                    try:
+                        fu_filters = CuratedReportFilters(srcips=[ip])
+                        fu_since = since_iso
+                        fu_until = until_iso
+                        fu_clauses = _build_curated_query(fu_since, fu_until, fu_filters)
+                        fu_body = {
+                            "size": 0,
+                            "query": {"bool": {"must": fu_clauses}},
+                            "aggs": {
+                                "top_rules": {"terms": {"field": "rule.id.keyword", "size": 5}},
+                                "total_alerts": {"value_count": {"field": "_id"}},
+                            },
+                        }
+                        fu_raw = await _wazuh_indexer_post(fu_body, _WAZUH_INDEX_PATTERNS["alerts"])
+                        if "error" not in fu_raw:
+                            fu_aggs = fu_raw.get("aggregations", {})
+                            fu_results.append({
+                                "srcip": ip,
+                                "total_alerts": fu_aggs.get("total_alerts", {}).get("value", 0),
+                                "top_rules": [
+                                    {"id": b["key"], "count": b["doc_count"]}
+                                    for b in fu_aggs.get("top_rules", {}).get("buckets", [])
+                                ],
+                                "three_sum_score": t["total_score"],
+                            })
+                    except Exception:
+                        fu_results.append({"srcip": ip, "error": "follow_up_failed"})
+                result["follow_up"] = {"mode": "curated_report", "results": fu_results}
 
         logger.info("[3SUM-EVAL] Evaluation finished — %d ms", round(elapsed_ms))
         return json.dumps(result, indent=2)
@@ -8069,7 +10789,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 def _validate_configuration() -> None:
     """Validate required secrets at startup and warn on missing optional credentials.
-    Per CLAUDE.md Hard Rule 8 and AGENTS.md §1.4 checklist item 2: fail fast
     on missing configuration. All API keys are optional (the server starts
     without them and tools that need them return actionable errors at call
     time), but we emit clear WARNINGs so operators know which tools will be
