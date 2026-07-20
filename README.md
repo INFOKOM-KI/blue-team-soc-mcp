@@ -529,6 +529,9 @@ All tools below are registered on `blue_team_server.py`. Tools not requiring a s
 | `blueteam_baseline_profile` | 🆕 — μ/σ/Z-score statistical baselining. "Is 4,821 alerts normal?" |
 | `blueteam_calendar_heatmap` | 🆕 — Day×hour periodicity detection (30+ day windows, ASCII heatmap) |
 | `blueteam_investigation_history` | 🆕 — JSONL-based IP verdict persistence. "Did we analyze this IP before?" |
+| `blueteam_mark_investigated` | 🆕 — Record IP investigation verdict + notes (JSONL write) |
+| `blueteam_false_positive_tracker` | 🆕 — Count FP verdicts per rule_id for rule tuning |
+| `blueteam_investigation_summary` | 🆕 — Dashboard: IPs investigated, verdict breakdown |
 
 ### Threat Intelligence
 | Tool | Description |
