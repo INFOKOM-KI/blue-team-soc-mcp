@@ -197,6 +197,34 @@ async def _api_call(method: str, url: str, *, client_name: str = "http", verify:
     return resp
 
 
+def response_pipeline(tool_name: str):
+    """Decorator: auto-applies redact → truncate → audit on tool return values.
+
+    Extracts bypass_redaction from the first positional arg (params object).
+    Chains: _redact_alert_data → json.dumps → _truncate_if_needed → _audit_log.
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            result = await func(*args, **kwargs)
+            params = args[0] if args else None
+            bypass_redact = getattr(params, "bypass_redaction", False)
+            bypass_char = getattr(params, "bypass_character_limit", False)
+            # Redact if result is dict/list
+            if isinstance(result, (dict, list)):
+                result = _redact_alert_data(result, bypass=bypass_redact)
+            # Serialize
+            if isinstance(result, (dict, list)):
+                result = json.dumps(result, indent=2, ensure_ascii=False)
+            # Truncate + audit
+            result = _truncate_if_needed(str(result) if not isinstance(result, str) else result, bypass=bypass_char)
+            _audit_log(tool_name, {} if params is None else params.model_dump() if hasattr(params, "model_dump") else {},
+                       str(result)[:200] if isinstance(result, str) else "")
+            return result
+        return wrapper
+    return decorator
+
+
 # Cursor utilities for pagination
 def _encode_cursor(data: dict) -> str:
     """Encode pagination state as a base64 JSON cursor string."""
@@ -486,6 +514,38 @@ _SRCIP_FIELD_PATHS: list[str] = [
     "data.ip.keyword",
     "srcip.keyword",
 ]
+
+
+def _compute_adaptive_thresholds(
+    baseline_alert_volume: tuple[float, float, int],  # (mu, sigma, buckets)
+    baseline_high_severity: tuple[float, float, int],
+) -> tuple[int, float]:
+    """Compute adaptive 3-Sum thresholds from baselines.
+
+    Cold-start safeguard: returns defaults if σ=0 or buckets<2.
+    Formula:
+      threshold_score = clamp(6, 30, 10 + (mu_high / max(sigma_high,1)) * 0.5)
+      z_threshold     = clamp(1.5, 5.0, 2.5 - (sigma_vol / max(mu_vol,1)) * 0.3)
+    """
+    mu_vol, sigma_vol, buckets_vol = baseline_alert_volume
+    mu_high, sigma_high, buckets_high = baseline_high_severity
+
+    # Cold-start check
+    if sigma_vol == 0.0 or sigma_high == 0.0 or buckets_vol < 2 or buckets_high < 2:
+        return (DEFAULT_THRESHOLD_SCORE, DEFAULT_Z_THRESHOLD)
+
+    import math
+    score = 10 + (mu_high / max(sigma_high, 1.0)) * 0.5
+    if math.isnan(score):
+        score = 10
+    threshold_score = max(6, min(30, int(round(score))))
+
+    z_val = 2.5 - (sigma_vol / max(mu_vol, 1.0)) * 0.3
+    if math.isnan(z_val):
+        z_val = 2.5
+    z_threshold = max(1.5, min(5.0, round(z_val, 1)))
+
+    return (threshold_score, z_threshold)
 
 
 def _classify_alert_mitre(
@@ -8737,17 +8797,12 @@ async def blueteam_system_health(bypass_redaction: bool = False) -> str:
 
 # Shared aggregation helper - posts raw OpenSearch bodies with circuit breaker
 async def _wazuh_indexer_post(body: dict, index_pattern: Optional[str] = None) -> Dict:
-    """Post a raw OpenSearch query body to the Wazuh Indexer.
-
-    All aggregation tools (Tier 1 & Tier 2) funnel through this single helper,
-    which wraps the HTTP call with the direct HTTP call.
-    """
+    """Post a raw OpenSearch query body to the Wazuh Indexer."""
     if index_pattern is None:
         index_pattern = _WAZUH_INDEX_PATTERNS["alerts"]
     if not WAZUH_INDEXER_URL or not WAZUH_INDEXER_PASSWORD:
         return {"error": "WAZUH_INDEXER_URL and WAZUH_INDEXER_PASSWORD must be set. See README for Indexer setup."}
     url = f"{WAZUH_INDEXER_URL}/{index_pattern}/_search"
-
     try:
         resp = await _api_call("post", url, client_name="indexer", verify=WAZUH_INDEXER_VERIFY_SSL,
                                 auth=(WAZUH_INDEXER_USER, WAZUH_INDEXER_PASSWORD),
@@ -8757,6 +8812,45 @@ async def _wazuh_indexer_post(body: dict, index_pattern: Optional[str] = None) -
         return {"error": f"Indexer API error: {e.response.status_code}", "detail": e.response.text[:500]}
     except Exception as e:
         return {"error": str(e)}
+
+
+_MSEARCH_FALLBACK_ERROR: dict = {"error": "_msearch_failed"}
+
+
+async def _wazuh_indexer_msearch(bodies: list[dict], index_pattern: Optional[str] = None) -> list[dict]:
+    """Send multiple OpenSearch queries in a single _msearch round-trip.
+
+    Builds NDJSON payload: alternating index-header lines and body lines.
+    Returns responses in the same order as the input bodies. On failure,
+    returns error dicts — the caller is responsible for fallback.
+    """
+    if index_pattern is None:
+        index_pattern = _WAZUH_INDEX_PATTERNS["alerts"]
+    if not WAZUH_INDEXER_URL or not WAZUH_INDEXER_PASSWORD:
+        return [{"error": "WAZUH_INDEXER_URL/WAZUH_INDEXER_PASSWORD not set"}] * len(bodies)
+    if not bodies:
+        return []
+    url = f"{WAZUH_INDEXER_URL}/{index_pattern}/_msearch"
+    header = json.dumps({"index": index_pattern, "allow_partial_search_results": True})
+    parts = []
+    for body in bodies:
+        parts.append(header)
+        parts.append(json.dumps(body, separators=(",", ":"), default=str))
+    ndjson = "\n".join(parts) + "\n"
+    if not ndjson.endswith("\n"):
+        ndjson += "\n"
+    try:
+        resp = await _api_call("post", url, client_name="indexer", verify=WAZUH_INDEXER_VERIFY_SSL,
+                                auth=(WAZUH_INDEXER_USER, WAZUH_INDEXER_PASSWORD),
+                                content=ndjson.encode("utf-8"),
+                                headers={"Content-Type": "application/x-ndjson"})
+        raw = resp.json()
+        if isinstance(raw, dict) and "responses" in raw:
+            return raw["responses"]
+        return [raw] if not isinstance(raw, list) else raw
+    except Exception as e:
+        logger.warning("_msearch failed (%s) — caller should fall back to _wazuh_indexer_post", e)
+        return [_MSEARCH_FALLBACK_ERROR] * len(bodies)
 
 
 # Tier 1: wazuh_alert_aggregate_analysis - full period statistics (size: 0 -> summarizes a whole period with no document limit)
