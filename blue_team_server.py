@@ -3846,6 +3846,10 @@ class ThreatCardInput(BaseModel):
         default=False,
         description=_BYPASS_REDACTION_DESC,
     )
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown",
+        description="'markdown' (default, human-readable) or 'json'.",
+    )
 
 
 @mcp.tool(
@@ -3945,22 +3949,7 @@ async def blueteam_threat_card(params: ThreatCardInput) -> str:
 
     docs = _redact_alert_data(docs, bypass=params.bypass_redaction)
 
-    # Build threat card
-    lines = [
-        f"# 🛡️ Threat Card — `{params.srcip}`",
-        "",
-        f"**Window**: `{since_iso}` → `{until_iso}` | **Total events**: {len(docs)}",
-        "",
-        "---",
-        "",
-    ]
-
-    if not docs:
-        lines.append("## No alerts found")
-        lines.append(f"No Wazuh alerts for `{params.srcip}` in this time window.")
-        return "\n".join(lines)
-
-    # Section 1: Executive Summary
+    # Extract common data
     rule_counts: Counter[str] = Counter()
     rule_descs: dict[str, str] = {}
     mitre_tactics: set[str] = set()
@@ -3979,32 +3968,59 @@ async def blueteam_threat_card(params: ThreatCardInput) -> str:
             rule_descs[rid] = str(r.get("description", rid))
         lvl = r.get("level")
         if isinstance(lvl, (int, str)):
-            try:
-                levels.append(int(lvl))
-            except (ValueError, TypeError):
-                pass
+            try: levels.append(int(lvl))
+            except (ValueError, TypeError): pass
         mitre = r.get("mitre", {})
         if isinstance(mitre, dict):
             tactics = mitre.get("tactic", [])
-            if isinstance(tactics, list):
-                mitre_tactics.update(tactics)
+            if isinstance(tactics, list): mitre_tactics.update(tactics)
         data = d.get("data", {})
         if isinstance(data, dict):
             dom = str(data.get("domain", "")).strip()
-            if dom and dom != "-":
-                domains.add(dom)
+            if dom and dom != "-": domains.add(dom)
             url = str(data.get("url", "")).strip()
-            if url and url != "-":
-                urls.append(url)
+            if url and url != "-": urls.append(url)
         ag = d.get("agent", {})
-        if isinstance(ag, dict):
-            aname = str(ag.get("name", ""))
-            if aname:
-                agents.add(aname)
+        if isinstance(ag, dict) and ag.get("name"): agents.add(str(ag["name"]))
 
     max_level = max(levels) if levels else 0
     avg_level = sum(levels) / len(levels) if levels else 0.0
 
+    # Format output
+    if params.response_format == "json":
+        return _truncate_if_needed(json.dumps({
+            "srcip": params.srcip,
+            "window": {"since": since_iso, "until": until_iso},
+            "total_events": len(docs),
+            "first_seen": first_ts,
+            "last_seen": last_ts,
+            "max_level": max_level,
+            "avg_level": round(avg_level, 1),
+            "rules": [{"id": rid, "count": cnt, "description": rule_descs.get(rid, "")}
+                      for rid, cnt in rule_counts.most_common(10)],
+            "targeted_domains": sorted(domains),
+            "urls_probed": list(set(urls))[:50],
+            "mitre_tactics": sorted(mitre_tactics),
+            "agents": sorted(agents),
+            "threat_intel": {"crowdsec": crowdsec_data, "greynoise": greynoise_data},
+        }, indent=2, ensure_ascii=False))
+
+    # Markdown threat card
+    lines = [
+        f"# 🛡️ Threat Card — `{params.srcip}`",
+        "",
+        f"**Window**: `{since_iso}` → `{until_iso}` | **Total events**: {len(docs)}",
+        "",
+        "---",
+        "",
+    ]
+
+    if not docs:
+        lines.append("## No alerts found")
+        lines.append(f"No Wazuh alerts for `{params.srcip}` in this time window.")
+        return "\n".join(lines)
+
+    # Section 1: Executive Summary
     lines.append("## 📊 Executive Summary")
     lines.append("")
     lines.append(f"| Field | Value |")
@@ -8783,6 +8799,10 @@ class AggregateAnalysisInput(BaseModel):
     response_format: Literal["markdown", "json"] = Field(
         default="markdown",
         description="'markdown' for human-readable stats, 'json' for structured data.",
+    )
+    bypass_redaction: bool = Field(
+        default=False,
+        description=_BYPASS_REDACTION_DESC,
     )
 
     @field_validator("mode")
