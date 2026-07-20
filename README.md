@@ -11,7 +11,7 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
 
 ## Architecture
 
-`blue_team_server.py` is a **single, unified MCP server** with 60 tools spanning host forensics, Wazuh SIEM, threat intelligence, Sangfor blocklist integration, alert enrichment, and 3-Sum APT correlation engine. It supports two transports:
+`blue_team_server.py` is a **single, unified MCP server** with 68 tools spanning host forensics, Wazuh SIEM, threat intelligence, Sangfor blocklist integration, alert enrichment, and 3-Sum APT correlation engine. It supports two transports:
 
 | Transport | Use case | MCP client connection |
 |---|---|---|
@@ -21,7 +21,7 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
 ```
                           ┌──────────────────────────────────┐
                           │     blue_team_server.py          │
-                          │     60 tools · 1 file · 2 transports  │
+                          │     68 tools · 1 file · 2 transports  │
                           │                                  │
                           │  ┌────────────────────────────┐  │
                           │  │ Host Forensics (26 tools)  │  │
@@ -84,7 +84,7 @@ Where Kali Linux gives Claude offensive tools (nmap, gobuster, sqlmap), this giv
 
 | File | Tools | When to use |
 |---|---|---|
-| `blue_team_server.py` | **All 60 tools** | **Recommended** — full capabilities, credential stripping, PII redaction |
+| `blue_team_server.py` | **All 68 tools** | **Recommended** — full capabilities, credential stripping, PII redaction |
 
 ---
 
@@ -715,7 +715,7 @@ export BLUETEAM_RATE_LIMIT=60
 
 | File | Role |
 |---|---|
-| `blue_team_server.py` | **Primary** — all 60 tools, both transports (stdio / Streamable HTTP) |
+| `blue_team_server.py` | **Primary** — all 68 tools, both transports (stdio / Streamable HTTP) |
 
 ### Legacy Naming Debt
 
