@@ -5756,6 +5756,407 @@ async def blueteam_calendar_heatmap(params: CalendarHeatmapInput) -> str:
 
 
 
+# Wazuh Manager API Expansion (Phase 1)
+class WazuhRulesInput(BaseModel):
+    """Input model for blueteam_wazuh_get_rules."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    rule_id: Optional[str] = Field(default=None, max_length=16,
+        description="Optional specific rule ID to fetch.")
+    path: Optional[str] = Field(default=None, max_length=256,
+        description="Optional rule file path filter.")
+    limit: int = Field(default=50, ge=1, le=500,
+        description="Max rules to return.")
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown", description="'markdown' or 'json'.")
+
+
+@mcp.tool(
+    name="blueteam_wazuh_get_rules",
+    annotations={"readOnlyHint": True, "destructiveHint": False,
+                 "idempotentHint": True, "openWorldHint": False},
+)
+async def blueteam_wazuh_get_rules(params: WazuhRulesInput) -> str:
+    """Fetch deployed Wazuh rules (custom and stock) from the Manager API.
+
+    Queries GET /rules with optional rule_id/path filters.
+
+    **Required Permissions**: Wazuh Manager API access (port 55000).
+
+    **Worked Examples**
+
+    1. *All rules*:
+       ``blueteam_wazuh_get_rules()``
+
+    2. *Specific rule*:
+       ``blueteam_wazuh_get_rules(rule_id="600029")``
+    """
+    _audit_log("blueteam_wazuh_get_rules", {"rule_id": params.rule_id})
+    api_params = {"limit": str(params.limit)}
+    if params.rule_id:
+        api_params["rule_ids"] = params.rule_id.strip()
+    if params.path:
+        api_params["path"] = params.path.strip()
+    data = await _wazuh_api_get("/rules", api_params)
+    if isinstance(data.get("error"), str):
+        return json.dumps(data, indent=2)
+    items = data.get("data", {}).get("affected_items", [])
+    if params.response_format == "json":
+        return _truncate_if_needed(json.dumps({"count": len(items), "rules": items[:params.limit]}, indent=2))
+    lines = [f"# Wazuh Rules ({len(items)} found)", ""]
+    for r in items[:30]:
+        rid = r.get("id", "?")
+        desc = _escape_md_table(str(r.get("description", ""))[:80])
+        lvl = r.get("level", "?")
+        lines.append(f"- `{rid}` (L{lvl}): {desc}")
+    return _truncate_if_needed("\n".join(lines))
+
+
+class WazuhDecodersInput(BaseModel):
+    """Input model for blueteam_wazuh_get_decoders."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    decoder_name: Optional[str] = Field(default=None, max_length=64,
+        description="Optional decoder name filter.")
+    limit: int = Field(default=50, ge=1, le=500)
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown", description="'markdown' or 'json'.")
+
+
+@mcp.tool(
+    name="blueteam_wazuh_get_decoders",
+    annotations={"readOnlyHint": True, "destructiveHint": False,
+                 "idempotentHint": True, "openWorldHint": False},
+)
+async def blueteam_wazuh_get_decoders(params: WazuhDecodersInput) -> str:
+    """Query GET /decoders to audit active Wazuh decoders.
+
+    **Worked Examples**
+
+    1. *All decoders*:
+       ``blueteam_wazuh_get_decoders()``
+
+    2. *Specific decoder*:
+       ``blueteam_wazuh_get_decoders(decoder_name="web-accesslog")``
+    """
+    _audit_log("blueteam_wazuh_get_decoders", {"decoder_name": params.decoder_name})
+    api_params = {"limit": str(params.limit)}
+    if params.decoder_name:
+        api_params["decoder_names"] = params.decoder_name.strip()
+    data = await _wazuh_api_get("/decoders", api_params)
+    if isinstance(data.get("error"), str):
+        return json.dumps(data, indent=2)
+    items = data.get("data", {}).get("affected_items", [])
+    if params.response_format == "json":
+        return _truncate_if_needed(json.dumps({"count": len(items), "decoders": items[:params.limit]}, indent=2))
+    lines = [f"# Wazuh Decoders ({len(items)} found)", ""]
+    for d in items[:30]:
+        name = d.get("name", "?")
+        detail = _escape_md_table(str(d.get("details", ""))[:60])
+        lines.append(f"- `{name}`: {detail}")
+    return _truncate_if_needed("\n".join(lines))
+
+
+class WazuhGroupsInput(BaseModel):
+    """Input model for blueteam_wazuh_get_groups."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    group_name: Optional[str] = Field(default=None, max_length=64,
+        description="Optional group name filter.")
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown", description="'markdown' or 'json'.")
+
+
+@mcp.tool(
+    name="blueteam_wazuh_get_groups",
+    annotations={"readOnlyHint": True, "destructiveHint": False,
+                 "idempotentHint": True, "openWorldHint": False},
+)
+async def blueteam_wazuh_get_groups(params: WazuhGroupsInput) -> str:
+    """List Wazuh agent groups from GET /groups.
+
+    **Worked Examples**
+
+    1. *All groups*:
+       ``blueteam_wazuh_get_groups()``
+
+    2. *Specific group*:
+       ``blueteam_wazuh_get_groups(group_name="web-servers")``
+    """
+    _audit_log("blueteam_wazuh_get_groups", {"group_name": params.group_name})
+    api_params = {}
+    if params.group_name:
+        api_params["group_list"] = params.group_name.strip()
+    data = await _wazuh_api_get("/groups", api_params)
+    if isinstance(data.get("error"), str):
+        return json.dumps(data, indent=2)
+    items = data.get("data", {}).get("affected_items", [])
+    if params.response_format == "json":
+        return _truncate_if_needed(json.dumps({"count": len(items), "groups": items}, indent=2))
+    lines = [f"# Wazuh Agent Groups ({len(items)} found)", ""]
+    for g in items[:30]:
+        name = g.get("name", "?")
+        count = g.get("count", 0) if isinstance(g, dict) else 0
+        lines.append(f"- `{name}` ({count} agents)")
+    return _truncate_if_needed("\n".join(lines))
+
+
+class WazuhSecurityEventsInput(BaseModel):
+    """Input model for blueteam_wazuh_get_security_events."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    limit: int = Field(default=50, ge=1, le=500)
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown", description="'markdown' or 'json'.")
+
+
+@mcp.tool(
+    name="blueteam_wazuh_get_security_events",
+    annotations={"readOnlyHint": True, "destructiveHint": False,
+                 "idempotentHint": True, "openWorldHint": False},
+)
+async def blueteam_wazuh_get_security_events(params: WazuhSecurityEventsInput) -> str:
+    """Fetch Wazuh Manager security audit events from GET /security/events.
+
+    Returns admin actions, auth attempts, and configuration changes.
+
+    **Worked Examples**
+
+    1. *Recent events*:
+       ``blueteam_wazuh_get_security_events()``
+
+    2. *Extended log*:
+       ``blueteam_wazuh_get_security_events(limit=200)``
+    """
+    _audit_log("blueteam_wazuh_get_security_events", {"limit": params.limit})
+    api_params = {"limit": str(min(params.limit, 500)), "sort": "-timestamp"}
+    data = await _wazuh_api_get("/security/events", api_params)
+    if isinstance(data.get("error"), str):
+        return json.dumps(data, indent=2)
+    items = data.get("data", {}).get("affected_items", [])
+    if params.response_format == "json":
+        return _truncate_if_needed(json.dumps({"count": len(items), "events": items[:params.limit]}, indent=2))
+    lines = [f"# Wazuh Security Events ({len(items)} found)", ""]
+    for e in items[:20]:
+        ts = str(e.get("timestamp", "?"))[:19]
+        user = e.get("user", "?")
+        action = _escape_md_table(str(e.get("action", "?"))[:80])
+        lines.append(f"- `[{ts}]` {user}: {action}")
+    return _truncate_if_needed("\n".join(lines))
+
+
+class WazuhClusterNodesInput(BaseModel):
+    """Input model for blueteam_wazuh_get_cluster_nodes."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown", description="'markdown' or 'json'.")
+
+
+@mcp.tool(
+    name="blueteam_wazuh_get_cluster_nodes",
+    annotations={"readOnlyHint": True, "destructiveHint": False,
+                 "idempotentHint": True, "openWorldHint": False},
+)
+async def blueteam_wazuh_get_cluster_nodes(params: WazuhClusterNodesInput) -> str:
+    """Query GET /cluster/nodes for multi-node Wazuh cluster health.
+
+    **Worked Examples**
+
+    1. *Cluster status*:
+       ``blueteam_wazuh_get_cluster_nodes()``
+    """
+    _audit_log("blueteam_wazuh_get_cluster_nodes", {})
+    data = await _wazuh_api_get("/cluster/nodes")
+    if isinstance(data.get("error"), str):
+        return json.dumps(data, indent=2)
+    items = data.get("data", {}).get("affected_items", [])
+    if params.response_format == "json":
+        return _truncate_if_needed(json.dumps({"count": len(items), "nodes": items}, indent=2))
+    lines = [f"# Wazuh Cluster Nodes ({len(items)} found)", ""]
+    for n in items:
+        name = n.get("name", "?")
+        typ = n.get("type", "?")
+        version = n.get("version", "?")
+        ip = n.get("ip", "?")
+        lines.append(f"- `{name}` ({typ}) v{version} @ {ip}")
+    return _truncate_if_needed("\n".join(lines))
+
+
+# Alert Lifecycle & Investigation State (Phase 2)
+class MarkInvestigatedInput(BaseModel):
+    """Input model for blueteam_mark_investigated."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    srcip: str = Field(..., min_length=7, max_length=45,
+        description="Source IP being investigated.")
+    verdict: Literal["true_positive", "false_positive", "suspicious", "clean", "unknown"] = Field(
+        ..., description="Investigation verdict.")
+    notes: str = Field(default="", max_length=1024,
+        description="Analyst notes (max 1024 chars).")
+
+
+@mcp.tool(
+    name="blueteam_mark_investigated",
+    annotations={"readOnlyHint": False, "destructiveHint": False,
+                 "idempotentHint": False, "openWorldHint": False},
+)
+async def blueteam_mark_investigated(params: MarkInvestigatedInput) -> str:
+    """Record an IP investigation verdict in the persistent JSONL history.
+
+    Appends a timestamped entry to BLUETEAM_INVESTIGATION_HISTORY. This is the
+    only tool that writes investigation state — all other tools (curated reports,
+    threat cards, beacon detection) are read-only.
+
+    **Required**: BLUETEAM_INVESTIGATION_HISTORY env var set to a writable path.
+
+    **Worked Examples**
+
+    1. *Mark malicious*:
+       ``blueteam_mark_investigated(srcip="103.107.116.202", verdict="true_positive", notes="CrowdSec confirmed — C2 beaconing")``
+
+    2. *Mark false positive*:
+       ``blueteam_mark_investigated(srcip="8.8.8.8", verdict="false_positive", notes="Google DNS — scanner noise")``
+    """
+    _audit_log("blueteam_mark_investigated", {"srcip": params.srcip, "verdict": params.verdict})
+    if not _INVESTIGATION_HISTORY_FILE:
+        return json.dumps({"error": "BLUETEAM_INVESTIGATION_HISTORY env var not set.",
+                           "detail": "Set this to a writable JSONL file path for investigation persistence."}, indent=2)
+    entry = {
+        "ts": datetime.utcnow().isoformat() + "Z",
+        "srcip": params.srcip.strip(),
+        "verdict": params.verdict,
+        "notes": params.notes[:1024],
+    }
+    try:
+        with open(_INVESTIGATION_HISTORY_FILE, "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        return json.dumps({"status": "recorded", "entry": entry}, indent=2)
+    except Exception as e:
+        return json.dumps({"error": f"Failed to write history: {e}"}, indent=2)
+
+
+class FalsePositiveTrackerInput(BaseModel):
+    """Input model for blueteam_false_positive_tracker."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    rule_id: str = Field(..., max_length=16,
+        description="Wazuh rule ID to check, e.g. '600029'.")
+    since: Optional[str] = Field(default="30d", max_length=30,
+        description="Time window. ISO 8601 or relative ('7d', '30d').")
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown", description="'markdown' or 'json'.")
+
+
+@mcp.tool(
+    name="blueteam_false_positive_tracker",
+    annotations={"readOnlyHint": True, "destructiveHint": False,
+                 "idempotentHint": True, "openWorldHint": False},
+)
+async def blueteam_false_positive_tracker(params: FalsePositiveTrackerInput) -> str:
+    """Count how often a Wazuh rule fired but was later marked false-positive.
+
+    Parses BLUETEAM_INVESTIGATION_HISTORY to find IPs investigated with
+    verdict="false_positive", then cross-references rule_id from investigation
+    summaries. Helps SOC tune noisy Wazuh rules.
+
+    **Worked Examples**
+
+    1. *Check rule 600029*:
+       ``blueteam_false_positive_tracker(rule_id="600029", since="30d")``
+    """
+    _audit_log("blueteam_false_positive_tracker", {"rule_id": params.rule_id})
+    if not _INVESTIGATION_HISTORY_FILE:
+        return json.dumps({"error": "BLUETEAM_INVESTIGATION_HISTORY not set."}, indent=2)
+    since_dt = datetime.utcnow() - timedelta(days=30 if params.since == "30d" else 7)
+    history = _read_history()
+    fp_ips = {ip for ip, e in history.items()
+              if e.get("verdict") == "false_positive"
+              and e.get("ts", "") >= since_dt.strftime("%Y-%m-%d")}
+    # Cross-reference: count rule_id mentions in FP summaries
+    fp_count = 0
+    fp_ips_list: list[str] = []
+    for ip, e in history.items():
+        if ip not in fp_ips:
+            continue
+        summary = e.get("summary", {})
+        rules = summary.get("rules", [])
+        if isinstance(rules, list):
+            for r in rules:
+                if isinstance(r, dict) and str(r.get("id", "")) == params.rule_id:
+                    fp_count += 1
+                    fp_ips_list.append(ip)
+                    break
+    if params.response_format == "json":
+        return json.dumps({"rule_id": params.rule_id, "false_positive_count": fp_count,
+                           "ips": fp_ips_list[:50]}, indent=2)
+    return (f"# False Positive Tracker — Rule `{params.rule_id}`\n\n"
+            f"- **False positive verdicts**: {fp_count}\n"
+            f"- **IPs flagged**: {', '.join(f'`{ip}`' for ip in fp_ips_list[:10]) if fp_ips_list else 'none'}\n"
+            f"- **Window**: since {since_dt.strftime('%Y-%m-%d')}\n")
+
+
+class InvestigationSummaryInput(BaseModel):
+    """Input model for blueteam_investigation_summary."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    since: Optional[str] = Field(default="7d", max_length=30,
+        description="Time window. ISO 8601 or relative.")
+    response_format: Literal["markdown", "json"] = Field(
+        default="markdown", description="'markdown' or 'json'.")
+
+
+@mcp.tool(
+    name="blueteam_investigation_summary",
+    annotations={"readOnlyHint": True, "destructiveHint": False,
+                 "idempotentHint": True, "openWorldHint": False},
+)
+async def blueteam_investigation_summary(params: InvestigationSummaryInput) -> str:
+    """Dashboard: unique IPs investigated, verdict breakdown, analyst notes.
+
+    Reads BLUETEAM_INVESTIGATION_HISTORY and aggregates recent investigations.
+    Prevents redundant re-analysis by showing which IPs already have verdicts.
+
+    **Worked Examples**
+
+    1. *Last 7 days*:
+       ``blueteam_investigation_summary()``
+
+    2. *Last 30 days*:
+       ``blueteam_investigation_summary(since="30d")``
+    """
+    _audit_log("blueteam_investigation_summary", {"since": params.since})
+    if not _INVESTIGATION_HISTORY_FILE:
+        return json.dumps({"error": "BLUETEAM_INVESTIGATION_HISTORY not set."}, indent=2)
+    since_dt = datetime.utcnow() - timedelta(days=7 if params.since == "7d" else 30)
+    history = _read_history()
+    recent = {ip: e for ip, e in history.items()
+              if e.get("ts", "")[:10] >= since_dt.strftime("%Y-%m-%d")}
+    verdicts: Counter[str] = Counter()
+    for e in recent.values():
+        verdicts[e.get("verdict", "unknown")] += 1
+
+    if params.response_format == "json":
+        return json.dumps({
+            "window_since": since_dt.strftime("%Y-%m-%d"),
+            "total_investigated": len(recent),
+            "verdicts": dict(verdicts),
+            "ips": sorted(recent.keys()),
+        }, indent=2)
+
+    lines = [
+        f"# Investigation Summary — Since {since_dt.strftime('%Y-%m-%d')}",
+        "",
+        f"**Total IPs investigated**: {len(recent)}",
+        "",
+        "| Verdict | Count |",
+        "|---------|-------|",
+    ]
+    for v, c in verdicts.most_common():
+        lines.append(f"| {v} | {c} |")
+    if recent:
+        lines.append("")
+        lines.append("## Recent Investigations")
+        for ip, e in sorted(recent.items(), key=lambda x: x[1].get("ts", ""), reverse=True)[:15]:
+            ts = e.get("ts", "?")[:19]
+            v = e.get("verdict", "?")
+            notes = (e.get("notes", "") or "")[:60]
+            lines.append(f"- `[{ts}]` `{ip}` — {v}" + (f" ({notes})" if notes else ""))
+    return _truncate_if_needed("\n".join(lines))
+
+
 # Wazuh Indexer index patterns (OpenSearch)
 _WAZUH_INDEX_PATTERNS = {
     "alerts": "wazuh-alerts-*",
