@@ -1,4 +1,8 @@
-"""ThreatFox by abuse.ch — IP → malware family attribution for APT hunting."""
+#!/usr/bin/env python3
+"""
+© NAuliajati - TangerangKota-CSIRT
+ThreatFox by abuse.ch — IP → malware family attribution for APT hunting
+"""
 from __future__ import annotations
 import json, time, os, asyncio
 from typing import Optional, Any
@@ -70,8 +74,7 @@ def _format_threatfox_markdown(ip: str, data: dict) -> str:
     return "\n".join(lines)
 
 
-# ── Single lookup ──
-
+# Single lookup
 class ThreatFoxIpLookupInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     ip: ValidPublicIp = Field(..., min_length=3, max_length=45)
@@ -109,8 +112,7 @@ async def threatfox_ip_lookup(params: ThreatFoxIpLookupInput) -> str:
     return _truncate_if_needed(_format_threatfox_markdown(params.ip, data))
 
 
-# ── Bulk lookup ──
-
+# Bulk lookup
 class ThreatFoxIpLookupBulkInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     ips: list[str] = Field(..., min_length=1, max_length=25)
