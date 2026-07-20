@@ -10693,7 +10693,7 @@ async def _threatfox_request(search_term: str, exact_match: bool = False) -> dic
 
 def _format_threatfox_markdown(ip: str, data: dict) -> str:
     items = data.get("data", [])
-    if not items:
+    if not isinstance(items, list) or not items:
         return f"# ThreatFox — `{ip}`\\n\\nNo ThreatFox data. IP not linked to known malware."
     lines = [f"# ThreatFox — `{ip}`", ""]
     for i, entry in enumerate(items[:10]):
@@ -10773,6 +10773,8 @@ async def threatfox_ip_lookup_bulk(params: ThreatFoxIpLookupBulkInput) -> str:
         try:
             data = await _threatfox_request(ip.strip(), params.exact_match)
             items = data.get("data", [])
+            if not isinstance(items, list):
+                items = []
             return {"ip": ip, "matches": len(items),
                     "malware": [e.get("malware_printable") or e.get("malware", "?") for e in items[:3]],
                     "confidence": max((e.get("confidence_level", 0) for e in items), default=0)}
