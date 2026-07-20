@@ -61,6 +61,7 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 # Blue Team MCP - Environment Variables
 
 # Threat intelligence (optional)
+# export THREATFOX_API_KEY="your_key"
 # export ABUSEIPDB_API_KEY="your_key"
 # export VIRUSTOTAL_API_KEY="your_key"
 # export CROWDSEC_API_KEY="your_key" # free tier: https://www.crowdsec.net/en/user/profile
@@ -140,7 +141,7 @@ fi
 # Wrapper scripts
 echo "[5/7] Creating MCP server wrapper scripts..."
 
-# Main wrapper: mcp-server-blueteam (all 68 tools)
+# Main wrapper: mcp-server-blueteam (all 70 tools)
 cat > /usr/local/bin/mcp-server-blueteam << 'EOF'
 #!/usr/bin/env bash
 # Wrapper - Claude Desktop calls this via SSH (MAESTRO-compliant)
@@ -232,7 +233,7 @@ echo "  GreyNoise Community needs no key — greynoise_ip_context works immediat
 echo ""
 echo "Wrapper entry points installed:"
 echo ""
-echo "  mcp-server-blueteam    — All 68 tools (Wazuh, threat intel, host forensics, Sangfor blocklist, 3-Sum correlation, curated reports)"
+echo "  mcp-server-blueteam    — All 70 tools (Wazuh, threat intel, host forensics, Sangfor blocklist, 3-Sum correlation, curated reports)"
 echo "  mcp-server-crowdsec    — DEPRECATED — redirects to mcp-server-blueteam"
 echo "  mcp-server-greynoise   — DEPRECATED — redirects to mcp-server-blueteam"
 echo ""
