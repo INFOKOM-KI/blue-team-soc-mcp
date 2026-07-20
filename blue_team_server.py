@@ -159,7 +159,7 @@ _WAZUH_INDEXER_MAX_SIZE = int(os.environ.get("WAZUH_INDEXER_MAX_SIZE", "10000"))
 BLUETEAM_ALLOW_UNTRUNCATED = os.environ.get("BLUETEAM_ALLOW_UNTRUNCATED", "false").lower() in ("1", "true", "yes")
 if BLUETEAM_ALLOW_UNTRUNCATED:
     logger.warning(
-        "BLUETEAM_ALLOW_UNTRUNCATED=true — character-limit bypass and include_all_docs are ENABLED. "
+        "BLUETEAM_ALLOW_UNTRUNCATED=true - character-limit bypass and include_all_docs are ENABLED. "
         "Unbounded response payloads may exhaust LLM context windows or MCP transport buffers. "
         "Use only for forensic deep-dives with explicit scope constraints (small time windows, "
         "specific agents/IPs, conservative max_scanned values)."
@@ -416,17 +416,26 @@ def _handle_api_error(e: Exception, context: str = "") -> str:
     return f"{prefix}Error: Unexpected error ({type(e).__name__})."
 
 def _truncate_if_needed(text: str, *, bypass: bool = False) -> str:
-    """Cap response at CHARACTER_LIMIT to keep MCP messages manageable.
-
-    Args:
-        text: The response text to potentially truncate.
-        bypass: When True AND BLUETEAM_ALLOW_UNTRUNCATED is enabled, return the
-                text without truncation. Ignored (treated as False) unless the
-                environment guard is active — this prevents callers from
-                accidentally bypassing the safety cap without admin approval.
-    """
-    if bypass and BLUETEAM_ALLOW_UNTRUNCATED:
-        return text
+    """Cap response at CHARACTER_LIMIT. When bypass=True, prepends forensic warning."""
+    if bypass:
+        banner = (
+            "⚠️ UNREDACTED - FORENSIC USE ONLY. Contains PII/internal IPs.\n {HANYA UNTUK KEBUTUHAN FORENSIK & AUDIT!!!}"
+        )
+        text = banner + text
+        # Append forensic trace to audit log
+        if BLUETEAM_AUDIT_LOG:
+            try:
+                with open(BLUETEAM_AUDIT_LOG, "a") as f:
+                    f.write(json.dumps({
+                        "ts": datetime.utcnow().isoformat() + "Z",
+                        "event": "forensic_bypass_response",
+                        "response_sha256": hashlib.sha256(text.encode()).hexdigest(),
+                        "response_bytes": len(text.encode()),
+                    }) + "\n")
+            except Exception:
+                pass
+        if BLUETEAM_ALLOW_UNTRUNCATED:
+            return text
     if len(text) <= CHARACTER_LIMIT:
         return text
     truncated = text[:CHARACTER_LIMIT]
@@ -546,7 +555,7 @@ _CREDENTIAL_STRIP_RULES: list[tuple[re.Pattern, str]] = [
      '<PLATFORM_TOKEN_REDACTED>'),
 ]
 
-# Forensic email hashing — preserves domain visibility for SOC analysis while
+# Forensic email hashing - preserves domain visibility for SOC analysis while
 # keeping the raw email out of the LLM context.  The hash is deterministic
 # (SHA-256 salted with BLUETEAM_REDACT_SALT, defaulting to hostname-derived)
 # so the same email produces the same hash across tool calls and server restarts.
@@ -599,12 +608,10 @@ def _redact_alert_data(data: Any, *, bypass: bool = False) -> Any:
     6. **User-agent truncation** (layer 6 — ``BLUETEAM_REDACT_UAS``)
        Truncated to 80 chars (OS/browser preserved).
 
-    The ``bypass`` parameter skips all optional layers (2-6). Layer 1 is NEVER
-    bypassable. Each layer is independently controlled by its ``BLUETEAM_REDACT_*``
-    env var, so operators can selectively disable masking at the deployment level.
-
-    Returns the redacted copy — original is never mutated.
+    Layer 1 is NEVER bypassable. Bypass usage is logged to stderr.
     """
+    if bypass:
+        logger.warning("REDACTION BYPASSED — raw PII/internal IPs exposed to caller")
     if isinstance(data, str):
         # Layer 1: Credential stripping (MANDATORY — no env var override)
         for pattern, replacement in _CREDENTIAL_STRIP_RULES:
@@ -764,6 +771,7 @@ def _audit_log(tool_name: str, params: dict, result_preview: str = "") -> None:
             "tool": tool_name,
             "params": {k: str(v)[:100] for k, v in params.items() if k not in ("api_key", "key")},
             "result_preview": (result_preview or "")[:200],
+            "redaction_bypassed": params.get("bypass_redaction", False),
         }
         with open(BLUETEAM_AUDIT_LOG, "a") as f:
             f.write(json.dumps(entry) + "\n")
@@ -4554,6 +4562,8 @@ class GeoDistributionInput(BaseModel):
         description="Number of top countries to return.")
     response_format: Literal["markdown", "json"] = Field(
         default="markdown", description="'markdown' or 'json'.")
+    bypass_redaction: bool = Field(
+        default=False, description=_BYPASS_REDACTION_DESC)
 
 
 @mcp.tool(
@@ -7521,7 +7531,9 @@ class WazuhAlertTimelineInput(BaseModel):
         default="markdown",
         description="'markdown' for human-readable timeline, 'json' for structured bucket data.",
     )
-
+    bypass_redaction: bool = Field(
+        default=False, description=_BYPASS_REDACTION_DESC,
+    )
 
 
     @field_validator("bucket")
@@ -7763,6 +7775,9 @@ class WazuhAttackVelocityInput(BaseModel):
     response_format: Literal["markdown", "json"] = Field(
         default="markdown",
         description="_RESPONSE_FORMAT_DESC",
+    )
+    bypass_redaction: bool = Field(
+        default=False, description=_BYPASS_REDACTION_DESC,
     )
 
 
