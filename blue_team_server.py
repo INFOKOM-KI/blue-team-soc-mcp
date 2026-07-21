@@ -6307,7 +6307,7 @@ class WazuhIndexerSearchInput(BaseModel):
     bypass_redaction: bool = Field(default=False, description="When true, return raw alert documents without PII masking. Overrides BLUETEAM_REDACT_PII for this call only — use for internal audit investigations.")
     max_scanned: Optional[int] = Field(
         default=None,
-        ge=1000,
+        ge=100,
         le=1000000,
         description="When set, auto-paginate through all matching alerts up to this limit. "
                     "Returns an aggregated summary (total counts, top IPs, top rules) "
@@ -7203,7 +7203,7 @@ class WazuhDomainLookupInput(BaseModel):
     )
     max_scanned: Optional[int] = Field(
         default=None,
-        ge=1000,
+        ge=100,
         le=500000,
         description="When set, auto-paginate through all matching alerts up to this limit. "
                     "Returns aggregated results (counts, top IPs, top rules) across ALL "
